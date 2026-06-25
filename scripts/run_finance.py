@@ -1024,22 +1024,36 @@ def _polymarket_brief(geo_topics: list[str], max_topics: int = 4) -> str:
             resp.raise_for_status()
             data = resp.json()
             logger.debug(f"Polymarket raw response for '{topic}': {json.dumps(data)[:2000]}")
-            markets = data.get("markets") or data.get("events") or []
-            for m in markets[:2]:
-                question = (m.get("question") or m.get("title") or "").strip()
-                if not question or question in seen or m.get("closed"):
+            # /public-search returns top-level "events"; the tradeable markets (with
+            # outcomePrices/outcomes) are nested under event["markets"], not on the event
+            # itself. There's no top-level "markets" key in practice; keep the fallback
+            # in case the API ever returns a flat market match directly.
+            events = data.get("events") or data.get("markets") or []
+            found_for_topic = 0
+            for ev in events[:3]:
+                if found_for_topic >= 2 or ev.get("closed"):
                     continue
-                raw_prices = m.get("outcomePrices")
-                raw_outcomes = m.get("outcomes")
-                try:
-                    prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-                    outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
-                except (TypeError, json.JSONDecodeError):
-                    prices, outcomes = None, None
-                if prices and outcomes:
-                    pairs = ", ".join(f"{o}:{float(p):.0%}" for o, p in zip(outcomes, prices))
-                    lines.append(f"- [{topic}] {question} → {pairs}")
-                    seen.add(question)
+                event_title = (ev.get("title") or "").strip()
+                sub_markets = ev.get("markets") or [ev]
+                for m in sub_markets[:3]:
+                    if m.get("closed"):
+                        continue
+                    question = (m.get("question") or m.get("title") or event_title or "").strip()
+                    if not question or question in seen:
+                        continue
+                    raw_prices = m.get("outcomePrices")
+                    raw_outcomes = m.get("outcomes")
+                    try:
+                        prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+                        outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+                    except (TypeError, json.JSONDecodeError):
+                        prices, outcomes = None, None
+                    if prices and outcomes:
+                        pairs = ", ".join(f"{o}:{float(p):.0%}" for o, p in zip(outcomes, prices))
+                        lines.append(f"- [{topic}] {question} → {pairs}")
+                        seen.add(question)
+                        found_for_topic += 1
+                        break
         except Exception as e:
             logger.warning(f"Polymarket query failed for '{topic}': {e}")
             continue
