@@ -11,6 +11,7 @@ __pycache__/
 tg_offset.json
 finance_tavily_budget.json
 finance_serpapi_budget.json
+finance_adanos_budget.json
 
 # IBKR gateway — not distributed (broker-specific, contains platform binaries)
 ibkr/

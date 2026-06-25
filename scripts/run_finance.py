@@ -92,6 +92,14 @@ SERPAPI_MONTHLY_LIMIT = 250
 SERPAPI_BUDGET_PATH   = _PROJ_DIR / "finance_serpapi_budget.json"
 FINNHUB_API_KEY       = os.getenv("FINNHUB_API_KEY", "")
 FINNHUB_BASE          = "https://finnhub.io/api/v1"
+
+# Social sentiment sources (issue C4): Polymarket (free, no auth) + Adanos X/Twitter (free tier, keyed)
+POLYMARKET_BASE        = "https://gamma-api.polymarket.com"
+ADANOS_API_KEY         = os.getenv("ADANOS_API_KEY", "")
+ADANOS_BASE            = "https://api.adanos.org"
+ADANOS_MONTHLY_LIMIT   = 200  # free tier is 250/mo; leave headroom for TG follow-ups/manual reruns
+ADANOS_BUDGET_PATH     = _PROJ_DIR / "finance_adanos_budget.json"
+
 ET = ZoneInfo("America/New_York")
 
 # ── Watchlist parser ─────────────────────────────────────────────────────────
@@ -227,6 +235,25 @@ def load_serpapi_budget() -> dict:
 
 def save_serpapi_budget(budget: dict) -> None:
     SERPAPI_BUDGET_PATH.write_text(json.dumps(budget))
+
+
+# ── Adanos monthly budget ─────────────────────────────────────────────────────
+
+def load_adanos_budget() -> dict:
+    ym = _this_month_et()
+    try:
+        data = json.loads(ADANOS_BUDGET_PATH.read_text())
+        if data.get("year_month") == ym:
+            return data
+    except Exception:
+        pass
+    return {"year_month": ym, "used": 0}
+
+def save_adanos_budget(budget: dict) -> None:
+    ADANOS_BUDGET_PATH.write_text(json.dumps(budget))
+
+def adanos_remaining(budget: dict) -> int:
+    return max(0, ADANOS_MONTHLY_LIMIT - budget.get("used", 0))
 
 def serpapi_remaining(budget: dict) -> int:
     return max(0, SERPAPI_MONTHLY_LIMIT - budget.get("used", 0))
@@ -806,7 +833,7 @@ USER_PROMPT_TEMPLATE = """今日日期（ET）：{date}
 ## 过去24小时新闻（RSS）
 {news_text}
 
-{finnhub_news_section}{sonar_macro_section}{tavily_section}{kb_section}
+{finnhub_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}
 ---
 
 ## 搜索任务约束（填写 tavily_queries 时遵守）
@@ -847,7 +874,7 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 ## 过去24小时新闻（RSS）
 {news_text}
 
-{finnhub_news_section}{sonar_macro_section}{tavily_section}{kb_section}
+{finnhub_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}
 ---
 
 == 持仓与框架 ==
@@ -973,6 +1000,110 @@ def _sonar_macro_brief(
             else:
                 logger.warning(f"Sonar macro brief failed after retry (non-fatal): {e}")
     return ""
+
+
+def _polymarket_brief(geo_topics: list[str], max_topics: int = 4) -> str:
+    """Query Polymarket's public Gamma API (/public-search) for prediction-market odds on
+    watchlist-relevant geo/macro themes. Free, no auth, no quota. Fail-open (returns "" on error).
+
+    Prediction-market prices are a probability signal that RSS/Sonar can't provide directly
+    (e.g. odds of a Fed rate decision or a geopolitical outcome), see issue C4.
+    """
+    if not geo_topics:
+        return ""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for topic in geo_topics[:max_topics]:
+        try:
+            resp = httpx.get(
+                f"{POLYMARKET_BASE}/public-search",
+                params={"q": topic, "limit_per_type": 3},
+                headers={"User-Agent": "daily-intelligence/1.0"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            logger.debug(f"Polymarket raw response for '{topic}': {json.dumps(data)[:2000]}")
+            # /public-search returns top-level "events"; the tradeable markets (with
+            # outcomePrices/outcomes) are nested under event["markets"], not on the event
+            # itself. There's no top-level "markets" key in practice; keep the fallback
+            # in case the API ever returns a flat market match directly.
+            events = data.get("events") or data.get("markets") or []
+            found_for_topic = 0
+            for ev in events[:3]:
+                if found_for_topic >= 2 or ev.get("closed"):
+                    continue
+                event_title = (ev.get("title") or "").strip()
+                sub_markets = ev.get("markets") or [ev]
+                for m in sub_markets[:3]:
+                    if m.get("closed"):
+                        continue
+                    question = (m.get("question") or m.get("title") or event_title or "").strip()
+                    if not question or question in seen:
+                        continue
+                    raw_prices = m.get("outcomePrices")
+                    raw_outcomes = m.get("outcomes")
+                    try:
+                        prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+                        outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+                    except (TypeError, json.JSONDecodeError):
+                        prices, outcomes = None, None
+                    if prices and outcomes:
+                        pairs = ", ".join(f"{o}:{float(p):.0%}" for o, p in zip(outcomes, prices))
+                        lines.append(f"- [{topic}] {question} → {pairs}")
+                        seen.add(question)
+                        found_for_topic += 1
+                        break
+        except Exception as e:
+            logger.warning(f"Polymarket query failed for '{topic}': {e}")
+            continue
+    if not lines:
+        return ""
+    return "\n## Polymarket 预测市场快照\n" + "\n".join(lines[:6]) + "\n"
+
+
+def _adanos_x_sentiment(tickers: list[str], budget: dict) -> str:
+    """Query Adanos (api.adanos.org) for X/Twitter stock sentiment (buzz/bullish ratio/mentions/trend)
+    on watchlist tickers. Free tier capped at ADANOS_MONTHLY_LIMIT calls/month — mutates
+    budget['used'] in place per call so the caller can persist it. Fail-open: returns "" if no
+    key configured, budget exhausted, or the API errors (response schema is best-effort parsed
+    since Adanos is an undocumented third-party aggregator, see issue C4).
+    """
+    if not tickers or not ADANOS_API_KEY:
+        return ""
+    lines: list[str] = []
+    for ticker in tickers:
+        if adanos_remaining(budget) <= 0:
+            logger.info("Adanos monthly budget exhausted, skipping remaining tickers")
+            break
+        try:
+            resp = httpx.get(
+                f"{ADANOS_BASE}/x/stocks/v1/stock/{ticker}",
+                headers={"X-API-Key": ADANOS_API_KEY},
+                timeout=10,
+            )
+            budget["used"] = budget.get("used", 0) + 1
+            logger.debug(f"Adanos raw response for {ticker} (status {resp.status_code}): {resp.text[:2000]}")
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            d = resp.json()
+            data = d.get("data", d)
+            buzz     = data.get("buzz_score", data.get("buzz"))
+            bullish  = data.get("bullish_ratio", data.get("sentiment_score", data.get("sentiment")))
+            mentions = data.get("mentions", data.get("mention_count"))
+            trend    = data.get("trend", data.get("trend_direction"))
+            parts = [f"{k}={v}" for k, v in
+                     [("buzz", buzz), ("bullish", bullish), ("mentions", mentions), ("trend", trend)]
+                     if v is not None]
+            if parts:
+                lines.append(f"- {ticker}: {', '.join(parts)}")
+        except Exception as e:
+            logger.warning(f"Adanos X sentiment query failed for {ticker}: {e}")
+            continue
+    if not lines:
+        return ""
+    return "\n## X/Twitter 舆情快照（Adanos）\n" + "\n".join(lines) + "\n"
 
 
 def fetch_finnhub_news(tickers: list[str], hours: int = 24) -> str:
@@ -1377,6 +1508,9 @@ def build_status_message(
     finnhub_tickers: list,
     finnhub_news_section: str,
     sonar_macro_section: str,
+    polymarket_section: str,
+    adanos_section: str,
+    adanos_budget: dict,
     all_search_jobs: list,
     raw_results: list,
     filtered: list,
@@ -1408,6 +1542,12 @@ def build_status_message(
         else "- Finnhub即时新闻: 无数据/未触发"
     )
     lines.append(f"- Sonar宏观快照: {'成功' if sonar_macro_section else '失败/跳过'}")
+    lines.append(f"- Polymarket预测市场: {'成功' if polymarket_section else '无相关市场/跳过'}")
+    if ADANOS_API_KEY:
+        lines.append(
+            f"- Adanos X舆情: {'成功' if adanos_section else '无数据/跳过'}"
+            f"（本月已用 {adanos_budget['used']}/{ADANOS_MONTHLY_LIMIT}）"
+        )
     if all_search_jobs:
         line = f"- Tavily/SerpApi搜索: {len(all_search_jobs)} 任务, {len(raw_results)} 条原始结果"
         if filtered:
@@ -1596,6 +1736,30 @@ def main():
         portfolio_snapshot=kb_context[:400] if kb_context else "",
     )
 
+    # 6d. Social sentiment — Polymarket (free, prediction-market odds) + Adanos X/Twitter
+    # (free tier, capped monthly budget). Anomaly tickers prioritized for Adanos, same as Finnhub.
+    # Wrapped in its own try/except so any unexpected failure here (e.g. budget file I/O)
+    # degrades to empty sections instead of taking down the rest of the run.
+    polymarket_section = ""
+    adanos_section = ""
+    adanos_budget = {"year_month": "", "used": 0}
+    try:
+        adanos_budget = load_adanos_budget()
+        polymarket_section = _polymarket_brief(list(wl["geo_keywords"].keys()))
+        _adanos_tickers = list(dict.fromkeys(
+            anomaly_ticker_syms + [t for t in wl["stocks"] if t not in anomaly_ticker_syms]
+        ))[:4]
+        adanos_section = _adanos_x_sentiment(_adanos_tickers, adanos_budget)
+        save_adanos_budget(adanos_budget)
+    except Exception as e:
+        logger.warning(f"Social sentiment step failed, continuing without it: {e}")
+    social_sentiment_section = polymarket_section + adanos_section
+    logger.info(
+        f"Social sentiment: polymarket={'yes' if polymarket_section else 'no'}, "
+        f"adanos={'yes' if adanos_section else 'no'} "
+        f"(budget {adanos_budget['used']}/{ADANOS_MONTHLY_LIMIT})"
+    )
+
     # 7b. First LLM pass — analyze and generate search tasks
 
     prompt = USER_PROMPT_TEMPLATE.format(
@@ -1611,6 +1775,7 @@ def main():
         news_text=news_text,
         finnhub_news_section=finnhub_news_section,
         sonar_macro_section=sonar_macro_section,
+        social_sentiment_section=social_sentiment_section,
         tavily_section="",
         kb_section=kb_section,
     )
@@ -1720,6 +1885,7 @@ def main():
             news_text=news_text,
             finnhub_news_section=finnhub_news_section,
             sonar_macro_section=sonar_macro_section,
+            social_sentiment_section=social_sentiment_section,
             tavily_section=tavily_section,
             kb_section=kb_section,
             personal_context=personal_context,
@@ -1774,7 +1940,8 @@ def main():
         today_et, slot_label, budget, serpapi_budget,
         tavily_used_before, serpapi_used_before,
         news_items, bool(guardian_key), _finnhub_tickers, finnhub_news_section,
-        sonar_macro_section, all_search_jobs, raw_results, filtered, extract_results,
+        sonar_macro_section, polymarket_section, adanos_section, adanos_budget,
+        all_search_jobs, raw_results, filtered, extract_results,
         tavily_section, llm_meta_p1, llm_meta_p2,
     )
     send_telegram_report(status_md, "")
