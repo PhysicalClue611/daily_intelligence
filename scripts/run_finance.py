@@ -1023,6 +1023,7 @@ def _polymarket_brief(geo_topics: list[str], max_topics: int = 4) -> str:
             )
             resp.raise_for_status()
             data = resp.json()
+            logger.debug(f"Polymarket raw response for '{topic}': {json.dumps(data)[:2000]}")
             markets = data.get("markets") or data.get("events") or []
             for m in markets[:2]:
                 question = (m.get("question") or m.get("title") or "").strip()
@@ -1040,7 +1041,7 @@ def _polymarket_brief(geo_topics: list[str], max_topics: int = 4) -> str:
                     lines.append(f"- [{topic}] {question} → {pairs}")
                     seen.add(question)
         except Exception as e:
-            logger.debug(f"Polymarket query failed for '{topic}': {e}")
+            logger.warning(f"Polymarket query failed for '{topic}': {e}")
             continue
     if not lines:
         return ""
@@ -1068,6 +1069,7 @@ def _adanos_x_sentiment(tickers: list[str], budget: dict) -> str:
                 timeout=10,
             )
             budget["used"] = budget.get("used", 0) + 1
+            logger.debug(f"Adanos raw response for {ticker} (status {resp.status_code}): {resp.text[:2000]}")
             if resp.status_code == 404:
                 continue
             resp.raise_for_status()
@@ -1083,7 +1085,7 @@ def _adanos_x_sentiment(tickers: list[str], budget: dict) -> str:
             if parts:
                 lines.append(f"- {ticker}: {', '.join(parts)}")
         except Exception as e:
-            logger.debug(f"Adanos X sentiment query failed for {ticker}: {e}")
+            logger.warning(f"Adanos X sentiment query failed for {ticker}: {e}")
             continue
     if not lines:
         return ""
@@ -1722,13 +1724,21 @@ def main():
 
     # 6d. Social sentiment — Polymarket (free, prediction-market odds) + Adanos X/Twitter
     # (free tier, capped monthly budget). Anomaly tickers prioritized for Adanos, same as Finnhub.
-    adanos_budget = load_adanos_budget()
-    polymarket_section = _polymarket_brief(list(wl["geo_keywords"].keys()))
-    _adanos_tickers = list(dict.fromkeys(
-        anomaly_ticker_syms + [t for t in wl["stocks"] if t not in anomaly_ticker_syms]
-    ))[:4]
-    adanos_section = _adanos_x_sentiment(_adanos_tickers, adanos_budget)
-    save_adanos_budget(adanos_budget)
+    # Wrapped in its own try/except so any unexpected failure here (e.g. budget file I/O)
+    # degrades to empty sections instead of taking down the rest of the run.
+    polymarket_section = ""
+    adanos_section = ""
+    adanos_budget = {"year_month": "", "used": 0}
+    try:
+        adanos_budget = load_adanos_budget()
+        polymarket_section = _polymarket_brief(list(wl["geo_keywords"].keys()))
+        _adanos_tickers = list(dict.fromkeys(
+            anomaly_ticker_syms + [t for t in wl["stocks"] if t not in anomaly_ticker_syms]
+        ))[:4]
+        adanos_section = _adanos_x_sentiment(_adanos_tickers, adanos_budget)
+        save_adanos_budget(adanos_budget)
+    except Exception as e:
+        logger.warning(f"Social sentiment step failed, continuing without it: {e}")
     social_sentiment_section = polymarket_section + adanos_section
     logger.info(
         f"Social sentiment: polymarket={'yes' if polymarket_section else 'no'}, "
