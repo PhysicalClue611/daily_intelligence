@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 _DI_ENV_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 load_dotenv(_DI_ENV_FILE)
 
+import fcntl
 import json
 import logging
 import math
@@ -72,6 +73,7 @@ WATCHLIST_PATH   = OBSIDIAN / "Hermes/Daily Intelligence/watchlist.md"
 REPORTS_DIR      = OBSIDIAN / "Hermes/Daily Intelligence/Daily Reports"
 BUDGET_PATH      = _PROJ_DIR / "finance_tavily_budget.json"
 ARCHIVE_DIR      = _PROJ_DIR / "archives"  # Extract full-text archive (outside Obsidian, never mined)
+LOCK_FILE        = _PROJ_DIR / "run_finance.lock"  # Prevents concurrent duplicate runs
 
 TAVILY_API_KEY      = os.getenv("TAVILY_API_KEY", "")
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
@@ -1590,9 +1592,36 @@ def _do_search(query: str, budget: dict, serpapi_budget: dict,
     return []
 
 
+# ── Concurrency lock ──────────────────────────────────────────────────────────
+
+def _acquire_lock():
+    """Acquire exclusive process lock; exits immediately if another instance is running.
+    Returns the open file handle (must stay open to hold the lock).
+    """
+    fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd.write(str(os.getpid()))
+        fd.flush()
+        return fd
+    except IOError:
+        fd.close()
+        logger.info("Another run_finance instance is already running (lock held), exiting")
+        sys.exit(0)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    _lock_fd = _acquire_lock()
+    try:
+        _main_body()
+    finally:
+        _lock_fd.close()
+        LOCK_FILE.unlink(missing_ok=True)
+
+
+def _main_body():
     # 0. Handle forced overrides (for manual re-runs)
     force_date = os.getenv("FINANCE_FORCE_DATE", "")
     force_run  = os.getenv("FINANCE_FORCE_RUN", "")
