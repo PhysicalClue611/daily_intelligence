@@ -548,16 +548,121 @@ def format_tavily_results(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def format_extract_results(results: list[dict]) -> str:
-    """Format Extract results (full chunks, up to 600 chars each)."""
+_TIMESTAMP_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
+_PHRASE_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b")
+_STRONG_TOKEN_RE = re.compile(r"\b\d{1,3}(?:\.\d+)?%|\$\d[\d,\.]*|\b\d{4}\b")
+_WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
+
+
+def _extract_key_phrases(text: str) -> set[str]:
+    """Cheap rule-based fact fingerprint: proper-noun phrases + weekday/date/number
+    tokens. Used only for rule-based cross-source corroboration (issue #19) —
+    no extra API/LLM cost. Expect false negatives on paraphrased claims; a miss
+    here means 'no rule-based match found', not proof a claim is uncorroborated."""
+    if not text:
+        return set()
+    phrases = set(_PHRASE_RE.findall(text))
+    tokens = set(m.lower() for m in _STRONG_TOKEN_RE.findall(text))
+    words = set(w.lower() for w in re.findall(r"[A-Za-z]+", text))
+    tokens |= (words & _WEEKDAYS)
+    return phrases | tokens
+
+
+def _detect_low_structure(text: str) -> bool:
+    """Heuristic for video-hub / caption-listing pages (issue #19): they pack many
+    bare timestamp prefixes ('01:32 ...') with few real sentences, unlike article
+    prose. Such pages often surface an isolated caption with no reliable date of
+    its own, which an LLM can otherwise mistake for a fresh, dated claim."""
+    if not text or len(text) < 40:
+        return False
+    ts_count = len(_TIMESTAMP_RE.findall(text))
+    sentence_count = text.count(". ") + text.count("。")
+    return ts_count >= 3 and ts_count > sentence_count
+
+
+def _lookup_published_date(url: str, candidates: list[dict]) -> tuple[str, float | None]:
+    """Resolve a published date for `url` from the pre-extract search result pool —
+    Tavily's /extract response carries no date field, only /search results do."""
+    for r in candidates:
+        if r.get("url") == url:
+            pub = r.get("published_date", "")
+            if not pub:
+                return "", None
+            try:
+                from dateutil import parser as _dp
+                age_h = (datetime.now(ET) - _dp.parse(pub).astimezone(ET)).total_seconds() / 3600
+                return pub, age_h
+            except Exception:
+                return pub, None
+    return "", None
+
+
+def _compute_corroboration(url: str, text: str, candidates: list[dict]) -> int:
+    """Rule-based cross-source check (issue #19): count distinct OTHER domains in the
+    broader candidate pool that share at least one key phrase with this result.
+    Zero cost (no extra API/LLM call), but also a rough heuristic — 0 means 'no
+    overlap found by this rule', not a confirmed single-source claim."""
+    own_domain = url.split("/")[2] if "//" in url else url
+    own_phrases = _extract_key_phrases(text)
+    if not own_phrases:
+        return 0
+    matched_domains: set[str] = set()
+    for r in candidates:
+        curl = r.get("url", "")
+        cdomain = curl.split("/")[2] if "//" in curl else curl
+        if not cdomain or cdomain == own_domain:
+            continue
+        ctext = (r.get("title", "") + " " + (r.get("content") or ""))
+        if own_phrases & _extract_key_phrases(ctext):
+            matched_domains.add(cdomain)
+    return len(matched_domains)
+
+
+def _source_confidence_tags(url: str, full_text: str, candidates: list[dict]) -> str:
+    """Build the '[信源类型/发布时间/交叉印证]' tag line for one Extract source.
+    Shared by format_extract_results() (LLM-facing) and write_extract_archive()
+    (audit trail) so both reflect the same confidence signals. See issue #19."""
+    pub_date, age_h = _lookup_published_date(url, candidates)
+    tags = []
+    if _detect_low_structure(full_text):
+        tags.append("信源类型: 视频/聚合页疑似caption堆叠-无独立时间戳，谨慎对待")
+    if not pub_date:
+        tags.append("发布时间: 未知")
+    elif age_h is not None and age_h > 72:
+        tags.append(f"发布时间: {pub_date}（约{age_h / 24:.0f}天前，警惕过时/已被后续事件覆盖）")
+    else:
+        tags.append(f"发布时间: {pub_date}")
+    corroboration = _compute_corroboration(url, full_text, candidates)
+    tags.append(
+        f"交叉印证: {corroboration}个独立域名有重叠信息佐证" if corroboration > 0
+        else "交叉印证: 未发现其他信源佐证（单一信源）"
+    )
+    return " | ".join(tags)
+
+
+def format_extract_results(results: list[dict], candidates: list[dict] | None = None) -> str:
+    """Format Extract results (full chunks, up to 600 chars each).
+
+    Each source gets a confidence tag line (structure type / date confidence /
+    rule-based corroboration count) so Pass 2 can hedge language on claims that
+    are single-source and/or from undated caption-listing pages, instead of
+    stating them as settled fact (see issue #19 — a Reuters video-hub caption
+    with no date of its own was reported as a confirmed "signing set for Friday").
+    `candidates` is the broader pre-extract search result pool (has published_date
+    and title/content for corroboration matching); pass score_and_filter's output.
+    """
     if not results:
         return ""
+    candidates = candidates or []
     lines = ["[Tavily Extract — 全文片段]"]
     for r in results:
         url = r.get("url", "")
         chunks = r.get("chunks") or []
         raw = r.get("raw_content", "")
+        full_text = " ".join((c.get("content") or "") for c in chunks) or raw
+
         lines.append(f"\n  来源: {url}")
+        lines.append(f"    [{_source_confidence_tags(url, full_text, candidates)}]")
         if chunks:
             for i, chunk in enumerate(chunks[:2]):
                 text = (chunk.get("content") or "")[:600]
@@ -689,9 +794,11 @@ def write_extract_archive(
             lines.append("## Extract 全文")
             for r in extract_results:
                 url = r.get("url", "")
-                lines.append(f"\n### {url}")
                 chunks = r.get("chunks") or []
                 raw = r.get("raw_content", "")
+                full_text = " ".join((c.get("content") or "") for c in chunks) or raw
+                lines.append(f"\n### {url}")
+                lines.append(f"[{_source_confidence_tags(url, full_text, filtered)}]\n")
                 if chunks:
                     for chunk in chunks:
                         text = chunk.get("content") or ""
@@ -887,6 +994,14 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 ① 今日价格异动（[!]标记标的）的驱动力，以及对该持仓逻辑的具体含义
 ② 地缘政治动态对持仓的潜在传导路径（有则写，无则省略）
 ③ 宏观信号（利率、商品、汇率）与仓位暴露的关系
+④ 信源置信度处理：[Tavily Extract] 每条来源前标注了 [信源类型 | 发布时间 | 交叉印证] 标签。
+   写入具体断言（尤其含日期、协议签署、人事变动等强论断）前先看该来源标签：
+   - 标"单一信源"或"视频/聚合页疑似caption堆叠"或"发布时间：未知"的，正文必须用
+     "未证实"/"单一信源，待核实"等措辞明确降级，不得以确定语气写成既成事实
+   - 标"约N天前"且 N 较大的，需提示"可能已被后续事件覆盖"
+   - 有"N个独立域名佐证"（N≥1）的可正常按事实陈述
+   快变的宏观/市场行情下，传统媒体报道常滞后于现状，未标注可靠时间戳的信息尤其容易过时，
+   宁可标注不确定，也不要把孤证当结论
 
 可选覆盖：其他值得关注的市场要闻（无实质内容可省略）
 
@@ -1888,7 +2003,7 @@ def _main_body():
             extract_results = tavily_extract(extract_urls, extract_q, budget)
 
         if extract_results:
-            tavily_section = format_extract_results(extract_results)
+            tavily_section = format_extract_results(extract_results, candidates=prescreened)
             logger.info(f"Using Extract chunks for Pass 2 ({len(extract_results)} sources)")
         elif filtered:
             tavily_section = format_tavily_results(filtered)

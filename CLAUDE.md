@@ -512,6 +512,8 @@ _Tavily: N/10_
 
 71. **yfinance 早间瞬时故障导致 ticker 静默丢失 → LLM 幻觉价格**（2026-06-18 发现修复）：5:30 AM ET yfinance bulk download 对多个 ticker 同时返回空 DataFrame（报 "possibly delisted"，实为瞬时故障，Jun 17/18 各触发一次，受影响：INTC/QCOM/TSLA/NVDA/AMKR/QQQM/SPCX/^TNX）。bulk download 无异常抛出，Finnhub 全局 fallback 不触发，个别 ticker 被 `continue` 丢弃。LLM 收不到价格行，却从 RSS 新闻 / portfolio context 拼凑出幻觉价格（INTC 昨收出现 $183.53，实际 $121.10）。修复：① `fetch_prices.py` 新增 `_finnhub_single_ticker()`，在 `len(closes_daily) < 2` 和 AM `len(_closes_pre) < 2` 两处 `continue` 前先调 Finnhub 单 ticker 补价（AM slot 进一步尝试 `yf.Ticker.info.preMarketPrice`，不同 Yahoo 端点，transient 故障期间通常仍可达）；② `run_finance.py` 价格表生成后检测 `failed_tickers`，非空时向 Pass 1 / Pass 2 prompt 注入"以下标的价格数据获取失败，不得引用具体价格数字"声明。
 
+72. **Tavily extract 对视频聚合页返回无时间戳 caption 堆叠 → LLM 误判为当前时效新闻**（2026-06-30 发现，issue #19）：Reuters 等视频聚合页（`/video/watch/...`）extract 回来的不是文章正文，而是多条视频缩略图 caption 堆叠文本，其中孤立 caption（如"US, Iran reach agreement to end war, signing set for Friday"）无独立时间戳，可能是过期视频，与当前抓取日期无关。Pass 2 LLM 曾把这类孤证当确定事实写入报告（"签署仪式定于周五"，用户核实后其他信源查无此消息）。修复：新增 `_detect_low_structure()`（时间戳前缀密度 vs 句子数，识别 caption 堆叠）、`_lookup_published_date()`（从 extract 前的 search 结果池按 URL 反查发布时间，因为 Tavily `/extract` 响应本身不带日期字段）、`_compute_corroboration()`（规则式事实指纹匹配，统计有多少独立域名与本条内容重叠，零 API/LLM 成本的启发式交叉印证，存在假阴性）。三者汇总为 `_source_confidence_tags()`，在 `format_extract_results()`（LLM 提示词）和 `write_extract_archive()`（本地审计存档）中共用同一套标签。`USER_PROMPT_TEMPLATE_P2` 新增分析要求第④条：单一信源/无时间戳/视频聚合页的具体断言必须用"未证实/单一信源，待核实"降级措辞。方向 4（wire 原文优先/视频路径降权）和方向 5（输出侧二次核验）按用户决定暂缓未实现。
+
 ---
 
 ## 下一步优先事项
