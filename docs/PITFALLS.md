@@ -216,6 +216,17 @@ bot 是 `KeepAlive` 常驻进程，改完 `telegram_commands.py` 必须 `launchc
 
 **方法论教训**：收到"回归"报警时，先验证是否真的是新问题，还是旧问题的可见度因为噪音基线下降而提升——两者的修复方向完全不同，前者要回滚/复查刚才的改动，后者是发现了一个独立的、之前被掩盖的问题。这次差点把无关的独立故障误诊为 #74 修复的副作用。
 
+**补充确认（同日，用户追问"为什么其他服务没这个问题"后验证）**：对照测试同一时段、同一隧道下 `api.telegram.org` vs `slack.com` vs `api.openai.com` 各 30-45 次独立连接：Telegram 3/45≈6.7%失败，Slack 0/45，OpenAI 0/30。排除"隧道对所有新连接都不稳定"，问题精确指向 Telegram 域名——大概率是 Shadowrocket 分流规则把 Telegram（国内被墙服务的典型分流对象）单独路由到了稳定性更差的代理节点/规则组，而 Slack/OpenAI 走直连或更稳定的通用代理组。叠加本脚本的高频轮询（~30s/次 vs Slack 检查脚本 5min/次），暴露次数差 10 倍，绝对故障计数被放大，且只有本项目的日志被巡检脚本盯着看，三个因素共同导致"只有这里持续报错"。
+
+### 77. Telegram 发送调用（sendMessage）与轮询调用（getUpdates）分属两套独立实现，重试补丁只覆盖了轮询
+（2026-07-02 发现修复，issue #23）#76 的重试修复只加在 `telegram_commands.py` 的 `_tg()`（轮询用），`run_finance.py` 里 `send_telegram_report()`/`send_telegram_alert()`（报告推送、故障告警）是完全独立手写的 `httpx.post()`，没有同样的重试。当时的判断是"发送调用频率低（数十次/5天 vs 轮询数万次/5天），统计上不容易撞上失败窗口"——用户指出这是同一个坑，只是运气好没暴露，明确提出三点要求：① 功能上轮询/发送/测试都要同等抗故障；② 重试后成功不算"警告"，是设计好的正常路径；③ 只有真正耗尽重试才该是 WARNING 级别，日志严重级别要反映"是否需要人关注"而不是"底层是否发生过一次网络抖动"。
+
+**修复**：新建 `scripts/telegram_utils.py`，单一函数 `call_telegram(bot_token, endpoint, payload, timeout, max_connect_retries=2)`：对 `httpx.ConnectError` 立即重试（不退避），重试后成功记 `logger.info("...recovered after N retry(ies)")`，全部耗尽才 `logger.warning(...)`。两个脚本的所有 Telegram 调用点统一改为调用这一个函数（`_tg()` 收窄为一行委托），全仓库 grep `api.telegram.org` 确认无遗漏裸调用点。顺带修正：`send_telegram_report`/`send_telegram_alert` 原实现只检查 HTTP 状态码，没检查 Telegram API 返回体的 `ok` 字段（API 层面失败如 `ok: false` 会被当成功放过），现在两者都查。
+
+**验证**：生产重启后 5 分钟窗口，日志只有启动行 + 2 条 "recovered after N retry(ies)"，全部 INFO，零 WARNING。
+
+**方法论教训（已存入项目 memory，跨项目通用）**：给不稳定外部依赖加容错时，容错机制要覆盖该依赖的**全部**调用路径（轮询/发送/测试/告警），不能挑一个高频路径打补丁就停手——低频路径只是统计上不容易暴露，不代表没有同样的坑。日志严重级别应该反映"人是否需要关注"，重试后自愈的瞬时故障是设计好的正常路径，记 INFO；只有兜底耗尽的真实故障才该是 WARNING/ERROR。
+
 ---
 
 ## 六、调度与并发（launchd / cron）
