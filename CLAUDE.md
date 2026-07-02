@@ -25,6 +25,10 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 **Sonar 宏观快照防过时/防幻觉（2026-07-02，issue #24）**：AM报告 Sonar 快照声称"WTI破$100"，实际价格$68.58——Pass2 LLM 自己核对发现矛盾并修正，但机制上无防线。修复 `_sonar_macro_brief()`：① OR payload 加 `search_recency_filter: "day"`（实测确认 OpenRouter 透传给 Perplexity，同一查询加参数前后价格准确度显著改善）；② 注入 pipeline 已算好的 `price_table` 作为权威锚点，冲突时以此为准；③ prompt 强制每条断言带时间戳，无近24h更新须明说不得编造。`telegram_commands.py::_sonar_research()` 同步加固。见踩坑记录第78条。
 
+**getUpdates 轮询改无状态单次调用（2026-07-02，issue #25）**：用户复查issue #22/#23的同步重试方案后指出"太重"——轮询循环本身每~30s自然重跑，循环节奏就是现成的重试机制，不需要单次调用内再套一层。改为：拉不到就静默跳过，`sleep(5)`交给下一轮；持续失败满30分钟才升级为WARNING（而非每次重试耗尽就报）。生产验证：日志格式从"recovered after N retry(ies)"变为"recovered after Ns"（真实停机秒数），零WARNING，单次失败完全不留痕迹。`sendMessage`类调用（无自然重试兜底）不受影响，仍用`call_telegram()`同步重试。见踩坑记录第79条。
+
+**AM 预判校准闭环（2026-07-02，issue #10）**：把"盘后对比版本"从独立报告改造成闭环学习机制。AM报告Pass 1/2 prompt新增条件指令（仅AM slot），报告结尾固定追加"## 可验证信号"小节（2-4条条件-结果式可核验断言）；PM pipeline新增`evaluate_am_calibration()`步骤（报告定稿后、写入Obsidian前），定位当天AM报告的该小节（复用#25教训的日期戳边界定位模式），用一次DeepSeek V4 Flash调用（~$0.0005）对照实际价格/新闻判定hit/miss/inconclusive，提炼"知识条目"（教训而非罗列对错），写入`Hermes/Daily Intelligence/预判校准记录.md`（人类可读）+ MemPalace drawer（`room=finance`，复用现有日报room，AM的`get_finance_context()`天然能语义检索到，无需新增注入管道）。默认不进报告正文，评估步骤自行判断是否"重要到该展示"（给方向性原则而非硬规则，观察一段时间）。今天(07-02)的AM报告是旧prompt生成、无"可验证信号"小节，今晚PM运行会静默跳过，机制从明天AM报告起真正生效。Issue #10 保持open，观察1-2周真实数据。
+
 **踩坑记录结构重组（2026-06-30）**：CLAUDE.md 踩坑记录从完整叙事（每条80-250 tokens，累计17.5K字符）改为一行索引+详情文件指针，完整叙述迁至 `docs/PITFALLS.md`（git-tracked，按需 grep/Read，不自动加载每个 session）。CLAUDE.md 全文从71.2K降至49.3K字符（-31%）。KG 相关8条历史踩坑标注"已下线子系统"归档。新增踩坑一律遵循此规范：这里加一行索引，详情写 `docs/PITFALLS.md` 对应分类小节。
 
 ## 当前系统状态（2026-06-18）
