@@ -19,6 +19,14 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-02）
+
+**Telegram Bot 容错全面重构（2026-07-01/02，issue #20/#21/#22/#23）**：用户提供的定时巡检报告显示 `telegram_commands.py` 5天内 3.4万条超时警告+207条SSL EOF+多次409冲突。四层排查：① `_tg()` 客户端 timeout(10s) 短于 getUpdates 长轮询服务端等待(30s)，几乎每次空轮询自断触发 409（issue #20，修复：`timeout=POLL_TIMEOUT+5`）；② 排查中意外发现 httpx INFO 日志把 Telegram/Finnhub/Guardian 凭据明文写入 644 权限的 `/tmp` 日志文件（issue #21，修复：两脚本均 `logging.getLogger("httpx").setLevel(WARNING)`）；③ 修复①后巡检又报警，验证证明不是回归而是本机 Shadowrocket TUN 隧道对 `api.telegram.org` 域名特定的 ~25-30% 瞬时连接失败率（对照 Slack/OpenAI 同隧道零失败确认域名特定），此前被①的噪音淹没（issue #22，修复：`ConnectError` 快速重试一次）；④ 用户指出重试补丁只覆盖轮询未覆盖发送（`send_telegram_report`/`send_telegram_alert`），要求容错覆盖全部调用路径且日志级别反映"是否需要人关注"（重试成功=INFO，耗尽才WARNING）（issue #23，修复：新建 `scripts/telegram_utils.py::call_telegram()` 共享函数，两脚本统一调用）。方法论已存为跨项目 memory `feedback_uniform_fault_tolerance.md`。见踩坑记录第74-77条。
+
+**Sonar 宏观快照防过时/防幻觉（2026-07-02，issue #24）**：AM报告 Sonar 快照声称"WTI破$100"，实际价格$68.58——Pass2 LLM 自己核对发现矛盾并修正，但机制上无防线。修复 `_sonar_macro_brief()`：① OR payload 加 `search_recency_filter: "day"`（实测确认 OpenRouter 透传给 Perplexity，同一查询加参数前后价格准确度显著改善）；② 注入 pipeline 已算好的 `price_table` 作为权威锚点，冲突时以此为准；③ prompt 强制每条断言带时间戳，无近24h更新须明说不得编造。`telegram_commands.py::_sonar_research()` 同步加固。见踩坑记录第78条。
+
+**踩坑记录结构重组（2026-06-30）**：CLAUDE.md 踩坑记录从完整叙事（每条80-250 tokens，累计17.5K字符）改为一行索引+详情文件指针，完整叙述迁至 `docs/PITFALLS.md`（git-tracked，按需 grep/Read，不自动加载每个 session）。CLAUDE.md 全文从71.2K降至49.3K字符（-31%）。KG 相关8条历史踩坑标注"已下线子系统"归档。新增踩坑一律遵循此规范：这里加一行索引，详情写 `docs/PITFALLS.md` 对应分类小节。
+
 ## 当前系统状态（2026-06-18）
 
 **开源准备（2026-06-18）：IBKR 代码注释禁用（`_ibkr_auth_note()` / `_fetch_ibkr_prices()` 均返回 `""`，函数体保留供将来本地启用），`ibkr/` 目录从 git tracking 移除（`git rm -r --cached`），`.gitignore` 将 `ibkr/` 整目录排除。隐私清理：硬编码邮箱地址改为 env var（`FINANCE_FROM_ADDRESS`），用户名路径全部改为 `$HOME/`，`memory_context_finance.py` 中个人姓名从 MemPalace query 移除。**
