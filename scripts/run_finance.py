@@ -53,6 +53,7 @@ import httpx
 from fetch_prices import fetch_prices, format_price_table, get_anomalies
 from fetch_news import fetch_rss, fetch_guardian_news, format_news_for_prompt
 from memory_context_finance import get_finance_context
+from telegram_utils import call_telegram
 
 from finance_email import send_report
 
@@ -1547,16 +1548,11 @@ def send_telegram_report(report_md: str, subject: str) -> bool:
 
     success = True
     for i, chunk in enumerate(chunks):
-        try:
-            resp = httpx.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"},
-                timeout=10,
-            )
-            resp.raise_for_status()
+        resp = call_telegram(token, "sendMessage", {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"})
+        if resp.get("ok"):
             logger.info(f"Telegram sent chunk {i+1}/{len(chunks)}")
-        except Exception as e:
-            logger.warning(f"Telegram send failed (chunk {i+1}): {e}")
+        else:
+            logger.warning(f"Telegram send failed (chunk {i+1}): {resp}")
             success = False
     return success
 
@@ -1567,17 +1563,8 @@ def send_telegram_alert(text: str) -> bool:
     chat_id = os.getenv("FINANCE_TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
         return False
-    try:
-        resp = httpx.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        logger.warning(f"Telegram alert failed: {e}")
-        return False
+    resp = call_telegram(token, "sendMessage", {"chat_id": chat_id, "text": text})
+    return bool(resp.get("ok"))
 
 
 # ── Email footer (finance-specific) ──────────────────────────────────────────

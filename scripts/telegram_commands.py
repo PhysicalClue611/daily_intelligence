@@ -32,6 +32,8 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 
+from telegram_utils import call_telegram
+
 _HOME = os.path.expanduser("~")
 _DI_ENV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 load_dotenv(_DI_ENV)
@@ -83,28 +85,7 @@ FINNHUB_BASE          = "https://finnhub.io/api/v1"
 # ── Telegram API ──────────────────────────────────────────────────────────────
 
 def _tg(endpoint: str, payload: dict, timeout: float = 10) -> dict:
-    # The local network path to api.telegram.org (TUN proxy) fails ~25-30% of
-    # fresh TLS handshakes almost immediately (~3s, ConnectError/SSL EOF) —
-    # unrelated to how long the request itself would take. One immediate retry
-    # (no backoff — the failure mode is fast, not a hung connection) clears
-    # most of these before they ever reach the warning log (issue #22).
-    for attempt in range(2):
-        try:
-            resp = httpx.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/{endpoint}",
-                json=payload,
-                timeout=timeout,
-            )
-            return resp.json()
-        except httpx.ConnectError as e:
-            if attempt == 0:
-                continue
-            logger.warning(f"Telegram API {endpoint} failed after retry: {e}")
-            return {}
-        except Exception as e:
-            logger.warning(f"Telegram API {endpoint} failed: {e}")
-            return {}
-    return {}
+    return call_telegram(BOT_TOKEN, endpoint, payload, timeout=timeout)
 
 
 def reply_html(html_text: str):
