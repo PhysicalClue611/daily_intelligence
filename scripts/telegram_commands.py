@@ -1323,25 +1323,41 @@ def run():
     logger.info("Finance Telegram bot started (long polling)")
     offset = load_offset()
 
-    POLL_TIMEOUT = 30  # server-side long-poll wait (Telegram payload param)
+    POLL_TIMEOUT = 30             # server-side long-poll wait (Telegram payload param)
+    POLL_RETRY_PAUSE = 5          # pacing delay before the next natural poll after a failed attempt
+    STALE_ALERT_THRESHOLD = 1800  # 30 min of continuous failure before it's worth a WARNING
+
+    failing_since: float | None = None
 
     while True:
+        # Stateless single-shot (issue #25): this loop already re-polls every
+        # ~30s, so the loop itself is the retry mechanism — no need for an
+        # in-call retry on top of it (that used to add ~3.2s latency to
+        # ~25% of cycles absorbing a connect-flakiness issue the next
+        # natural iteration would clear anyway, see docs/PITFALLS.md #76).
+        # A single failed attempt is silently skipped ("拉不到就 pass，下一
+        # 轮再拉"); only sustained failure (30 min straight — implausible
+        # unless something is genuinely wrong, not just a flaky proxy hop)
+        # escalates to WARNING.
         try:
-            # Client read timeout must exceed the server-side long-poll wait,
-            # otherwise httpx aborts the read before Telegram's 30s window
-            # elapses on every empty poll — this was firing on nearly every
-            # cycle (34k+ "read operation timed out" over 5 days) and the
-            # abandoned-but-still-pending long polls on Telegram's side then
-            # collided with the next request as HTTP 409 Conflict (issue #20).
-            resp = _tg(
-                "getUpdates",
-                {"offset": offset, "timeout": POLL_TIMEOUT, "limit": 20},
+            resp = httpx.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                json={"offset": offset, "timeout": POLL_TIMEOUT, "limit": 20},
                 timeout=POLL_TIMEOUT + 5,
             )
-            updates = resp.get("result", [])
+            updates = resp.json().get("result", [])
+            if failing_since is not None:
+                logger.info(f"getUpdates recovered after {time.time() - failing_since:.0f}s")
+                failing_since = None
         except Exception as e:
-            logger.warning(f"getUpdates error: {e}, retrying in 5s")
-            import time; time.sleep(5)
+            now = time.time()
+            if failing_since is None:
+                failing_since = now
+            down_for = now - failing_since
+            if down_for >= STALE_ALERT_THRESHOLD:
+                logger.warning(f"getUpdates has been failing for {down_for / 60:.0f}min straight: {e}")
+                failing_since = now  # re-arm — warn again only after another 30min of continued failure
+            time.sleep(POLL_RETRY_PAUSE)
             continue
 
         for update in updates:
