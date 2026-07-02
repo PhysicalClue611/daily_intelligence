@@ -188,6 +188,15 @@ bot 是 `KeepAlive` 常驻进程，改完 `telegram_commands.py` 必须 `launchc
 ### 55. `_unified_preprocess` max_tokens 截断
 （2026-05-26）followup 类需输出 query + search_queries（两条英文约 200 字）+ question_intent 等，合计超过 350 tokens，JSON 截断，`json.loads` 抛 JSONDecodeError，fallback 到 `{"action": "unknown"}`，bot 回复"未识别指令"。修复：max_tokens 350→600。
 
+### 74. getUpdates 长轮询超时配置错位：客户端 timeout(10s) < Telegram 长轮询 timeout(30s)，引发超时刷屏+409冲突
+（2026-07-01 发现修复，issue #20）用户巡检报告：`telegram_commands.py`（launchd KeepAlive 常驻）5 天内产生 34,117 次 `read operation timed out`、207 次 `SSL UNEXPECTED_EOF_WHILE_READING`、5 次 `HTTP 409 Conflict`（getUpdates），全是 WARNING/INFO，无崩溃，"带病运行"。
+
+**根因（单一根因解释全部三症状）**：`_tg()`（:80）对所有 Telegram API 调用统一用 `httpx.post(..., timeout=10)`，但主循环调用 `getUpdates` 传的 payload 是 `{"timeout": 30, ...}`——这个 `30` 是 Telegram **长轮询**参数，告诉服务端没有新消息时最多挂起连接 30 秒。客户端 read timeout（10s）比服务端承诺的等待时间短 20 秒，于是几乎每次空轮询（绝大多数周期）都在服务端还没来得及返回前被客户端自己掐断，抛 `ReadTimeout`，`except Exception` 吞掉记成 WARNING，`sleep(5)` 后重试，5 天堆出 3.4 万条日志。409 由此连锁触发：客户端本地放弃读取不等于服务端立即感知取消，若下一次 `getUpdates` 恰好落在上一个请求服务端仍未释放的窗口内，Telegram 判定"同一 bot 两个并发 getUpdates"返回 409。SSL EOF（207次/5天）大概率是同一族问题的极端情况（Telegram 强制断开重叠连接）。
+
+**已排除的其他可能性**（巡检报告列出但验证不成立）：`ps aux` 确认只有一个进程；`getWebhookInfo` 确认未设 webhook；全盘 grep bot token 仅在 `~/.hermes/.env.bak*`（过期备份，无脚本加载）中出现，活跃的 `~/.hermes/.env` 不含该 token。
+
+**修复**：`_tg()` 新增 `timeout` 参数（默认保持10，向后兼容其他调用），`run()` 调用 `getUpdates` 时显式传 `timeout=POLL_TIMEOUT+5`（35s），确保客户端永远比服务端多等。重启后观察 45 秒无任何新增 timeout/409/SSL EOF 记录（修复前平均 10-15 秒一条）。
+
 ---
 
 ## 六、调度与并发（launchd / cron）
@@ -257,7 +266,22 @@ LLM 始终写「开盘前简报」，需在写文件前 `re.sub` 替换为「夜
 
 ---
 
-## 十、已下线子系统：Knowledge Graph（KG 三元组，2026-06-12 全面下线）
+## 十、凭据与日志卫生
+
+### 75. Telegram bot token / Finnhub / Guardian API key 以明文形式写入世界可读的 /tmp 日志文件
+（2026-07-01 发现修复，issue #21，排查 issue #20 时意外发现）`telegram_commands.py` 和 `run_finance.py` 均用 `logging.basicConfig(level=logging.INFO)` 配置根 logger。httpx 库内建的请求日志同样走 Python logging 且默认 propagate 到 root，在 INFO 级别输出完整请求 URL——而 Telegram Bot API 把认证 token 直接编码在 URL 路径（`https://api.telegram.org/bot<TOKEN>/method`），Finnhub/Guardian 把 key 放在查询参数（`?token=`/`?api-key=`），于是每次 API 调用都把明文凭据写进日志。`/tmp/finance_telegram.log`（79000+行）和 `/tmp/daily_intelligence.log` 均为 `-rw-r--r--`（644，本机任何本地账户可读）。实测 `/tmp/daily_intelligence.log` 中已有 54 处明文 `api-key=`/`token=`。
+
+**影响面**：Telegram bot token（可完全冒充 `@PhyCluFintel_bot`）、Finnhub/Guardian API key（免费/低权限，无资金操作权限）。不涉及账号密码或其他系统。
+
+**修复**：两个文件的 `logging.basicConfig()` 之后各加一行 `logging.getLogger("httpx").setLevel(logging.WARNING)`，httpx 自身请求日志降级，不再输出完整 URL；应用层日志（`_tg()` 内的 warning 等）仍能感知调用失败，不影响可观测性。
+
+**遗留（需用户执行，代码层无法完成）**：① 已暴露的凭据视为泄露处理——Telegram bot token 建议通过 BotFather `/revoke` 重新生成；Finnhub/Guardian key 评估是否重新生成；② 历史日志文件内容已含明文凭据，建议清理或轮转。
+
+**举一反三**：任何脚本若 `logging.basicConfig(level=INFO)` 且底层调用 httpx/requests 访问带 token 查询参数或路径的 API，都有同类风险——新增外部 API 调用时应默认检查 URL 是否含凭据，若含则该脚本必须显式压低 `httpx`/`requests` logger 级别，不能依赖"忘了配置"的默认状态。
+
+---
+
+## 十一、已下线子系统：Knowledge Graph（KG 三元组，2026-06-12 全面下线）
 
 **说明**：以下踩坑记录的触发代码（`kg_extractor_finance.py` 及 `memory_context_finance.py`/`telegram_commands.py` 中的 KG 相关函数）已于 2026-06-12 全面删除，系统回退为两层知识体系（Obsidian + MemPalace）。这些坑**不会再复现**，保留仅供未来若重新引入类似的实体关系图谱设计时参考，不需要在日常排障时优先检索。
 

@@ -445,6 +445,8 @@ _Tavily: N/10_
 71. yfinance 早间瞬时故障导致 ticker 静默丢失 → LLM 幻觉价格 → 详见 `docs/PITFALLS.md#71`
 72. 三个 launchd plist 并存导致 AM/PM 报告各发两次 → 详见 `docs/PITFALLS.md#72`
 73. Tavily extract 对视频聚合页返回无时间戳 caption 堆叠 → LLM 误判为当前时效新闻 → 详见 `docs/PITFALLS.md#73`
+74. getUpdates 长轮询超时配置错位（客户端10s<服务端30s），引发超时刷屏+409冲突 → 详见 `docs/PITFALLS.md#74`
+75. Telegram/Finnhub/Guardian 凭据经 httpx INFO 日志明文写入世界可读 /tmp 文件（安全）→ 详见 `docs/PITFALLS.md#75`
 
 ---
 
