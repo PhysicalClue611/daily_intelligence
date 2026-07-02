@@ -752,6 +752,11 @@ def _sonar_research(query: str, price_context: str = "") -> str:
         ],
         "max_tokens": 1500,
         "temperature": 0.1,
+        # Restricts Perplexity's underlying search to sources published in the
+        # last 24h — confirmed passed through by OpenRouter, not silently
+        # dropped. See run_finance.py's _sonar_macro_brief for the incident
+        # this addresses (docs/PITFALLS.md).
+        "search_recency_filter": "day",
     }
     for attempt in range(2):
         try:

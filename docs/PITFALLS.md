@@ -160,6 +160,15 @@ peer closed connection / Server disconnected / SSL UNEXPECTED_EOF 等瞬时错�
 
 **遗留**：方向 4（wire 原文优先/视频路径降权）并入 issue #14 范围：把"信源形态"判断从"extract 抓完全文后事后打标"前移到"候选阶段 URL 路径正则前筛"（识别 `/video/`、`/watch/`、`/gallery/` 等），与 #14 原有的"相关度分类"（个股直接命中/行业关联/宏观背景）合并成统一候选打标层，同域名同事件的视频版/文章版做去重降权，省 Tavily extract credit。用户决定先观察一段时间再评估是否启动。方向 5（输出侧二次核验）暂缓，需评估额外搜索额度成本（当前 Tavily 预算仅 20cr/日）。
 
+### 78. Sonar 宏观快照报告过时/幻觉信息，未限定检索时间窗且未锚定实时价格
+（2026-07-02 发现修复，issue #24）2026-07-02 AM 报告的 Sonar 宏观快照声称"原油飙破 $100、黄金下跌、美元走强"（典型滞涨初期画面），但同一份报告的实际价格数据显示 WTI 跌破 $70（$68.58，-2.13%），黄金 ETF 盘前涨 1.30%——与 Sonar 描述完全相反。Pass 2 LLM 靠自己核对价格数据发现了矛盾并在报告里做了修正说明，但这只是运气好被下游 LLM 接住，机制上没有防线——用户明确要求：严格限定 Sonar 情报的检索时间窗，或找别的办法拿到新情报；至少要求返回信息带时间戳。
+
+**根因**：`_sonar_macro_brief()` 调用 Perplexity Sonar via OpenRouter 时：① 未设置 `search_recency_filter`，底层搜索没有时间窗约束，可能召回/合成陈旧或不相关文章；② 未把调用这一步之前 pipeline 已经算好的实时价格表（`price_table`）注入给 Sonar 做锚定，Sonar 完全靠自己的搜索结果"重新发明"价格；③ prompt 只泛泛要求"time-stamped developments"，没有强制每条具体断言必须带时间戳，也没要求"找不到近24小时更新就明说，不能拿旧信息冒充当前"。
+
+**验证**：直接测试 `perplexity/sonar` via OpenRouter 加 `search_recency_filter: "day"`——OpenRouter 确认透传给 Perplexity（不报错，结果明显不同），同样问"WTI 当前价格"，加参数后返回 $68.00（对比真实 $68.58，误差很小）并附带具体来源时间戳。进一步用假造 price_table 注入测试，模型正确遵循"若搜索结论与注入价格冲突，以注入价格为准并明确指出冲突"，且对缺乏近24小时更新的具体问题（如 USD/JPY）正确输出"no update in past 24h"而非编造。
+
+**修复**：`_sonar_macro_brief()` 三处改动——① OR payload 加 `"search_recency_filter": "day"`；② 新增 `price_table` 参数，system prompt 注入"以下为实时价格数据（权威，非搜索结果），若你的搜索结论与之冲突，以此为准并明确指出冲突"；③ user prompt 加"对每个具体数字/断言说明来源发布时间；若某话题近24小时无更新，明确说明'无近24小时更新'，不要用旧信息冒充当前"。`telegram_commands.py` 的 `_sonar_research()`（TG 追问流水线的 Sonar fallback，同一模型同一风险，此前已有价格锚定但缺这个检索层约束）同步加 `search_recency_filter: "day"`。
+
 ---
 
 ## 五、Telegram Bot 与追问流水线

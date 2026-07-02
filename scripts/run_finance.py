@@ -1028,12 +1028,25 @@ def _sonar_macro_brief(
     geo_topics: list[str],
     now_et: "datetime",
     portfolio_snapshot: str = "",
+    price_table: str = "",
 ) -> str:
     """Call Perplexity Sonar for a real-time macro intelligence snapshot.
 
     Query is built dynamically from the current watchlist so it evolves as holdings change.
     Returns a formatted section string for LLM prompt injection. Fail-open (returns "" on error).
     Cost: ~$0.005 (Sonar fixed search fee, billed via OpenRouter).
+
+    Staleness hardening (2026-07-02): Sonar has synthesized macro claims that
+    contradicted same-day live price data (e.g. reporting WTI "breaking above
+    $100" when the actual price was ~$68) — it's a search+synthesis model, not
+    a quote feed, and can surface or blend in older/less-relevant source
+    material. Three mitigations: (1) `search_recency_filter: "day"` restricts
+    Perplexity's underlying search to sources published in the last 24h
+    (confirmed passed through by OpenRouter, not silently dropped); (2) the
+    live price_table already computed earlier in the pipeline is injected as
+    ground truth the model must defer to on conflict; (3) the prompt requires
+    a per-claim timestamp and explicit "no update" instead of stale-but-undated
+    claims.
     """
     if not OPENROUTER_API_KEY:
         return ""
@@ -1081,15 +1094,27 @@ def _sonar_macro_brief(
         f"Deliver: (1) single most market-moving development with specific numbers, "
         f"(2) direct sector impact on semiconductors/EV/energy/bonds/FX, "
         f"(3) one forward-looking signal to watch in the next 12-24 hours. "
-        f"Be specific. No generic commentary."
+        f"Be specific. No generic commentary. "
+        f"For every specific number or claim (price, rate, event), state its source's "
+        f"publish date/time. If you cannot find anything from the last 24 hours on a "
+        f"topic, say so explicitly ('no update in past 24h') instead of reporting an "
+        f"undated or older claim as if it were current."
     )
 
     system = (
         f"You are a macro intelligence analyst serving a personal investor. "
         f"Today is {now_str}. Reason in NYSE Eastern Time. "
-        f"Focus on actionable, time-stamped developments. "
+        f"Focus on actionable, time-stamped developments — every factual claim must carry "
+        f"a publish date/time so staleness is visible, not implied. "
         f"If portfolio snapshot is provided, tailor analysis to those holdings.\n"
         + (f"Portfolio: {portfolio_snapshot}\n" if portfolio_snapshot else "")
+        + (
+            f"\nLive price data as of {now_str} (authoritative — this is a direct feed, "
+            f"not a search result): if any search-derived claim in your answer conflicts "
+            f"with these numbers, defer to these numbers and flag the conflict explicitly "
+            f"rather than presenting the older search claim as current.\n{price_table}\n"
+            if price_table else ""
+        )
     )
 
     or_payload = {
@@ -1101,6 +1126,7 @@ def _sonar_macro_brief(
         "max_tokens": 800,
         "temperature": 0.1,
         "provider": {"order": ["Perplexity"], "allow_fallbacks": False},
+        "search_recency_filter": "day",
     }
     slot_label = "开盘前" if slot == "am" else "夜盘"
     for attempt in range(2):
@@ -1870,6 +1896,7 @@ def _main_body():
         geo_topics=list(wl["geo_keywords"].keys()),
         now_et=now_et,
         portfolio_snapshot=kb_context[:400] if kb_context else "",
+        price_table=price_table,
     )
 
     # 6d. Social sentiment — Polymarket (free, prediction-market odds) + Adanos X/Twitter
