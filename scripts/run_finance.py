@@ -936,6 +936,20 @@ def _load_layer_a() -> str:
 
 SYSTEM_PROMPT_P2 = _load_layer_a()
 
+# AM-only instruction (issue #10): ask for a short list of falsifiable claims
+# that the PM run can mechanically check against actual EOD data that evening.
+# Kept out of the PM prompt — the point is to test the morning's calls against
+# what actually happened, not to have every report predict itself.
+VERIFIABLE_SIGNALS_INSTRUCTION_P1 = (
+    "4. report_md 结尾追加\"## 可验证信号\"小节，2-4条，每条必须是可被今晚收盘后核验的具体条件-结果断言"
+    "（如\"WTI跌破$65→通胀预期继续下修\"、\"Fed官员今日确认/否认降息\"），不写模糊定性描述（如\"值得关注\"）"
+)
+VERIFIABLE_SIGNALS_INSTRUCTION_P2 = (
+    "⑤ 可验证信号：report_md 结尾追加\"## 可验证信号\"小节，2-4条，每条必须是可被今晚收盘后核验的"
+    "具体条件-结果断言（价格阈值/事件是否发生），不写模糊定性描述——这些会在今晚 PM 报告生成前被核验，"
+    "核验结果沉淀为知识库供未来报告参考"
+)
+
 USER_PROMPT_TEMPLATE = """今日日期（ET）：{date}
 当前时间：{now_str}
 上次报告：{last_report_date}
@@ -976,6 +990,7 @@ USER_PROMPT_TEMPLATE = """今日日期（ET）：{date}
 2. tavily_queries：为需要更多背景的事件生成搜索对象数组，每项格式：
    {{"query": "英文搜索词", "search_depth": "basic", "days": N, "max_results": 12}}
 3. 严格JSON格式，report_md内换行用\\n
+{verifiable_signals_rule}
 """
 
 # Pass 2 prompt template: free-form analysis with personal context (Layer B injected at call site)
@@ -1008,6 +1023,7 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
    - 有"N个独立域名佐证"（N≥1）的可正常按事实陈述
    快变的宏观/市场行情下，传统媒体报道常滞后于现状，未标注可靠时间戳的信息尤其容易过时，
    宁可标注不确定，也不要把孤证当结论
+{verifiable_signals_rule}
 
 可选覆盖：其他值得关注的市场要闻（无实质内容可省略）
 
@@ -1464,6 +1480,167 @@ def get_last_report_date() -> str:
         if dates:
             return max(dates)
     return "N/A（首次运行）"
+
+
+# ── AM prediction calibration (issue #10) ────────────────────────────────────
+# Self-contained, fail-open block. PM slot only: locates today's AM report's
+# "## 可验证信号" list (added by VERIFIABLE_SIGNALS_INSTRUCTION_P1/P2 above),
+# has a cheap LLM judge each claim against today's actual price/news data,
+# writes the verdict as a knowledge entry to Obsidian + MemPalace (room=finance)
+# so future AM runs can retrieve it via the existing get_finance_context()
+# search — that's the "recursive improvement" loop, no bespoke injection
+# pipeline needed. Only appends to the PM report itself if the evaluation
+# step judges the result important enough to flag (most days it won't).
+# Entirely optional: any failure here is caught and logged, the main report
+# pipeline is unaffected either way.
+
+CALIBRATION_LOG_PATH = OBSIDIAN / "Hermes/Daily Intelligence/预判校准记录.md"
+
+_CALIBRATION_SYSTEM_PROMPT = (
+    "你是一名负责复盘财经分析准确率的助理。任务是拿今早报告里的具体预判，"
+    "对照今天实际发生的情况做核验，并提炼出对未来分析有参考价值的教训。"
+    "只输出要求的 JSON，不要附加其他文字。"
+)
+
+
+def _extract_report_section(month_text: str, date_str: str, slot_label: str) -> str:
+    """Extract one day's report section from a monthly file, bounded by the
+    next date-stamped '## YYYY-MM-DD ...' header — not by internal '## '
+    subsections within the report itself (see docs/PITFALLS.md #25, the same
+    bug pattern in the old KG section-locator)."""
+    pattern = re.compile(
+        rf"## {re.escape(date_str)} {re.escape(slot_label)}\n(.*?)(?=\n## \d{{4}}-\d{{2}}-\d{{2}} |\Z)",
+        re.DOTALL,
+    )
+    m = pattern.search(month_text)
+    return m.group(1) if m else ""
+
+
+def _extract_verifiable_signals(am_section_text: str) -> str:
+    """Pull the '## 可验证信号' bullet list out of an AM report section, if present."""
+    m = re.search(r"## 可验证信号\s*\n(.*?)(?=\n## |\n\n---\n|\Z)", am_section_text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def _evaluate_am_predictions(signals_text: str, price_table: str, news_context: str, date_str: str) -> dict:
+    """Single cheap LLM call: judge each AM 'verifiable signal' against today's
+    actual outcome data. Returns {} on any failure or empty input (fail-open).
+    Cost: ~$0.0005 (small prompt, deepseek-v4-flash via OR)."""
+    if not OPENROUTER_API_KEY or not signals_text.strip():
+        return {}
+    prompt = f"""今日日期：{date_str}
+
+今早 AM 报告中的可验证信号清单：
+{signals_text}
+
+今日实际结果：
+## 价格数据
+{price_table}
+
+## 新闻/宏观上下文（节选）
+{news_context[:3000]}
+
+任务：
+1. 对清单中每一条，判断 hit（命中）/ miss（未命中）/ inconclusive（无法判断），给一句话理由。
+2. 写一段"知识条目"（knowledge_entry）——不是简单罗列对错，而是提炼一条对未来分析有参考价值的教训或验证
+   （例如某类判断的系统性偏差、某条框架逻辑被验证有效），供未来生成 AM 报告时参考。50-150字。
+3. 判断今天的校验结果是否重要到需要出现在今晚报告正文里。原则：
+   - 只有当某条高置信度判断被证伪、或某条核心框架逻辑被验证、或存在需要立即警惕的偏差模式时才算"重要"
+   - 普通的命中/未命中是常态，不是新闻，不需要展示
+   - 宁可少展示，不要为了"有内容"就展示
+
+输出 JSON（不要附加任何其他文字）：
+{{
+  "verdicts": [{{"claim": "...", "verdict": "hit|miss|inconclusive", "reasoning": "..."}}],
+  "knowledge_entry": "...",
+  "worth_surfacing": true,
+  "surface_blurb": "若 worth_surfacing 为 true，一段可直接放进今晚报告正文的文字（含具体原因）；否则留空字符串"
+}}
+"""
+    try:
+        return call_llm(prompt, model=LLM_MODEL, system_prompt=_CALIBRATION_SYSTEM_PROMPT)
+    except Exception as e:
+        logger.warning(f"AM prediction evaluation failed (non-fatal): {e}")
+        return {}
+
+
+def _write_calibration_knowledge(date_str: str, knowledge_entry: str, verdicts: list) -> None:
+    """Append to Obsidian 预判校准记录.md + push a MemPalace drawer (room=finance,
+    same room the daily report drawers already use — so get_finance_context()'s
+    existing search surfaces this for future AM runs with no new plumbing).
+    Fail-open on both writes independently."""
+    if not knowledge_entry:
+        return
+    try:
+        CALIBRATION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        verdict_lines = "\n".join(
+            f"- [{v.get('verdict', '?')}] {v.get('claim', '')} — {v.get('reasoning', '')}"
+            for v in verdicts if isinstance(v, dict)
+        )
+        entry = f"\n## {date_str}\n\n{knowledge_entry}\n\n{verdict_lines}\n\n---\n"
+        if not CALIBRATION_LOG_PATH.exists():
+            header = "---\nsource: Daily Intelligence 预判校准\n---\n\n# AM 预判校准记录\n"
+            CALIBRATION_LOG_PATH.write_text(header + entry, encoding="utf-8")
+        else:
+            with CALIBRATION_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(entry)
+        logger.info(f"Calibration knowledge written → {CALIBRATION_LOG_PATH.name}")
+    except Exception as e:
+        logger.warning(f"Calibration knowledge write failed (non-fatal): {e}")
+
+    try:
+        resp = httpx.post(
+            "http://localhost:8765/mempalace/add_drawer",
+            json={
+                "wing": "paperview",
+                "room": "finance",
+                "content": f"预判校准 {date_str}：\n{knowledge_entry}",
+                "source_file": "Hermes/Daily Intelligence/预判校准记录.md",
+                "added_by": "daily-intel-calibration",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        logger.info("Calibration MemPalace drawer written")
+    except Exception as e:
+        logger.warning(f"Calibration MemPalace drawer skipped: {e}")
+
+
+def evaluate_am_calibration(today_et: str, run_slot: str, price_table: str,
+                            finnhub_news_section: str, sonar_macro_section: str,
+                            report_md: str) -> str:
+    """Top-level entry point for the calibration step — PM slot only. Returns
+    report_md unchanged, or with a '## 预判校验' section appended if the
+    evaluation judged today's result worth surfacing. Fully fail-open: any
+    exception here just returns report_md unchanged and logs a warning."""
+    if run_slot != "pm":
+        return report_md
+    try:
+        am_slot_label = "开盘前简报"
+        month_path = _monthly_path(today_et)
+        if not month_path.exists():
+            return report_md
+        month_text = month_path.read_text(encoding="utf-8")
+        am_section = _extract_report_section(month_text, today_et, am_slot_label)
+        signals_text = _extract_verifiable_signals(am_section)
+        if not signals_text:
+            logger.info("No '可验证信号' section found in today's AM report, skipping calibration")
+            return report_md
+
+        news_context = "\n".join(filter(None, [finnhub_news_section, sonar_macro_section]))
+        evaluation = _evaluate_am_predictions(signals_text, price_table, news_context, today_et)
+        knowledge_entry = evaluation.get("knowledge_entry", "")
+        verdicts = evaluation.get("verdicts", [])
+        if knowledge_entry:
+            _write_calibration_knowledge(today_et, knowledge_entry, verdicts)
+
+        if evaluation.get("worth_surfacing") and evaluation.get("surface_blurb"):
+            report_md += f"\n\n---\n\n## 预判校验\n{evaluation['surface_blurb']}\n"
+            logger.info("Calibration result surfaced in PM report")
+        return report_md
+    except Exception as e:
+        logger.warning(f"AM prediction calibration step failed (non-fatal): {e}")
+        return report_md
 
 
 # ── MemPalace drawer writer ───────────────────────────────────────────────────
@@ -1941,6 +2118,7 @@ def _main_body():
         social_sentiment_section=social_sentiment_section,
         tavily_section="",
         kb_section=kb_section,
+        verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P1 if run_slot == "am" else "",
     )
     result = call_llm(prompt)
     llm_meta_p1 = result.get("_llm_meta", {})
@@ -2052,6 +2230,7 @@ def _main_body():
             tavily_section=tavily_section,
             kb_section=kb_section,
             personal_context=personal_context,
+            verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P2 if run_slot == "am" else "",
         )
         result2 = call_llm(prompt2, model=LLM_MODEL_PASS2, system_prompt=SYSTEM_PROMPT_P2)
         llm_meta_p2 = result2.get("_llm_meta", {})
@@ -2073,6 +2252,12 @@ def _main_body():
             report_md,
             flags=re.MULTILINE,
         )
+
+    # 10b. AM prediction calibration (PM slot only, issue #10) — see function
+    # docstring for design notes. Fail-open: never raises.
+    report_md = evaluate_am_calibration(
+        today_et, run_slot, price_table, finnhub_news_section, sonar_macro_section, report_md
+    )
 
     # 11. Write to Obsidian monthly file
     write_report(today_et, slot_label, report_md, budget)
