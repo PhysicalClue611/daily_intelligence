@@ -447,6 +447,7 @@ _Tavily: N/10_
 73. Tavily extract 对视频聚合页返回无时间戳 caption 堆叠 → LLM 误判为当前时效新闻 → 详见 `docs/PITFALLS.md#73`
 74. getUpdates 长轮询超时配置错位（客户端10s<服务端30s），引发超时刷屏+409冲突 → 详见 `docs/PITFALLS.md#74`
 75. Telegram/Finnhub/Guardian 凭据经 httpx INFO 日志明文写入世界可读 /tmp 文件（安全）→ 详见 `docs/PITFALLS.md#75`
+76. Shadowrocket TUN 隧道对新建TLS连接~25-30%瞬时失败率，#74修复后噪音归零被误判为回归 → 详见 `docs/PITFALLS.md#76`
 
 ---
 
