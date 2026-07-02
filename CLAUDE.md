@@ -458,6 +458,7 @@ _Tavily: N/10_
 76. Shadowrocket TUN 隧道对新建TLS连接~25-30%瞬时失败率，#74修复后噪音归零被误判为回归 → 详见 `docs/PITFALLS.md#76`
 77. sendMessage 与 getUpdates 分属两套独立实现，重试补丁只覆盖了轮询未覆盖发送 → 详见 `docs/PITFALLS.md#77`
 78. Sonar 宏观快照过时/幻觉信息（曾报WTI>$100，实际$68.58），未限定检索时间窗+未锚定实时价格 → 详见 `docs/PITFALLS.md#78`
+79. getUpdates 同步重试是多余复杂度，轮询循环本身节奏已是现成的重试机制 → 详见 `docs/PITFALLS.md#79`
 
 ---
 
