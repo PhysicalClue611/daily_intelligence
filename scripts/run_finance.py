@@ -962,7 +962,7 @@ USER_PROMPT_TEMPLATE = """今日日期（ET）：{date}
 ## 过去24小时新闻（RSS）
 {news_text}
 
-{finnhub_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}
+{finnhub_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}{calibration_notes}
 ---
 
 ## 搜索任务约束（填写 tavily_queries 时遵守）
@@ -1004,7 +1004,7 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 ## 过去24小时新闻（RSS）
 {news_text}
 
-{finnhub_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}
+{finnhub_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}{calibration_notes}
 ---
 
 == 持仓与框架 ==
@@ -1486,15 +1486,24 @@ def get_last_report_date() -> str:
 # Self-contained, fail-open block. PM slot only: locates today's AM report's
 # "## 可验证信号" list (added by VERIFIABLE_SIGNALS_INSTRUCTION_P1/P2 above),
 # has a cheap LLM judge each claim against today's actual price/news data,
-# writes the verdict as a knowledge entry to Obsidian + MemPalace (room=finance)
-# so future AM runs can retrieve it via the existing get_finance_context()
-# search — that's the "recursive improvement" loop, no bespoke injection
-# pipeline needed. Only appends to the PM report itself if the evaluation
-# step judges the result important enough to flag (most days it won't).
-# Entirely optional: any failure here is caught and logged, the main report
-# pipeline is unaffected either way.
+# writes the verdict as a knowledge entry. Only appends to the PM report
+# itself if the evaluation step judges the result important enough to flag
+# (most days it won't). Entirely optional: any failure here is caught and
+# logged, the main report pipeline is unaffected either way.
+#
+# Durability (2026-07-02, per user's flag that MemPalace's `finance` room has
+# been fully rebuilt multiple times recently): Obsidian is the source of
+# truth, not MemPalace. _load_recent_calibration_notes() reads the Obsidian
+# log directly for the AM-side "recursive improvement" injection — it does
+# NOT depend on get_finance_context()'s generic MemPalace search picking this
+# content up, which was never targeted or guaranteed anyway. The MemPalace
+# drawer write is kept as a secondary enrichment layer only (nice-to-have for
+# ad-hoc semantic queries), never the sole channel. A local backup mirror
+# (outside Obsidian, outside git — see .gitignore) protects against Obsidian-
+# side loss (sync conflicts, accidental deletion) independently of MemPalace.
 
 CALIBRATION_LOG_PATH = OBSIDIAN / "Hermes/Daily Intelligence/预判校准记录.md"
+CALIBRATION_BACKUP_PATH = _PROJ_DIR / "backups" / "预判校准记录_backup.md"
 
 _CALIBRATION_SYSTEM_PROMPT = (
     "你是一名负责复盘财经分析准确率的助理。任务是拿今早报告里的具体预判，"
@@ -1564,29 +1573,55 @@ def _evaluate_am_predictions(signals_text: str, price_table: str, news_context: 
         return {}
 
 
+def _append_calibration_entry(path: Path, entry: str, header: str) -> bool:
+    """Append-only write to `path` (creating with `header` if new). Append mode
+    never truncates existing content — no in-place-overwrite data-loss risk
+    (unlike `open(path, 'w')`, see global CLAUDE.md 破坏性文件写入安全). Returns
+    True on success; caller logs and treats failure as non-fatal."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(header + entry, encoding="utf-8")
+    else:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(entry)
+    return True
+
+
 def _write_calibration_knowledge(date_str: str, knowledge_entry: str, verdicts: list) -> None:
-    """Append to Obsidian 预判校准记录.md + push a MemPalace drawer (room=finance,
-    same room the daily report drawers already use — so get_finance_context()'s
-    existing search surfaces this for future AM runs with no new plumbing).
-    Fail-open on both writes independently."""
+    """Write the same entry to two independent append-only stores, plus a
+    MemPalace drawer as a secondary enrichment layer:
+
+    1. Obsidian 预判校准记录.md — source of truth, human-readable, what
+       _load_recent_calibration_notes() reads back for the AM injection.
+    2. CALIBRATION_BACKUP_PATH — local mirror outside Obsidian and outside
+       git (see .gitignore), independent of iCloud sync issues.
+    3. MemPalace drawer (room=finance) — best-effort semantic-search
+       enrichment only. Per user's flag (2026-07-02) that this room has been
+       fully rebuilt multiple times, nothing here depends on this surviving;
+       (1) and (2) are the durable stores.
+
+    Each write is independently fail-open — one failing doesn't block the
+    others or the main report pipeline."""
     if not knowledge_entry:
         return
+    verdict_lines = "\n".join(
+        f"- [{v.get('verdict', '?')}] {v.get('claim', '')} — {v.get('reasoning', '')}"
+        for v in verdicts if isinstance(v, dict)
+    )
+    entry = f"\n## {date_str}\n\n{knowledge_entry}\n\n{verdict_lines}\n\n---\n"
+    header = "---\nsource: Daily Intelligence 预判校准\n---\n\n# AM 预判校准记录\n"
+
     try:
-        CALIBRATION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        verdict_lines = "\n".join(
-            f"- [{v.get('verdict', '?')}] {v.get('claim', '')} — {v.get('reasoning', '')}"
-            for v in verdicts if isinstance(v, dict)
-        )
-        entry = f"\n## {date_str}\n\n{knowledge_entry}\n\n{verdict_lines}\n\n---\n"
-        if not CALIBRATION_LOG_PATH.exists():
-            header = "---\nsource: Daily Intelligence 预判校准\n---\n\n# AM 预判校准记录\n"
-            CALIBRATION_LOG_PATH.write_text(header + entry, encoding="utf-8")
-        else:
-            with CALIBRATION_LOG_PATH.open("a", encoding="utf-8") as f:
-                f.write(entry)
+        _append_calibration_entry(CALIBRATION_LOG_PATH, entry, header)
         logger.info(f"Calibration knowledge written → {CALIBRATION_LOG_PATH.name}")
     except Exception as e:
-        logger.warning(f"Calibration knowledge write failed (non-fatal): {e}")
+        logger.warning(f"Calibration knowledge write (Obsidian) failed (non-fatal): {e}")
+
+    try:
+        _append_calibration_entry(CALIBRATION_BACKUP_PATH, entry, header)
+        logger.info(f"Calibration knowledge backed up → {CALIBRATION_BACKUP_PATH}")
+    except Exception as e:
+        logger.warning(f"Calibration knowledge local backup failed (non-fatal): {e}")
 
     try:
         resp = httpx.post(
@@ -1601,9 +1636,36 @@ def _write_calibration_knowledge(date_str: str, knowledge_entry: str, verdicts: 
             timeout=10,
         )
         resp.raise_for_status()
-        logger.info("Calibration MemPalace drawer written")
+        logger.info("Calibration MemPalace drawer written (best-effort enrichment)")
     except Exception as e:
-        logger.warning(f"Calibration MemPalace drawer skipped: {e}")
+        logger.warning(f"Calibration MemPalace drawer skipped (non-fatal, not the durable store): {e}")
+
+
+def _load_recent_calibration_notes(max_entries: int = 5, max_chars: int = 1200) -> str:
+    """Read recent AM-calibration knowledge entries directly from Obsidian
+    (falling back to the local backup mirror if the Obsidian file is missing
+    or unreadable) for injection into today's AM prompt. Deliberately does
+    NOT go through MemPalace — see _write_calibration_knowledge docstring for
+    why. Fail-open: returns "" on any error or if nothing has been recorded
+    yet (e.g. first days after this feature shipped)."""
+    for path in (CALIBRATION_LOG_PATH, CALIBRATION_BACKUP_PATH):
+        try:
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8")
+            entries = re.findall(r"\n## (\d{4}-\d{2}-\d{2})\n\n(.*?)(?=\n## \d{4}-\d{2}-\d{2}\n|\Z)", text, re.DOTALL)
+            if not entries:
+                continue
+            recent = entries[-max_entries:]
+            lines = [f"- [{date}] {body.split(chr(10)+chr(10))[0].strip()}" for date, body in recent]
+            body = "\n".join(lines)
+            if len(body) > max_chars:
+                body = body[:max_chars] + "\n[...truncated]"
+            return "## 近期预判校准教训（供参考，非当前持仓）\n" + body + "\n"
+        except Exception as e:
+            logger.warning(f"Reading calibration notes from {path} failed (non-fatal): {e}")
+            continue
+    return ""
 
 
 def evaluate_am_calibration(today_et: str, run_slot: str, price_table: str,
@@ -2102,6 +2164,11 @@ def _main_body():
 
     # 7b. First LLM pass — analyze and generate search tasks
 
+    # AM-only: recent AM-calibration knowledge (issue #10), read directly from
+    # Obsidian (see _load_recent_calibration_notes docstring for why this
+    # bypasses MemPalace). No-op most of the time until entries accumulate.
+    calibration_notes = _load_recent_calibration_notes() if run_slot == "am" else ""
+
     prompt = USER_PROMPT_TEMPLATE.format(
         date=today_et,
         now_str=now_et.strftime("%Y-%m-%d %H:%M %Z"),
@@ -2118,6 +2185,7 @@ def _main_body():
         social_sentiment_section=social_sentiment_section,
         tavily_section="",
         kb_section=kb_section,
+        calibration_notes=calibration_notes,
         verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P1 if run_slot == "am" else "",
     )
     result = call_llm(prompt)
@@ -2229,6 +2297,7 @@ def _main_body():
             social_sentiment_section=social_sentiment_section,
             tavily_section=tavily_section,
             kb_section=kb_section,
+            calibration_notes=calibration_notes,
             personal_context=personal_context,
             verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P2 if run_slot == "am" else "",
         )

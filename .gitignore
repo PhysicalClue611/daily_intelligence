@@ -19,6 +19,9 @@ ibkr/
 # Extract archives (large, local-only)
 archives/
 
+# Local backup mirror of personal-data Obsidian files (calibration log etc.)
+backups/
+
 # macOS
 .DS_Store
 
