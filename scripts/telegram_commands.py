@@ -1,8 +1,9 @@
 """
 telegram_commands.py — Telegram command handler for Daily Intelligence
 
-Runs periodically via launchd (every 5 minutes). Polls getUpdates, parses
-commands, modifies watchlist.md directly, replies in the same chat.
+Runs as a launchd KeepAlive daemon (com.daily-intel.finance.telegram), long-
+polling getUpdates in a tight loop (see run()). Parses commands, modifies
+watchlist.md directly, replies in the same chat.
 
 Supported commands (natural language, LLM-parsed):
   - 加 MSFT / 删 INTC          → add/remove ticker
@@ -40,6 +41,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# httpx's own request logger (propagates to root at INFO) logs the full request
+# URL, and Telegram's Bot API encodes the auth token in the URL path — without
+# this, the bot token gets written in plaintext to the log file (issue #21).
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("FINANCE_TELEGRAM_BOT_TOKEN", "")
@@ -77,12 +82,12 @@ FINNHUB_BASE          = "https://finnhub.io/api/v1"
 
 # ── Telegram API ──────────────────────────────────────────────────────────────
 
-def _tg(endpoint: str, payload: dict) -> dict:
+def _tg(endpoint: str, payload: dict, timeout: float = 10) -> dict:
     try:
         resp = httpx.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/{endpoint}",
             json=payload,
-            timeout=10,
+            timeout=timeout,
         )
         return resp.json()
     except Exception as e:
@@ -1320,9 +1325,21 @@ def run():
     logger.info("Finance Telegram bot started (long polling)")
     offset = load_offset()
 
+    POLL_TIMEOUT = 30  # server-side long-poll wait (Telegram payload param)
+
     while True:
         try:
-            resp = _tg("getUpdates", {"offset": offset, "timeout": 30, "limit": 20})
+            # Client read timeout must exceed the server-side long-poll wait,
+            # otherwise httpx aborts the read before Telegram's 30s window
+            # elapses on every empty poll — this was firing on nearly every
+            # cycle (34k+ "read operation timed out" over 5 days) and the
+            # abandoned-but-still-pending long polls on Telegram's side then
+            # collided with the next request as HTTP 409 Conflict (issue #20).
+            resp = _tg(
+                "getUpdates",
+                {"offset": offset, "timeout": POLL_TIMEOUT, "limit": 20},
+                timeout=POLL_TIMEOUT + 5,
+            )
             updates = resp.get("result", [])
         except Exception as e:
             logger.warning(f"getUpdates error: {e}, retrying in 5s")

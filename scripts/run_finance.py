@@ -61,6 +61,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# httpx's own request logger (propagates to root at INFO) logs the full request
+# URL, and several APIs here (Finnhub, Guardian) put the key in the query
+# string — without this, keys get written in plaintext to the log file
+# (issue #21).
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
