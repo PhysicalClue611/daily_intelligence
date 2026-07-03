@@ -31,6 +31,8 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 **AM 预判校准知识改为 Obsidian 为主，不依赖 MemPalace（2026-07-02 同日修正）**：用户指出 MemPalace `finance` room 最近多次全部重建，持久化内容应多留在 Obsidian 并要求考虑备份。复查发现最初"AM 通过现有`get_finance_context()`的 MemPalace 搜索自动捞到校准知识"是未经验证的假设（那个搜索是通用query，非针对校准知识，且对 MemPalace 不可用零容错）。修正：新增`_load_recent_calibration_notes()`直接读 Obsidian`预判校准记录.md`（不经bridge/MemPalace）注入AM prompt（新模板变量`{calibration_notes}`）；新增本地备份镜像`backups/预判校准记录_backup.md`（已gitignore），与Obsidian独立写入，读取时Obsidian缺失自动fallback到本地备份；MemPalace drawer保留但降级为非必需的锦上添花层。用删除模拟文件的方式验证了fallback正确工作。commit `b1df5c4`。
 
+**市场见顶预警框架 + FRED流动性快照（2026-07-02，issue #26）**：用户分享一份YouTube视频总结的"市场见顶先行指标"，评估后认可两根支柱——流动性水位（准备金/SOFR-RRP利差/TGA/SRF）和产业资本开支二阶导数（"思科悖论"），其余指标（0DTE占比、内部人减持比、前十大集中度、纳指前瞻PE、未定义的"4%经典指标"）降级为背景参考或直接排除。整理成活文档`Hermes/Daily Intelligence/市场见顶预警指标.md`，按【正常/观察/警戒】三档+分资产操作指引表达，明确定位"参考背景，非清仓触发"。流动性三项（准备金/SOFR-RRP/TGA）接入FRED免费API自动化（`fetch_liquidity_snapshot()`，`FRED_API_KEY`），折进`social_sentiment_section`同一注入槽，Pass 2新增第⑥条分析要求约束LLM只能给出与该tier匹配的克制建议。SRF无干净免费数据源，保留人工检查。首次实测：SOFR-RRP利差16bp已达【警戒】（持续两周非单日噪音），准备金/TGA正常。commit `dae2494`。
+
 **踩坑记录结构重组（2026-06-30）**：CLAUDE.md 踩坑记录从完整叙事（每条80-250 tokens，累计17.5K字符）改为一行索引+详情文件指针，完整叙述迁至 `docs/PITFALLS.md`（git-tracked，按需 grep/Read，不自动加载每个 session）。CLAUDE.md 全文从71.2K降至49.3K字符（-31%）。KG 相关8条历史踩坑标注"已下线子系统"归档。新增踩坑一律遵循此规范：这里加一行索引，详情写 `docs/PITFALLS.md` 对应分类小节。
 
 ## 当前系统状态（2026-06-18）
