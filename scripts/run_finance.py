@@ -108,6 +108,14 @@ ADANOS_BASE            = "https://api.adanos.org"
 ADANOS_MONTHLY_LIMIT   = 200  # free tier is 250/mo; leave headroom for TG follow-ups/manual reruns
 ADANOS_BUDGET_PATH     = _PROJ_DIR / "finance_adanos_budget.json"
 
+# Liquidity plumbing snapshot (Hermes/Daily Intelligence/市场见顶预警指标.md, 2026-07-02):
+# FRED is the authoritative free source for these Fed data series — precise
+# and structured, unlike asking an LLM search engine for exact numbers (see
+# issue #24, Sonar's unreliability on precise figures). No SRF usage series
+# exists on FRED; that indicator stays manual/qualitative per the doc.
+FRED_API_KEY  = os.getenv("FRED_API_KEY", "")
+FRED_BASE     = "https://api.stlouisfed.org/fred/series/observations"
+
 ET = ZoneInfo("America/New_York")
 
 # ── Watchlist parser ─────────────────────────────────────────────────────────
@@ -1023,6 +1031,10 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
    - 有"N个独立域名佐证"（N≥1）的可正常按事实陈述
    快变的宏观/市场行情下，传统媒体报道常滞后于现状，未标注可靠时间戳的信息尤其容易过时，
    宁可标注不确定，也不要把孤证当结论
+⑥ 若上方注入了"流动性水位快照"（FRED），只作为背景参考，不单独触发操作建议——它是对回撤应对框架
+   的补充信号，不是替代。整体标记【正常】：不提及或一笔带过。标记【观察】：可以提示"流动性边际收紧，
+   保持现有仓位，暂不启动避险交易"，不建议减仓。标记【警戒】：可以提示"优先评估高贝塔个股暴露"，但
+   核心仓位（QQQM/VOO）仍按回撤框架的价格/回撤幅度决定操作，不得因这一项信号单独建议清仓或大幅减仓
 {verifiable_signals_rule}
 
 可选覆盖：其他值得关注的市场要闻（无实质内容可省略）
@@ -1269,6 +1281,86 @@ def _adanos_x_sentiment(tickers: list[str], budget: dict) -> str:
     if not lines:
         return ""
     return "\n## X/Twitter 舆情快照（Adanos）\n" + "\n".join(lines) + "\n"
+
+
+def _fred_latest(series_id: str, limit: int = 1) -> list[tuple[str, float]]:
+    """Fetch the latest N observations for a FRED series, skipping missing
+    values ('.'). Returns [(date, value), ...] newest first. Fail-open:
+    returns [] on any error or if FRED_API_KEY isn't configured."""
+    if not FRED_API_KEY:
+        return []
+    try:
+        resp = httpx.get(FRED_BASE, params={
+            "series_id": series_id, "api_key": FRED_API_KEY, "file_type": "json",
+            "sort_order": "desc", "limit": limit + 5,  # pad for missing/holiday gaps
+        }, timeout=15)
+        resp.raise_for_status()
+        result = []
+        for o in resp.json().get("observations", []):
+            v = o.get("value", ".")
+            if v == ".":
+                continue
+            result.append((o["date"], float(v)))
+            if len(result) >= limit:
+                break
+        return result
+    except Exception as e:
+        logger.warning(f"FRED fetch failed for {series_id}: {e}")
+        return []
+
+
+def fetch_liquidity_snapshot() -> str:
+    """Fed liquidity plumbing snapshot — supports the tiered framework in
+    Hermes/Daily Intelligence/市场见顶预警指标.md (2026-07-02). Classifies
+    each series into 正常/观察/警戒. Reference only, not a liquidation
+    trigger — see that doc for the reasoning and asset-specific guidance.
+
+    Thresholds need periodic recalibration (reserve "ampleness" is relative
+    to bank balance sheet size, which grows over time — a fixed dollar
+    floor will drift stale; revisit yearly, see doc §一).
+
+    SRF usage has no clean free FRED series and isn't automated here —
+    stays a manual/qualitative check per the doc. Fail-open throughout.
+    """
+    if not FRED_API_KEY:
+        return ""
+    lines: list[str] = []
+    tiers: list[str] = []
+
+    reserves = _fred_latest("WRESBAL")
+    if reserves:
+        date, val = reserves[0]
+        t = val / 1_000_000  # millions -> trillions
+        tier = "警戒" if t < 2.5 else ("观察" if t < 2.9 else "正常")
+        lines.append(f"- 银行准备金余额（{date}）：${t:.2f}万亿 [{tier}]")
+        tiers.append(tier)
+
+    sofr, rrp = _fred_latest("SOFR"), _fred_latest("RRPONTSYAWARD")
+    if sofr and rrp:
+        sdate, sval = sofr[0]
+        _, rval = rrp[0]
+        spread_bp = (sval - rval) * 100
+        tier = "警戒" if spread_bp > 3 else ("观察" if spread_bp > 0 else "正常")
+        lines.append(f"- SOFR-RRP利差（{sdate}）：{spread_bp:.1f}bp（SOFR {sval:.2f}% / RRP {rval:.2f}%）[{tier}]")
+        tiers.append(tier)
+
+    tga = _fred_latest("WTREGEN")
+    if tga:
+        date, val = tga[0]
+        t = val / 1_000_000
+        tier = "观察" if t > 0.9 else "正常"
+        lines.append(f"- TGA账户余额（{date}）：${t:.2f}万亿 [{tier}]")
+        tiers.append(tier)
+
+    if not lines:
+        return ""
+    overall = "警戒" if "警戒" in tiers else ("观察" if "观察" in tiers else "正常")
+    logger.info(f"FRED liquidity snapshot: overall={overall}")
+    return (
+        f"\n## 流动性水位快照（FRED，整体：{overall}）\n"
+        + "\n".join(lines)
+        + "\n（仅供参考背景，非清仓触发；详见 Hermes/Daily Intelligence/市场见顶预警指标.md）\n"
+    )
 
 
 def fetch_finnhub_news(tickers: list[str], hours: int = 24) -> str:
@@ -2155,7 +2247,19 @@ def _main_body():
         save_adanos_budget(adanos_budget)
     except Exception as e:
         logger.warning(f"Social sentiment step failed, continuing without it: {e}")
-    social_sentiment_section = polymarket_section + adanos_section
+
+    # 6e. Liquidity plumbing snapshot (FRED) — supports 市场见顶预警指标.md.
+    # Same reasoning as above: isolated try/except so a FRED hiccup can't
+    # take down the run. Folded into the same social_sentiment_section slot
+    # (both are optional macro-context sections) rather than adding a new
+    # template variable to both prompts.
+    liquidity_section = ""
+    try:
+        liquidity_section = fetch_liquidity_snapshot()
+    except Exception as e:
+        logger.warning(f"Liquidity snapshot step failed, continuing without it: {e}")
+
+    social_sentiment_section = polymarket_section + adanos_section + liquidity_section
     logger.info(
         f"Social sentiment: polymarket={'yes' if polymarket_section else 'no'}, "
         f"adanos={'yes' if adanos_section else 'no'} "

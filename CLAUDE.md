@@ -141,7 +141,7 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 | 月度报告 | Obsidian: `Hermes/Daily Intelligence/Daily Reports/Daily_Intel_report_YYYYMM.md` | 脚本 append 写入 |
 | 持仓快照 | Obsidian: `Finance/portfolio_report_latest.md` | portfolio-agent 覆盖更新 |
 | Gmail token | `~/.hermes/token.json` | 借用 Hermes 的 OAuth token |
-| API keys | `~/Daily_Intelligence/.env` | OPENROUTER_API_KEY, TAVILY_API_KEY, SERPAPI_API_KEY, FINANCE_TELEGRAM_BOT_TOKEN, FINANCE_TELEGRAM_CHAT_ID, GUARDIAN_API_KEY, FINNHUB_API_KEY, EXA_API_KEY, PARALLEL_API_KEY, POLYGON_API_KEY（free tier 备用，未接入代码）（DI 脚本只读此文件，不 fallback 到 ~/.hermes/.env） |
+| API keys | `~/Daily_Intelligence/.env` | OPENROUTER_API_KEY, TAVILY_API_KEY, SERPAPI_API_KEY, FINANCE_TELEGRAM_BOT_TOKEN, FINANCE_TELEGRAM_CHAT_ID, GUARDIAN_API_KEY, FINNHUB_API_KEY, EXA_API_KEY, PARALLEL_API_KEY, POLYGON_API_KEY（free tier 备用，未接入代码），FRED_API_KEY（流动性水位快照，issue 见2026-07-02状态）（DI 脚本只读此文件，不 fallback 到 ~/.hermes/.env） |
 | email_sender | `~/.hermes/skills/intel/china-intel/scripts/` | 共享工具，只读借用 |
 | GitHub repo | `https://github.com/PhysicalClue611/daily_intelligence` (private) | physicalclue611@gmail.com 账户，SSH alias: `github-physicalclue611` |
 
