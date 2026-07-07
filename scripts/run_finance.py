@@ -1482,7 +1482,7 @@ def call_llm(prompt: str, max_retries: int = 2, model: str = LLM_MODEL,
             logger.warning(f"LLM attempt {attempt+1}: returned invalid JSON: {e}\nContent: {content[:500]}")
             continue
         except httpx.HTTPStatusError as e:
-            if e.response.status_code >= 500:
+            if e.response.status_code >= 500 or e.response.status_code == 429:
                 last_error = e
                 logger.warning(f"LLM attempt {attempt+1}: HTTP {e.response.status_code}")
             else:
