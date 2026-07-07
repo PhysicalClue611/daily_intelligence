@@ -19,6 +19,10 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-06）
+
+**`call_llm()` 429 限流修复（2026-07-06，issue #29）**：夜盘收市速报生成失败——OpenRouter 返回 `429 Too Many Requests`，`call_llm()` 把它当普通不可重试的 4xx 直接 `return {}`，既不重试也跳过了 OR flex fallback，导致 Pass 1 空手而归、报告静默跳过未发送。429 是限流性质的瞬时错误，修复为与 5xx 同等对待（`status_code >= 500 or status_code == 429`），走 exponential backoff 重试，耗尽后落入 flex fallback。已手动补跑当次报告成功。见踩坑记录第80条，commit `c985b0c`。
+
 ## 当前系统状态（2026-07-02）
 
 **Telegram Bot 容错全面重构（2026-07-01/02，issue #20/#21/#22/#23）**：用户提供的定时巡检报告显示 `telegram_commands.py` 5天内 3.4万条超时警告+207条SSL EOF+多次409冲突。四层排查：① `_tg()` 客户端 timeout(10s) 短于 getUpdates 长轮询服务端等待(30s)，几乎每次空轮询自断触发 409（issue #20，修复：`timeout=POLL_TIMEOUT+5`）；② 排查中意外发现 httpx INFO 日志把 Telegram/Finnhub/Guardian 凭据明文写入 644 权限的 `/tmp` 日志文件（issue #21，修复：两脚本均 `logging.getLogger("httpx").setLevel(WARNING)`）；③ 修复①后巡检又报警，验证证明不是回归而是本机 Shadowrocket TUN 隧道对 `api.telegram.org` 域名特定的 ~25-30% 瞬时连接失败率（对照 Slack/OpenAI 同隧道零失败确认域名特定），此前被①的噪音淹没（issue #22，修复：`ConnectError` 快速重试一次）；④ 用户指出重试补丁只覆盖轮询未覆盖发送（`send_telegram_report`/`send_telegram_alert`），要求容错覆盖全部调用路径且日志级别反映"是否需要人关注"（重试成功=INFO，耗尽才WARNING）（issue #23，修复：新建 `scripts/telegram_utils.py::call_telegram()` 共享函数，两脚本统一调用）。方法论已存为跨项目 memory `feedback_uniform_fault_tolerance.md`。见踩坑记录第74-77条。
@@ -467,6 +471,7 @@ _Tavily: N/10_
 77. sendMessage 与 getUpdates 分属两套独立实现，重试补丁只覆盖了轮询未覆盖发送 → 详见 `docs/PITFALLS.md#77`
 78. Sonar 宏观快照过时/幻觉信息（曾报WTI>$100，实际$68.58），未限定检索时间窗+未锚定实时价格 → 详见 `docs/PITFALLS.md#78`
 79. getUpdates 同步重试是多余复杂度，轮询循环本身节奏已是现成的重试机制 → 详见 `docs/PITFALLS.md#79`
+80. `call_llm()` 把 429 限流当不可重试的 4xx，Pass 1 直接放弃生成空报告 → 详见 `docs/PITFALLS.md#80`
 
 ---
 

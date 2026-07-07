@@ -252,6 +252,15 @@ bot 是 `KeepAlive` 常驻进程，改完 `telegram_commands.py` 必须 `launchc
 
 **验证**：状态机逻辑用缩短阈值（3s 代替 1800s）做了独立单元测试，行为符合预期。生产部署后日志出现 `getUpdates recovered after 44s`/`36s`（真实停机秒数，非重试次数），零 WARNING，单次失败完全静默不留日志。
 
+### 80. `call_llm()` 把 429 限流当成不可重试的 4xx，Pass 1 直接放弃生成空报告
+（2026-07-06 发现修复，issue #29）2026-07-06 夜盘收市速报生成失败："Pass 1/Pass 2 均未返回有效 report_md，本次报告未发送"。日志：`ERROR LLM HTTP 429: Client error '429 Too Many Requests'` → `WARNING Empty report_md, skipping`。
+
+**根因**：`call_llm()`（`scripts/run_finance.py`）对 `httpx.HTTPStatusError` 的处理只把 `status_code >= 500` 视为可重试，其余 4xx（含 429）直接 `logger.error` + `return {}`——不仅不重试，连函数末尾的 OR flex fallback 也被硬 `return` 跳过，两条恢复路径全部被绕开。429 是限流性质的瞬时错误，应与 5xx 同等对待，不该和"请求参数错误"等真正不可恢复的 4xx（400/401/404）混为一谈。
+
+**修复**：条件改为 `status_code >= 500 or status_code == 429`，429 现在会走 exponential backoff 重试，重试耗尽后正常落入 OR flex fallback。
+
+**临时处置**：手动补跑 PM 报告成功（根因确认是 OpenRouter 短暂限流，重跑时已恢复，说明不重试是唯一问题，无需其他修复）。
+
 **与 #76/#77 的关系**：不是推翻，是简化——#76/#77 解决的"轮询和发送都要抗故障"仍然成立（发送路径的重试没变），但轮询路径原本套的同步重试是多余复杂度，因为轮询循环自带的天然节奏已经提供了等效的重试能力，且成本更低（不占用当次调用的额外延迟）。
 
 ---
