@@ -843,22 +843,32 @@ _framework_cache: str = ""
 
 
 def _load_framework() -> str:
-    """Extract key investment framework from 金融资产信息.md. Module-level cache."""
+    """Extract operative rules from Investment Operating Manual v1.0.md (issue #30).
+
+    Pulls three sections verbatim from the canonical Obsidian manual so edits there
+    propagate to Pass 2 without code changes: Section 2 (能力边界, used for the
+    capability-boundary tagging rule), Section 6 (Portfolio Construction, incl. the
+    认知提升/减仓条件 checklists), Section 7.4 (Expectation Gap internal signal list).
+    Module-level cache. Replaces the prior 金融资产信息.md excerpt.
+    """
     global _framework_cache
     if _framework_cache:
         return _framework_cache
-    asset_file = OBSIDIAN / "Finance" / "金融资产信息.md"
-    if not asset_file.exists():
+    manual_file = OBSIDIAN / "Finance" / "Investment Operating Manual v1.0.md"
+    if not manual_file.exists():
         return ""
-    text = re.sub(r"^---.*?---\s*", "", asset_file.read_text(encoding="utf-8"), flags=re.DOTALL)
+    text = re.sub(r"^---.*?---\s*", "", manual_file.read_text(encoding="utf-8"), flags=re.DOTALL)
     parts = []
-    m = re.search(r"## 总体构架\n(.*?)(?=\n##)", text, re.DOTALL)
+    m = re.search(r"2\. 能力边界.*?\n\n(.*?)(?=\n\s*3\. Alpha 的来源)", text, re.DOTALL)
     if m:
-        parts.append("【目标构架】\n" + m.group(1).strip()[:500])
-    m2 = re.search(r"##### Dream Bucket投资逻辑\n(.*?)(?=\n#####|\n##)", text, re.DOTALL)
+        parts.append("【能力边界：以下变量属于能力圈外，不构成操作依据】\n" + m.group(1).strip()[:500])
+    m2 = re.search(r"6\. Portfolio Construction\n\n(.*?)(?=\n\s*7\. Strategic Alpha Score)", text, re.DOTALL)
     if m2:
-        parts.append("【Dream Bucket】\n" + m2.group(1).strip()[:350])
-    _framework_cache = "\n\n".join(parts)[:900]
+        parts.append("【Portfolio Construction：认知提升标准 / 减仓条件】\n" + m2.group(1).strip()[:1600])
+    m3 = re.search(r"7\.4 Expectation Gap.*?\n\n(.*?)(?=\n\s*7\.5 Alpha Potential)", text, re.DOTALL)
+    if m3:
+        parts.append("【Expectation Gap 内部信号清单】\n" + m3.group(1).strip()[:1200])
+    _framework_cache = "\n\n".join(parts)[:3200]
     return _framework_cache
 
 
@@ -1031,10 +1041,18 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
    - 有"N个独立域名佐证"（N≥1）的可正常按事实陈述
    快变的宏观/市场行情下，传统媒体报道常滞后于现状，未标注可靠时间戳的信息尤其容易过时，
    宁可标注不确定，也不要把孤证当结论
+⑤ 能力圈内外标注（依据下方"持仓与框架"中的【能力边界】清单）：对每个异动/驱动因素，先判断是否属于
+   能力圈外变量（利率与宏观周期、财报超预期或不及预期、资金流向与风格轮动、技术分析与短期timing、
+   情绪驱动的价格波动）。属于能力圈外的，只客观陈述事实，并显式加注"（能力圈外，不构成操作依据）"，
+   不得据此给出隐含的加减仓暗示；属于能力圈内的（战略执行进展、竞争格局变化、产品/商业化里程碑等）
+   才可以进一步讨论对持仓逻辑的含义
 ⑥ 若上方注入了"流动性水位快照"（FRED），只作为背景参考，不单独触发操作建议——它是对回撤应对框架
    的补充信号，不是替代。整体标记【正常】：不提及或一笔带过。标记【观察】：可以提示"流动性边际收紧，
    保持现有仓位，暂不启动避险交易"，不建议减仓。标记【警戒】：可以提示"优先评估高贝塔个股暴露"，但
    核心仓位（QQQM/VOO）仍按回撤框架的价格/回撤幅度决定操作，不得因这一项信号单独建议清仓或大幅减仓
+⑦ 持仓类异动核对清单：涉及"IB美股持仓"快照中实际持有标的（非观察用watchlist标的）的异动，须对照
+   下方【Portfolio Construction】中的认知提升标准三条和减仓条件A/B/C三条逐条核对——命中的写明命中
+   哪条+对应事实依据；三条都不命中，必须写"不构成加/减仓依据"，不得给出与这些枚举标准无关的仓位建议
 {verifiable_signals_rule}
 
 可选覆盖：其他值得关注的市场要闻（无实质内容可省略）
