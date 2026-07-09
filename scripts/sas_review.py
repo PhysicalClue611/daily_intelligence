@@ -37,6 +37,7 @@ _DI_ENV_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 load_dotenv(_DI_ENV_FILE)
 
 import argparse
+import fcntl
 import json
 import logging
 import re
@@ -63,6 +64,7 @@ _PROJ_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
 TRACKED_TICKERS_PATH = _PROJ_DIR / "sas_tracked_tickers.json"
 SAS_REVIEW_DIR = OBSIDIAN / "Finance" / "SAS_Review"
 CANDIDATE_LOG_PATH = OBSIDIAN / "Hermes/Daily Intelligence/SAS候选证据日志.md"
+LOCK_FILE = _PROJ_DIR / "sas_review.lock"
 
 FINNHUB_API_KEY = fp.FINNHUB_API_KEY
 FINNHUB_BASE = fp.FINNHUB_BASE
@@ -73,6 +75,30 @@ SAS_REVIEW_MODEL = "~anthropic/claude-sonnet-latest"
 EARNINGS_ANCHOR_MAX_RETRIES = 3
 INSIDER_LOOKBACK_DAYS = 120
 FINNHUB_NEWS_LOOKBACK_HOURS = 90 * 24
+
+# 2026-07-09: scheduled/unattended runs (no --ticker) only NOTIFY when a
+# trigger fires — they don't spend money or write to the historical file on
+# their own yet. This is deliberate: the earnings-trigger logic is untested
+# in production, and each real run costs real money (~$0.05) and writes a
+# permanent, hard-to-undo entry. Flip to False once a few real quarters have
+# validated the trigger timing. --ticker (manual) always runs for real,
+# regardless of this flag.
+NOTIFY_ONLY = True
+
+
+# ── Concurrency lock (mirrors run_finance.py's _acquire_lock pattern) ─────────
+
+def _acquire_lock():
+    fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd.write(str(os.getpid()))
+        fd.flush()
+        return fd
+    except IOError:
+        fd.close()
+        logger.info("Another sas_review instance is already running (lock held), exiting")
+        sys.exit(0)
 
 
 # ── Persistent tracked-ticker list (issue #32 point 1) ────────────────────────
@@ -430,6 +456,40 @@ def send_review_email(ticker: str, today: str, result: dict, anchor: dict) -> No
     send_report(subject=f"[Daily_Intel] {ticker} 季度 SAS 复盘 {today}", markdown_body=body, recipients=recipients)
 
 
+def _has_today_entry(ticker: str) -> bool:
+    """Dedup guardrail: has today's review already been completed and written
+    to Finance/SAS_Review/{ticker}.md? Checked before sending a reminder (or,
+    if NOTIFY_ONLY=False in the future, before running for real) so a repeat
+    scheduler firing / crash-restart doesn't nag twice or spend twice."""
+    path = SAS_REVIEW_DIR / f"{ticker}.md"
+    if not path.exists():
+        return False
+    return f"## {date.today().isoformat()}" in path.read_text(encoding="utf-8")
+
+
+def notify_pending_review(ticker: str, trigger_reason: str) -> None:
+    """NOTIFY_ONLY mode: don't spend money or write anything — just tell the
+    user a review is due and hand them the exact command to run it."""
+    today = date.today().isoformat()
+    cmd = f".venv/bin/python scripts/sas_review.py --ticker {ticker}"
+    subject = f"[Daily_Intel] {ticker} 季度 SAS 复盘待运行 — {today}"
+    body = (
+        f"# {ticker} 季度 SAS 复盘待运行\n\n"
+        f"触发原因：{trigger_reason}\n\n"
+        f"当前为提醒模式（NOTIFY_ONLY），不会自动运行分析。手工执行：\n\n"
+        f"```\ncd ~/Daily_Intelligence\n{cmd}\n```\n\n"
+        f"本次运行预计花费约 $0.05（Claude Sonnet via OpenRouter），"
+        f"结果会写入 Finance/SAS_Review/{ticker}.md 并发邮件。\n"
+    )
+    wl = rf.load_watchlist()
+    recipients = wl.get("recipients", [])
+    if recipients:
+        send_report(subject=subject, markdown_body=body, recipients=recipients)
+        logger.info(f"Notify-only reminder sent for {ticker}")
+    else:
+        logger.warning("No recipients configured, skipping notify-only reminder email")
+
+
 # ── Orchestration ────────────────────────────────────────────────────────────────
 
 def run_ticker_review(ticker: str, trigger_reason: str) -> bool:
@@ -491,27 +551,59 @@ def run_ticker_review(ticker: str, trigger_reason: str) -> bool:
     return True
 
 
+def _exclude_ticker(ticker: str) -> None:
+    """Permanently remove `ticker` from the SAS tracking list (e.g. after a
+    full exit the user doesn't want to keep tracking). Does NOT touch the
+    historical Finance/SAS_Review/{ticker}.md file — past judgment stays on
+    record even if tracking stops. If the ticker later gets re-bought and
+    crosses 2% weight again, _update_tracked_tickers() will re-add it — a
+    fresh entry deserves fresh tracking, not a silent permanent block."""
+    tracked = set(_load_tracked_tickers())
+    if ticker not in tracked:
+        logger.info(f"{ticker} not in tracked list, nothing to exclude")
+        return
+    tracked.discard(ticker)
+    _save_tracked_tickers(sorted(tracked))
+    logger.info(f"{ticker} removed from SAS tracked list (history file untouched)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Quarterly SAS deep-dive (issue #32)")
     parser.add_argument("--ticker", help="Manually run for a specific ticker, bypassing trigger checks")
+    parser.add_argument("--exclude", help="Permanently remove a ticker from the SAS tracking list")
     args = parser.parse_args()
 
-    if args.ticker:
-        run_ticker_review(args.ticker.upper(), trigger_reason="手工指定")
-        return
+    _lock_fd = _acquire_lock()
+    try:
+        if args.exclude:
+            _exclude_ticker(args.exclude.upper())
+            return
 
-    tracked = _update_tracked_tickers()
-    if not tracked:
-        logger.info("No tracked tickers yet, exiting")
-        return
+        if args.ticker:
+            run_ticker_review(args.ticker.upper(), trigger_reason="手工指定")
+            return
 
-    any_triggered = False
-    for ticker in tracked:
-        if _is_triggered_today(ticker):
+        tracked = _update_tracked_tickers()
+        if not tracked:
+            logger.info("No tracked tickers yet, exiting")
+            return
+
+        any_triggered = False
+        for ticker in tracked:
+            if not _is_triggered_today(ticker):
+                continue
+            if _has_today_entry(ticker):
+                logger.info(f"{ticker}: today's review already completed, skipping")
+                continue
             any_triggered = True
-            run_ticker_review(ticker, trigger_reason="财报后第3个交易日")
-    if not any_triggered:
-        logger.info("No ticker triggered today, exiting silently")
+            if NOTIFY_ONLY:
+                notify_pending_review(ticker, trigger_reason="财报后第3个交易日")
+            else:
+                run_ticker_review(ticker, trigger_reason="财报后第3个交易日")
+        if not any_triggered:
+            logger.info("No ticker triggered today, exiting silently")
+    finally:
+        _lock_fd.close()
 
 
 if __name__ == "__main__":
