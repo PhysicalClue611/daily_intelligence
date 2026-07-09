@@ -1056,6 +1056,14 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
    减仓条件A/B/C三条逐条核对——命中的写明命中哪条+对应事实依据；三条都不命中，必须写"不构成加/
    减仓依据"，不得给出与这些枚举标准无关的仓位建议。⑤中讨论的战略含义仅作理解背景，不能替代本条
    的核对结果
+⑧ SAS候选证据标注（独立于⑤⑦，不写入 report_md 正文，只填 JSON 字段）：若某条新闻/事件命中下方
+   【Expectation Gap 内部信号清单】五类之一（内部人增持 / 资本配置持续性 / 生态位验证 / 监管语言
+   变化 / 历史先例），或命中【Portfolio Construction】认知提升标准三条之一，且涉及"IB美股持仓"中
+   实际持有的标的，则在 sas_candidates 数组追加一条记录，含 ticker/category/fact 三个字段；category
+   只能取以下字符串之一："内部人增持"/"资本配置持续性"/"生态位验证"/"监管语言变化"/"历史先例"/
+   "认知提升-战略节点解锁"/"认知提升-竞争格局变化"/"认知提升-管理层兑现承诺"。fact 为一句话事实
+   摘要（含关键数字/来源，不超过80字）。无命中则留空数组。这只是记录候选证据供未来复审，本身不代表
+   应该操作，不影响⑤⑦的判断
 {verifiable_signals_rule}
 
 可选覆盖：其他值得关注的市场要闻（无实质内容可省略）
@@ -1064,7 +1072,8 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 
 请输出以下JSON（不要附加任何其他文字）：
 {{
-  "report_md": "# [Daily_Intel] {date} 开盘前简报\\n\\n..."
+  "report_md": "# [Daily_Intel] {date} 开盘前简报\\n\\n...",
+  "sas_candidates": [{{"ticker": "...", "category": "...", "fact": "..."}}]
 }}
 """
 
@@ -1754,6 +1763,48 @@ def _write_calibration_knowledge(date_str: str, knowledge_entry: str, verdicts: 
         logger.warning(f"Calibration MemPalace drawer skipped (non-fatal, not the durable store): {e}")
 
 
+# ── SAS candidate evidence log (issue #31) ────────────────────────────────
+# Pass 2 flags news/events matching the Investment Operating Manual's 7.4
+# internal-signal list or Section 6 cognitive-upgrade criteria via the
+# `sas_candidates` JSON field (see USER_PROMPT_TEMPLATE_P2 rule ⑧). This is
+# a pure evidence queue for the semi-annual SAS review (Manual Section 7.1:
+# scoring requires a human-written 100-300-char rationale with no price
+# lookback) — it never drives automated scoring or trading advice.
+
+SAS_CANDIDATE_LOG_PATH = OBSIDIAN / "Hermes/Daily Intelligence/SAS候选证据日志.md"
+
+_SAS_CANDIDATE_HEADER = (
+    "---\nsource: Daily Intelligence SAS候选证据\n---\n\n# SAS 候选证据日志\n\n"
+    "> 供半年 SAS 复审（Investment Operating Manual v1.0 第7节）人工批阅使用，"
+    "不参与自动打分，评分权仍在人工。\n"
+)
+
+
+def write_sas_candidate_log(date_str: str, slot_label: str, candidates: list) -> None:
+    """Append-only write of Pass 2-flagged SAS candidate evidence. Fail-open —
+    a write failure here must never affect the main report pipeline."""
+    if not candidates:
+        return
+    lines = []
+    for c in candidates:
+        if not isinstance(c, dict):
+            continue
+        ticker = c.get("ticker", "").strip()
+        category = c.get("category", "").strip()
+        fact = c.get("fact", "").strip()
+        if not ticker or not category or not fact:
+            continue
+        lines.append(f"- **{ticker}** [{category}] {fact}")
+    if not lines:
+        return
+    entry = f"\n## {date_str} {slot_label}\n\n" + "\n".join(lines) + "\n"
+    try:
+        _append_calibration_entry(SAS_CANDIDATE_LOG_PATH, entry, _SAS_CANDIDATE_HEADER)
+        logger.info(f"SAS candidate evidence written → {SAS_CANDIDATE_LOG_PATH.name} ({len(lines)} entries)")
+    except Exception as e:
+        logger.warning(f"SAS candidate log write failed (non-fatal): {e}")
+
+
 def _load_recent_calibration_notes(max_entries: int = 5, max_chars: int = 1200) -> str:
     """Read recent AM-calibration knowledge entries directly from Obsidian
     (falling back to the local backup mirror if the Obsidian file is missing
@@ -2429,6 +2480,7 @@ def _main_body():
         result2 = call_llm(prompt2, model=LLM_MODEL_PASS2, system_prompt=SYSTEM_PROMPT_P2)
         llm_meta_p2 = result2.get("_llm_meta", {})
         report_md = result2.get("report_md", report_md)
+        write_sas_candidate_log(today_et, slot_label, result2.get("sas_candidates", []))
 
     if not report_md:
         logger.warning("Empty report_md, skipping")
