@@ -29,7 +29,7 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 **Issue #32 设计定稿 + 数据源验证（2026-07-09）**：季度财报深度分析脚本设计敲定五处细化（追踪列表按核心个股永久持久化不因回撤/卖出移除、依赖 #33 的权重函数、数据源、价格数据"打分不引用但需真实锚点"、失败后当日重试+TG报警而非静默抛错）。实测三个原假设数据源：Finnhub 机构持仓（13F）免费key返回权限错误，付费tier功能；yfinance 期权链 impliedVolatility 数据确认损坏（bid/ask全0，IV呈规律翻倍的占位符模式，非真实定价）——两者均从 v1 范围移除。新发现 `edgartools`（已装入 `.venv` 并更新 `requirements.txt`）可免费按 ticker 直接拉取 Form 4 内部人交易明细（含 transaction code 可区分公开市场买入 vs RSU归属等routine事件）和 10-K risk factors 结构化正文，替代了两项原计划信号源，无需自建 SEC 全文检索。13F 按机构申报非按标的，反向聚合工程量大，v1 明确跳过。详见 issue #32 完整评论。尚未开始写 `sas_review.py`。
 
-**Issue #32 实现完成（2026-07-09）**：`scripts/sas_review.py`（新脚本）+ `scripts/sec_edgar_utils.py`（封装 edgartools 调用）。核心组件：①持久化追踪列表 `sas_tracked_tickers.json`（原子写入，核心个股权重>2%永久加入不因回撤/卖出移除）；②财报触发判定（Finnhub calendar/earnings + exchange_calendars 计算"财报后第3个交易日"，AMC/BMO区分反应起始session）；③fail-closed财报锚点（Finnhub /stock/earnings，同日重试耗尽后 `send_telegram_alert()` 报警而非静默失败）；④Form4内部人买入（`edgartools`，仅取code='P'公开市场买入，排除RSU归属等routine事件）+ 10-K risk factors跨期对比（原文交给LLM语义diff，不自建diff算法）；⑤`~anthropic/claude-sonnet-latest` via OR直接打分SAS四维度，用OpenRouter `usage.cost`字段拿真实花费（无需硬编码价格表，2026-07-09验证该字段存在）；⑥每ticker一份md文件原子append（读全文+temp+os.replace，比run_finance.py现有的`_append_calibration_entry()`更重但匹配这份数据的多季度比较价值）。真实测试：INTC完整跑通一次（$0.0525），正确引用10-K措辞变化（"foundry strategy"→"external foundry strategy"）和真实52周价格数据，正确处理"无内部人买入"为中性事实而非编造，遵守"打分不引用价格"纪律。该次真实结果已写入 `Finance/SAS_Review/INTC.md` 并发送邮件，作为INTC第一条历史记录。**尚未接入 launchd 自动调度**——脚本可手动运行（`--ticker` 或无参数扫描触发），是否现在就接入 PM 定时任务待用户确认。
+**Issue #32 实现完成（2026-07-09）**：`scripts/sas_review.py`（新脚本）+ `scripts/sec_edgar_utils.py`（封装 edgartools 调用）。核心组件：①持久化追踪列表 `sas_tracked_tickers.json`（原子写入，核心个股权重>2%永久加入不因回撤/卖出移除）；②财报触发判定（Finnhub calendar/earnings + exchange_calendars 计算"财报后第3个交易日"，AMC/BMO区分反应起始session）；③fail-closed财报锚点（Finnhub /stock/earnings，同日重试耗尽后 `send_telegram_alert()` 报警而非静默失败）；④Form4内部人买入（`edgartools`，仅取code='P'公开市场买入，排除RSU归属等routine事件）+ 10-K risk factors跨期对比（原文交给LLM语义diff，不自建diff算法）；⑤`~anthropic/claude-sonnet-latest` via OR直接打分SAS四维度，用OpenRouter `usage.cost`字段拿真实花费（无需硬编码价格表，2026-07-09验证该字段存在）；⑥每ticker一份md文件原子append（读全文+temp+os.replace，比run_finance.py现有的`_append_calibration_entry()`更重但匹配这份数据的多季度比较价值）。真实测试：INTC完整跑通一次（$0.0525），正确引用10-K措辞变化（"foundry strategy"→"external foundry strategy"）和真实52周价格数据，正确处理"无内部人买入"为中性事实而非编造，遵守"打分不引用价格"纪律。该次真实结果已写入 `Finance/SAS_Review/INTC.md` 并发送邮件，作为INTC第一条历史记录。补充两道围栏（commit `4752231`）：`_has_today_entry()` 防重复（今天已写入历史文件则跳过）+ `_acquire_lock()` 并发锁（复用 run_finance.py 模式）。新增 `NOTIFY_ONLY` 默认模式——自动扫描触发时只发邮件提醒（含手工执行命令），不自动花钱跑分析，待观察几个真实季度触发逻辑稳定后再改 `NOTIFY_ONLY=False` 转全自动；`--ticker` 手工模式不受影响。新增 `--exclude TICKER` 支持清仓后永久移除追踪（历史文件保留，未来重新建仓超2%权重会自动重新追踪）。**已接入 launchd（2026-07-09）**：`~/Library/LaunchAgents/com.daily-intel.finance.pm.plist` 的 `ProgramArguments` 改为 `/bin/bash -c "run_finance.py; sas_review.py"`（`;` 分隔，前者失败不挡后者），复用原 20:10 ET 运行时点，未新增独立 plist。`plutil -lint` 校验通过，`launchctl unload`+`load` 重新加载生效。当前 `NOTIFY_ONLY=True`，触发时只发邮件提醒不自动跑分析。
 
 ## 当前系统状态（2026-07-06）
 
@@ -189,6 +189,9 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
   com.daily-intel.finance.pm.plist  → 5:10 PM PT = 20:10 ET（夜盘动向，slot=pm）
   注：原单 plist 含两个 StartCalendarInterval 时间，macOS launchd 只注册第一个 XPC activity，
       第二个静默丢失。2026-05-29 拆分为两个独立 plist 修复此问题。
+  PM plist 自 2026-07-09 起串联 sas_review.py（issue #32，`ProgramArguments` 改为
+      `/bin/bash -c "run_finance.py; sas_review.py"`），复用同一运行时点，未新增 plist。
+      sas_review.py 当前 NOTIFY_ONLY=True，触发时只发邮件提醒不自动跑分析。
   非交易日: exchange_calendars 检查后静默退出
 
 Telegram bot: com.daily-intel.finance.telegram.plist
