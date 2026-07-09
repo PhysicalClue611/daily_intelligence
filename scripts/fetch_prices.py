@@ -608,5 +608,47 @@ def format_price_table(rows: list[PriceRow], slot: str = "daily") -> str:
     return "\n".join(lines)
 
 
+def fetch_52week_stats(tickers: list[str]) -> dict[str, dict]:
+    """52-week range percentile + drawdown from high (issue #33).
+
+    Pure computation on yfinance daily history — the "股价相对位置" signal from
+    Investment Operating Manual 7.4 (Expectation Gap 市场共识类信号). No LLM,
+    no search cost; meant to be injected as a computed fact so Pass 2 doesn't
+    have to eyeball "high or low" from prose. Fail-open: a failure for one or
+    all tickers returns an empty/partial dict, never raises.
+    """
+    if not tickers:
+        return {}
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {}
+    try:
+        data = yf.download(tickers, period="1y", interval="1d", progress=False,
+                            auto_adjust=True, group_by="column")
+    except Exception as e:
+        logger.warning(f"52-week stats download failed: {e}")
+        return {}
+    out: dict[str, dict] = {}
+    for ticker in tickers:
+        try:
+            closes = data["Close"] if len(tickers) == 1 else data["Close"][ticker]
+            closes = closes.dropna()
+            if len(closes) < 20:
+                continue
+            current = float(closes.iloc[-1])
+            hi = float(closes.max())
+            lo = float(closes.min())
+            if hi == lo:
+                continue
+            out[ticker] = {
+                "range_percentile": round((current - lo) / (hi - lo) * 100, 1),
+                "pct_from_high": round((current - hi) / hi * 100, 1),
+            }
+        except Exception as e:
+            logger.debug(f"{ticker}: 52-week stats failed: {e}")
+    return out
+
+
 def get_anomalies(rows: list[PriceRow]) -> list[PriceRow]:
     return [r for r in rows if r.is_anomaly]

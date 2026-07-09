@@ -50,7 +50,7 @@ from pathlib import Path
 
 import httpx
 
-from fetch_prices import fetch_prices, format_price_table, get_anomalies
+from fetch_prices import fetch_prices, format_price_table, get_anomalies, fetch_52week_stats
 from fetch_news import fetch_rss, fetch_guardian_news, format_news_for_prompt
 from memory_context_finance import get_finance_context
 from telegram_utils import call_telegram
@@ -905,6 +905,88 @@ def _get_portfolio_snapshot() -> str:
         return ""
 
 
+# Beta layer (QQQM/VOO) + defensive layer (EWJ/SGOL/BOXX) + cash — excluded from the
+# "core individual holding" set per Investment Operating Manual Section 1's three-tier
+# structure (issue #33). What's left is the ~25% active-Alpha layer these signals target.
+_CORE_HOLDING_EXCLUDE = {"QQQM", "VOO", "EWJ", "SGOL", "BOXX", "CASH"}
+
+
+def _get_core_holding_tickers() -> list[str]:
+    """Active individual-stock tickers from the IB holdings snapshot (issue #33)."""
+    try:
+        latest_path = OBSIDIAN / "Finance" / "portfolio_report_latest.md"
+        if not latest_path.exists():
+            return []
+        text = latest_path.read_text(encoding="utf-8")
+        ib_section = re.search(r"## IB（账户 0611）(.*?)(?=\n## |\Z)", text, re.DOTALL)
+        if not ib_section:
+            return []
+        tickers = re.findall(r"### (\w+) \w+ \d+", ib_section.group(1))
+        return [t for t in tickers if t.isalpha() and t not in _CORE_HOLDING_EXCLUDE]
+    except Exception as e:
+        logger.debug(f"Core holding ticker parse failed: {e}")
+        return []
+
+
+def _get_portfolio_weights() -> dict[str, float]:
+    """Ticker → % of total portfolio market value (issue #33), for Manual Section 6
+    condition C (single position > 15%). Parses per-holding 市值 + total 组合总市值(USD)
+    from portfolio_report_latest.md — pure arithmetic, no LLM estimation needed."""
+    try:
+        latest_path = OBSIDIAN / "Finance" / "portfolio_report_latest.md"
+        if not latest_path.exists():
+            return {}
+        text = latest_path.read_text(encoding="utf-8")
+        total_m = re.search(r"组合总市值：.*?/\s*([\d,]+)\s*USD", text)
+        if not total_m:
+            return {}
+        total_usd = float(total_m.group(1).replace(",", ""))
+        if not total_usd:
+            return {}
+        ib_section = re.search(r"## IB（账户 0611）(.*?)(?=\n## |\Z)", text, re.DOTALL)
+        if not ib_section:
+            return {}
+        holdings = re.findall(
+            r"### (\w+) \w+ \d+\n.*?市值：([\d.]+)\s*浮盈",
+            ib_section.group(1), re.DOTALL
+        )
+        return {
+            sym: round(float(mv) / total_usd * 100, 1)
+            for sym, mv in holdings
+            if sym.isalpha() and sym != "CASH"
+        }
+    except Exception as e:
+        logger.debug(f"Portfolio weights parse failed: {e}")
+        return {}
+
+
+def _compute_holding_signals() -> str:
+    """Issue #33: pure-computation signals for Manual 7.4 (股价相对位置) and Section 6
+    condition C (仓位>15%) — code-computed ground truth, not LLM estimation from prose.
+    Fail-open at every step; returns "" if nothing computable."""
+    core_tickers = _get_core_holding_tickers()
+    weights = _get_portfolio_weights()
+    if not core_tickers and not weights:
+        return ""
+    stats = fetch_52week_stats(core_tickers) if core_tickers else {}
+    lines = ["【持仓计算信号：以下为代码直接计算的既定事实，非LLM估算，减仓条件C判断请直接读取此处】"]
+    all_tickers = core_tickers or list(weights.keys())
+    for ticker in all_tickers:
+        parts = []
+        s = stats.get(ticker)
+        if s:
+            parts.append(f"52周区间百分位{s['range_percentile']}%（距历史高点{s['pct_from_high']}%）")
+        w = weights.get(ticker)
+        if w is not None:
+            flag = "，已超过15%阈值（触发减仓条件C）" if w > 15 else ""
+            parts.append(f"占组合{w}%{flag}")
+        if parts:
+            lines.append(f"- {ticker}：" + "；".join(parts))
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
+
 def _load_personal_context() -> str:
     """Combine portfolio snapshot + investment framework for Pass 2 injection (Layer B)."""
     parts = [
@@ -916,6 +998,9 @@ def _load_personal_context() -> str:
     portfolio = _get_portfolio_snapshot()
     if portfolio:
         parts.append(portfolio)
+    signals = _compute_holding_signals()
+    if signals:
+        parts.append(signals)
     fw = _load_framework()
     if fw:
         parts.append(fw)
@@ -1055,7 +1140,8 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
    （非观察用watchlist标的）的异动，须对照下方【Portfolio Construction】中的认知提升标准三条和
    减仓条件A/B/C三条逐条核对——命中的写明命中哪条+对应事实依据；三条都不命中，必须写"不构成加/
    减仓依据"，不得给出与这些枚举标准无关的仓位建议。⑤中讨论的战略含义仅作理解背景，不能替代本条
-   的核对结果
+   的核对结果。条件C（仓位>15%）直接读取下方【持仓计算信号】里代码算好的占比数字，不要自己从
+   持仓文本估算百分比
 ⑧ SAS候选证据标注（独立于⑤⑦，不写入 report_md 正文，只填 JSON 字段）：若某条新闻/事件命中下方
    【Expectation Gap 内部信号清单】五类之一（内部人增持 / 资本配置持续性 / 生态位验证 / 监管语言
    变化 / 历史先例），或命中【Portfolio Construction】认知提升标准三条之一，且涉及"IB美股持仓"中
@@ -2146,6 +2232,51 @@ def _acquire_lock():
         sys.exit(0)
 
 
+# ── Core-holding cognitive-upgrade rotation query (issue #33) ─────────────────
+# AM/PM search triggering is otherwise entirely anomaly/geo-driven — a core
+# holding that isn't moving never gets a proactive check for the Manual
+# Section 6 cognitive-upgrade fact types (product/commercialization milestones,
+# competitive-landscape shifts, management delivering on doubted promises).
+# One rotation query/day, deterministic by date (no rotation-state file to
+# maintain), appended after the anomaly/geo/LLM-suggested jobs so it only
+# consumes leftover Tavily budget rather than competing with real signals.
+
+_COGNITIVE_UPGRADE_LOOKBACK_DAYS = 30
+
+
+def _build_cognitive_upgrade_query(ticker: str, today_et: str) -> str:
+    year = today_et[:4]
+    return (
+        f"{ticker} product commercialization milestone OR competitive landscape "
+        f"change OR management guidance confirmed {year}"
+    )
+
+
+def _rotation_search_job(today_et: str) -> dict | None:
+    """Pick one core holding for today via date.toordinal() % N — self-correcting
+    if the holding list changes, no persisted state to go stale."""
+    core_tickers = _get_core_holding_tickers()
+    if not core_tickers:
+        return None
+    from datetime import date as _date
+    try:
+        idx = _date.fromisoformat(today_et).toordinal() % len(core_tickers)
+    except ValueError:
+        return None
+    ticker = core_tickers[idx]
+    return {
+        "query": _build_cognitive_upgrade_query(ticker, today_et),
+        "search_depth": "basic",
+        "days": _COGNITIVE_UPGRADE_LOOKBACK_DAYS,
+        "max_results": 10,
+        # Explicit None overrides the loop's default "since last report" window
+        # (usually ~1 day) — this query needs a 30-day lookback, not yesterday's news.
+        "start_date": None,
+        "end_date": None,
+        "_rotation_ticker": ticker,  # for logging only
+    }
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -2395,6 +2526,14 @@ def _main_body():
         # All queries forced to basic — Extract handles depth
         all_search_jobs.append({**qobj, "search_depth": "basic"})
 
+    # Issue #33: one core-holding cognitive-upgrade rotation query/day, appended
+    # last so it only spends leftover Tavily budget (anomaly/geo/LLM queries above
+    # take priority — this is a proactive fill-in, not a real signal yet).
+    rotation_job = _rotation_search_job(today_et)
+    if rotation_job:
+        all_search_jobs.append(rotation_job)
+        logger.info(f"Issue #33 rotation query: {rotation_job['_rotation_ticker']}")
+
     # 9. Layer 1 — Discovery: run all basic searches, accumulate raw results
     tavily_section = ""
     raw_results: list[dict] = []
@@ -2409,8 +2548,8 @@ def _main_body():
             days=job.get("days", query_days),
             search_depth="basic",
             max_results=job.get("max_results", 12),
-            start_date=search_start,
-            end_date=search_end,
+            start_date=job.get("start_date", search_start),
+            end_date=job.get("end_date", search_end),
         )
         raw_results.extend(results)
 

@@ -19,6 +19,14 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-08）
+
+**Investment Operating Manual v1.0 接入 AM/PM 报告（issue #30，2026-07-08 当晚真实 PM 报告验证后追加修正）**：⑤/⑦ 措辞首次上线后用户反馈"能力圈内/外"黑话令人困惑，且逻辑不对称——圈外明确"不构成操作依据"，圈内却只说"可以讨论含义"，容易误读成"圈内=有操作依据"。修正为直接指代【能力边界】清单（"清单内/清单外"，不再用"能力圈"术语），并重新划清分工：⑤ 只决定能不能讨论战略含义，不决定该不该动；⑦ 才是唯一允许产出加减仓建议的依据来源，⑤ 的讨论不能替代 ⑦ 的核对结果。commit `86d47a5`。新写的 `Finance/Investment Operating Manual v1.0.md`（能力边界/Expectation Gap/SAS/Portfolio Construction 完整决策框架）此前完全不在日报注入链路里——`_load_framework()` 一直读的是旧的 `金融资产信息.md` 摘录。本次改为直接从 Manual 提取三段运行性规则（第2节能力边界、第6节 Portfolio Construction 含认知提升标准/减仓条件A/B/C、第7.4节 Expectation Gap 内部信号清单），注入 Pass 2 Layer B；Pass 2 prompt 新增两条分析要求：⑤能力圈内外标注（圈外驱动因素须显式标注"不构成操作依据"，不得暗示操作）、⑦持仓类异动核对清单（须对照认知提升/减仓枚举条件逐条核对，不满足则明确声明不构成依据）。不做 SAS 自动打分（仍为人工季度任务，见 issue #32）。实测提取内容 2498 字符、Pass2 prompt 组装正常，未跑完整付费流水线（避免当日报告重复）。同批还创建了 issue #31（SAS候选证据日志）、#32（季度财报深度分析脚本，>2%持仓 + earnings-triggered + 手工指定ticker，模型选用 claude-sonnet via OR、需报告实际花费、LLM 直接打分），均待实现。
+
+**SAS 候选证据日志接入（issue #31）**：Pass 2 prompt 新增 ⑧号规则 + `sas_candidates` JSON 字段——命中 Manual 第7.4节内部信号清单（内部人增持/资本配置持续性/生态位验证/监管语言变化/历史先例）或第6节认知提升标准三条之一、且涉及实际持仓标的时，输出 `{ticker, category, fact}`（category 为枚举字符串，非自由文本）。新增 `write_sas_candidate_log()` append-only 写入 `SAS候选证据日志.md`，复用 issue #10 校准记录的通用 append 助手，fail-open，纯证据队列不参与自动打分。测试用 scratch 文件验证了正常写入/缺字段过滤/二次append不截断三种场景。commit `137b192`。
+
+**每日情报搜集阶段补齐（issue #33）**：#31 上线后用真实 INTC 报告内容测试，`sas_candidates` 全为空——排查发现根因是搜集阶段结构性缺口：AM/PM 搜索完全由价格异动/地缘关键词触发，对核心持仓"没异动但该主动查"的情况（认知提升三条标准）和纯计算类信号（股价相对位置、仓位占比）完全没有覆盖。补齐三项：① `fetch_prices.py::fetch_52week_stats()` 计算52周区间百分位+距历史高点回撤（纯计算，零成本，替代 LLM 从文本自行估算"高位/低位"）；② `_get_portfolio_weights()`/`_compute_holding_signals()` 计算持仓占组合%（减仓条件C判断的既定事实，⑦号规则已更新为直接读取该值而非自行估算）；③ `_rotation_search_job()` 每日轮询一个核心持仓（AMKR/INTC/NVDA/QCOM/TSLA，日期取模确定，无需状态文件）主动生成认知提升相关搜索，追加在异动/地缘/LLM查询之后，只消耗剩余 Tavily 预算不抢占真实信号的额度。SEC EDGAR（Form 4/10-K语言变化）作为 13F/期权数据一起，明确留给 #32 季度深度分析场景，不进日频流水线。测试：真实数据验证核心持仓解析（AMKR/INTC/NVDA/QCOM/TSLA）、权重计算（INTC 10.4%等）、52周统计、7天轮询确定性（每个标的固定命中同一天）、prompt 组装、fetch_52week_stats 空列表/无效ticker 边界情况均通过。
+
 ## 当前系统状态（2026-07-06）
 
 **`call_llm()` 429 限流修复（2026-07-06，issue #29）**：夜盘收市速报生成失败——OpenRouter 返回 `429 Too Many Requests`，`call_llm()` 把它当普通不可重试的 4xx 直接 `return {}`，既不重试也跳过了 OR flex fallback，导致 Pass 1 空手而归、报告静默跳过未发送。429 是限流性质的瞬时错误，修复为与 5xx 同等对待（`status_code >= 500 or status_code == 429`），走 exponential backoff 重试，耗尽后落入 flex fallback。已手动补跑当次报告成功。见踩坑记录第80条，commit `c985b0c`。
