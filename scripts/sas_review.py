@@ -188,14 +188,23 @@ def _third_trading_day_after(earnings_date_str: str, hour: str) -> date | None:
         return None
 
 
-def _is_triggered_today(ticker: str) -> bool:
+def _describe_ticker_status(ticker: str) -> tuple[bool, str]:
+    """Whether `ticker` is triggered today, plus a human-readable reason either way.
+    The reason string is what makes the daily TG summary (issue #35) actually useful
+    for confirming the scan ran and evaluated each ticker correctly, not just that it
+    didn't crash."""
     event = _get_last_earnings_event(ticker)
     if not event:
-        return False
+        return False, "近45天内查不到财报记录"
     third_day = _third_trading_day_after(event["date"], event.get("hour", ""))
     if third_day is None:
-        return False
-    return third_day == date.today()
+        return False, f"上次财报{event['date']}，交易日偏移计算失败"
+    today = date.today()
+    if third_day == today:
+        return True, f"上次财报{event['date']}，今天是财报后第3个交易日"
+    if third_day < today:
+        return False, f"上次财报{event['date']}，触发窗口（{third_day}）已过"
+    return False, f"上次财报{event['date']}，触发窗口在{third_day}（还没到）"
 
 
 # ── Fail-closed earnings anchor (issue #32 point 5: retry, then alert) ────────
@@ -567,6 +576,19 @@ def _exclude_ticker(ticker: str) -> None:
     logger.info(f"{ticker} removed from SAS tracked list (history file untouched)")
 
 
+def _send_daily_scan_summary(statuses: list[tuple[str, bool, str]]) -> None:
+    """Issue #35: every automatic scan reports which tickers matched the
+    earnings-trigger window and which didn't, and why — not just the ones that
+    fired. Fail-open, sent regardless of whether anything triggered, so a
+    silent scan and a broken scan don't look identical from the outside."""
+    today = date.today().isoformat()
+    lines = [f"SAS 季度复盘每日扫描 {today}"]
+    for ticker, triggered, detail in statuses:
+        mark = "[命中]" if triggered else "[未命中]"
+        lines.append(f"{mark} {ticker}：{detail}")
+    rf.send_telegram_alert("\n".join(lines))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Quarterly SAS deep-dive (issue #32)")
     parser.add_argument("--ticker", help="Manually run for a specific ticker, bypassing trigger checks")
@@ -588,20 +610,22 @@ def main():
             logger.info("No tracked tickers yet, exiting")
             return
 
-        any_triggered = False
+        statuses: list[tuple[str, bool, str]] = []
         for ticker in tracked:
-            if not _is_triggered_today(ticker):
+            triggered, detail = _describe_ticker_status(ticker)
+            if not triggered:
+                statuses.append((ticker, False, detail))
                 continue
             if _has_today_entry(ticker):
-                logger.info(f"{ticker}: today's review already completed, skipping")
+                statuses.append((ticker, False, "今日已完成复盘（去重跳过，避免重复提醒/重复花费）"))
                 continue
-            any_triggered = True
             if NOTIFY_ONLY:
                 notify_pending_review(ticker, trigger_reason="财报后第3个交易日")
+                statuses.append((ticker, True, f"{detail}，已发邮件提醒（NOTIFY_ONLY模式，不自动跑分析）"))
             else:
-                run_ticker_review(ticker, trigger_reason="财报后第3个交易日")
-        if not any_triggered:
-            logger.info("No ticker triggered today, exiting silently")
+                ok = run_ticker_review(ticker, trigger_reason="财报后第3个交易日")
+                statuses.append((ticker, True, f"{detail}，{'已自动跑完分析并发邮件' if ok else '运行失败，见上方 Telegram 告警'}"))
+        _send_daily_scan_summary(statuses)
     finally:
         _lock_fd.close()
 
