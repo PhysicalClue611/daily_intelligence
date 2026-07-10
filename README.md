@@ -111,8 +111,9 @@ Create the directory (script will append to monthly files here):
 
 | File | Purpose |
 |---|---|
-| `Hermes/Daily Intelligence/Layer_A_Prompt.md` | System prompt for Pass 2. If missing, a built-in default is used. Edit in Obsidian to tune report style. |
+| `Hermes/Daily Intelligence/Layer_A_Prompt.md` | System prompt for Pass 2. If missing, a built-in default is used. Edit in Obsidian to tune report style. Starter template: [`templates/layer_a_prompt.example.md`](templates/layer_a_prompt.example.md). |
 | `Finance/portfolio_report_latest.md` | Your current holdings (cost basis, position size). Injected into Pass 2 for personalised analysis. Safe to omit. |
+| `Finance/Investment Operating Manual v1.0.md` | Your investment philosophy and decision rules (capability boundaries, position-sizing triggers, Strategic Alpha Score rubric). Extracted verbatim into Pass 2 prompts and read by `sas_review.py` for the quarterly deep-dive. Safe to omit — Pass 2 just runs without the personalized framework section. Starter template: [`templates/investment_operating_manual.example.md`](templates/investment_operating_manual.example.md). |
 
 ---
 
@@ -296,11 +297,20 @@ Daily_Intelligence/
 │   ├── finance_email.py        Resend email client
 │   ├── memory_context_finance.py   MemPalace + Obsidian context injection
 │   ├── telegram_commands.py    Telegram bot (long polling)
+│   ├── sas_review.py           quarterly Strategic Alpha Score deep-dive (manual/earnings-triggered)
+│   ├── sec_edgar_utils.py       SEC EDGAR helpers (Form 4 insider buys, 10-K risk factors) via edgartools
 │   ├── backfill_drawers.py     one-shot: backfill past reports into MemPalace
 │   └── migrate_reports.py      one-shot: migrate old single-file reports to monthly
+├── docs/
+│   └── design.md                full architecture reference (manually synced snapshot of the
+│                                 author's private Obsidian design doc — see note at top of the file)
+├── templates/
+│   ├── investment_operating_manual.example.md   starting point for Finance/Investment Operating Manual v1.0.md
+│   └── layer_a_prompt.example.md                starting point for Hermes/Daily Intelligence/Layer_A_Prompt.md
 ├── .env                        API keys (gitignored)
 ├── finance_tavily_budget.json  Tavily daily usage counter (auto-reset, gitignored)
 ├── finance_serpapi_budget.json SerpApi monthly counter (auto-reset, gitignored)
+├── sas_tracked_tickers.json    SAS tracked-ticker list (auto-maintained, gitignored)
 ├── tg_offset.json              Telegram polling offset (gitignored)
 └── .venv/                      Python virtual environment (gitignored)
 ```

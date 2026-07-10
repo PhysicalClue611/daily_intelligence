@@ -12,6 +12,8 @@ tg_offset.json
 finance_tavily_budget.json
 finance_serpapi_budget.json
 finance_adanos_budget.json
+sas_tracked_tickers.json
+sas_review.lock
 
 # IBKR gateway — not distributed (broker-specific, contains platform binaries)
 ibkr/

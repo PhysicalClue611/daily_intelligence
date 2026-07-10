@@ -19,6 +19,14 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-09 下）
+
+**移除条件代号引用，改自然语言自解释（issue #34）**：用户反馈 AM/PM 报告 prompt 和 `Finance/Investment Operating Manual v1.0.md` 里大量用代号引用边界条件——Manual 第6节"条件A/B/C"、prompt 里①-⑧编号、Manual 第9节"第6条的条件A"这类文档内跨引用，代号时间长了记不住。排查还发现编号方案已经腐化的实证：`VERIFIABLE_SIGNALS_INSTRUCTION_P2` 标签写"⑤"，实际拼接位置在模板里是"⑧"之后。修复：Manual 第6节条件A/B/C 改纯描述性标题（Alpha大幅兑现/出现更高赔率机会/仓位结构性超载），第7.4/第9节内部跨引用改为直接复述规则内容；`run_finance.py` `USER_PROMPT_TEMPLATE_P2` 的①-⑧编号改为描述性粗体小标题，互相引用处改为内联复述。`Daily_Intel设计文档.md` 第7.1/7.1b/十二节同步更新旧编号描述。已存跨项目 memory `feedback_no_coded_references`（决策规则用自然语言自解释，不用字母/数字代号互相引用）。commit `0db1759`，issue #34（已关闭）。
+
+**依赖文档接入 GH repo（docs/ + templates/ 分层）**：`Finance/Investment Operating Manual v1.0.md`、`Hermes/Daily Intelligence/Daily_Intel设计文档.md`、`Hermes/Daily Intelligence/Layer_A_Prompt.md` 三份文档此前只存在于私有 Obsidian vault，脚本靠 `OBSIDIAN_PATH` 在运行时读取，repo 里完全没有对应内容——开源后其他实现者无从参考。按内容分类接入：`docs/design.md` 是设计文档快照（本身面向独立实现者写的，直接原样入库，去掉含个人笔记标题的 frontmatter，文件头附一句"与 Obsidian 权威版本手动同步"的说明）；Manual 和 Layer_A_Prompt 不含任何持仓数字/账户信息，作为 `templates/investment_operating_manual.example.md` 和 `templates/layer_a_prompt.example.md` 入库（起点模板，供新用户复制到自己 Obsidian 后按个人情况修改，脚本本身不读这两个模板文件）。`sas_tracked_tickers.json`/`sas_review.lock` 补进 `.gitignore`（运行时状态，此前遗漏）。README 补充这三份文件的位置说明、`sas_review.py`/`sec_edgar_utils.py` 补进 Project structure 清单（此前 README 完全没提过 SAS 系统）。
+
+---
+
 ## 当前系统状态（2026-07-08）
 
 **Investment Operating Manual v1.0 接入 AM/PM 报告（issue #30，2026-07-08 当晚真实 PM 报告验证后追加修正）**：⑤/⑦ 措辞首次上线后用户反馈"能力圈内/外"黑话令人困惑，且逻辑不对称——圈外明确"不构成操作依据"，圈内却只说"可以讨论含义"，容易误读成"圈内=有操作依据"。修正为直接指代【能力边界】清单（"清单内/清单外"，不再用"能力圈"术语），并重新划清分工：⑤ 只决定能不能讨论战略含义，不决定该不该动；⑦ 才是唯一允许产出加减仓建议的依据来源，⑤ 的讨论不能替代 ⑦ 的核对结果。commit `86d47a5`。新写的 `Finance/Investment Operating Manual v1.0.md`（能力边界/Expectation Gap/SAS/Portfolio Construction 完整决策框架）此前完全不在日报注入链路里——`_load_framework()` 一直读的是旧的 `金融资产信息.md` 摘录。本次改为直接从 Manual 提取三段运行性规则（第2节能力边界、第6节 Portfolio Construction 含认知提升标准/减仓条件A/B/C、第7.4节 Expectation Gap 内部信号清单），注入 Pass 2 Layer B；Pass 2 prompt 新增两条分析要求：⑤能力圈内外标注（圈外驱动因素须显式标注"不构成操作依据"，不得暗示操作）、⑦持仓类异动核对清单（须对照认知提升/减仓枚举条件逐条核对，不满足则明确声明不构成依据）。不做 SAS 自动打分（仍为人工季度任务，见 issue #32）。实测提取内容 2498 字符、Pass2 prompt 组装正常，未跑完整付费流水线（避免当日报告重复）。同批还创建了 issue #31（SAS候选证据日志）、#32（季度财报深度分析脚本，>2%持仓 + earnings-triggered + 手工指定ticker，模型选用 claude-sonnet via OR、需报告实际花费、LLM 直接打分），均待实现。
