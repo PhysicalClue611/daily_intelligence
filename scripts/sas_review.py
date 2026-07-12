@@ -368,6 +368,7 @@ def _call_sas_review_llm(system_prompt: str, user_prompt: str, max_retries: int 
                 headers={
                     "Authorization": f"Bearer {rf.OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
+                    **rf.OR_ATTRIBUTION_HEADERS,
                 },
                 json={
                     "model": SAS_REVIEW_MODEL,

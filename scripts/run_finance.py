@@ -84,6 +84,7 @@ LOCK_FILE        = _PROJ_DIR / "run_finance.lock"  # Prevents concurrent duplica
 TAVILY_API_KEY      = os.getenv("TAVILY_API_KEY", "")
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 OR_BASE_URL         = "https://openrouter.ai/api/v1/chat/completions"
+OR_ATTRIBUTION_HEADERS = {"HTTP-Referer": "PhysicalClue611", "X-OpenRouter-Title": "DailyIntel"}
 LLM_MODEL           = "deepseek/deepseek-v4-flash"
 LLM_MODEL_PASS2     = "deepseek/deepseek-v4-pro"
 SEMANTIC_FILTER_MODEL = "deepseek/deepseek-v4-flash"
@@ -495,6 +496,7 @@ Return ONLY a JSON array of exactly {top_n} indices (or fewer if less than {top_
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
+                **OR_ATTRIBUTION_HEADERS,
             },
             json={
                 "model": SEMANTIC_FILTER_MODEL,
@@ -524,7 +526,7 @@ Return ONLY a JSON array of exactly {top_n} indices (or fewer if less than {top_
         resp = httpx.post(
             OR_BASE_URL,
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                     "Content-Type": "application/json"},
+                     "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
             json={
                 "model": LLM_FALLBACK_FLASH,
                 "service_tier": "flex",
@@ -1298,7 +1300,7 @@ def _sonar_macro_brief(
             resp = httpx.post(
                 OR_BASE_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                         "Content-Type": "application/json"},
+                         "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
                 json=or_payload,
                 timeout=30,
             )
@@ -1570,6 +1572,7 @@ def call_llm(prompt: str, max_retries: int = 2, model: str = LLM_MODEL,
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
+                    **OR_ATTRIBUTION_HEADERS,
                 },
                 json={
                     "model": model,
@@ -1641,7 +1644,7 @@ def call_llm(prompt: str, max_retries: int = 2, model: str = LLM_MODEL,
         resp = httpx.post(
             OR_BASE_URL,
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                     "Content-Type": "application/json"},
+                     "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
             json={
                 "model": fallback_model,
                 "service_tier": "flex",

@@ -55,6 +55,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 EXA_API_KEY        = os.getenv("EXA_API_KEY", "")
 PARALLEL_API_KEY   = os.getenv("PARALLEL_API_KEY", "")
 OR_BASE_URL        = "https://openrouter.ai/api/v1/chat/completions"
+OR_ATTRIBUTION_HEADERS = {"HTTP-Referer": "PhysicalClue611", "X-OpenRouter-Title": "DailyIntel"}
 EXA_BASE_URL       = "https://api.exa.ai/chat/completions"
 LLM_MODEL          = "deepseek/deepseek-v4-flash"
 LLM_FALLBACK_FLASH = "google/gemini-3.1-flash-lite"   # OR flex fallback for v4-flash
@@ -303,7 +304,7 @@ def _openrouter_post(payload: dict, timeout: int = 30, max_retries: int = 2):
                 time.sleep(wait)
             resp = httpx.post(
                 OR_BASE_URL,
-                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", **OR_ATTRIBUTION_HEADERS},
                 json=payload,
                 timeout=timeout,
             )
@@ -337,7 +338,7 @@ def _deepseek_post(payload: dict, timeout: int = 30, max_retries: int = 2):
             resp = httpx.post(
                 OR_BASE_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                         "Content-Type": "application/json"},
+                         "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
                 json=payload,
                 timeout=timeout,
             )
@@ -363,7 +364,7 @@ def _deepseek_post(payload: dict, timeout: int = 30, max_retries: int = 2):
         resp = httpx.post(
             OR_BASE_URL,
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                     "Content-Type": "application/json"},
+                     "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
             json=or_payload,
             timeout=120,
         )
@@ -681,7 +682,7 @@ def _detect_research_gap(question_intent: str, queries: list[str], brief: str) -
         )
         resp = httpx.post(
             OR_BASE_URL,
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
             json={
                 "model": REASONING_MODEL,
                 "provider": DS_OR_PROVIDERS,
@@ -1144,7 +1145,7 @@ def _llm_followup(question: str, pre: dict) -> str:
             resp = httpx.post(
                 OR_BASE_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                         "Content-Type": "application/json"},
+                         "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
                 json={"model": REASONING_MODEL, "provider": DS_OR_PROVIDERS,
                       "messages": messages,
                       "max_tokens": 8000, "temperature": 0.3},
