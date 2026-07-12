@@ -19,6 +19,10 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-12）
+
+**OpenRouter 调用接入归属 Header（跨项目通用约定，同步存入 `~/.claude/CLAUDE.md`）**：用户在 OR 后台发现 Hermes 调用显示 "App - Hermes Agent" 标签，本项目调用无标签。原因是 OR 通过 `HTTP-Referer`（必需）+ `X-OpenRouter-Title`（可选，日志里 App 名称来源）两个 header 做归属；本项目 3 个脚本共 11 处 OR 调用均未设置。修复：`run_finance.py`/`telegram_commands.py` 各自定义 `OR_ATTRIBUTION_HEADERS = {"HTTP-Referer": "PhysicalClue611", "X-OpenRouter-Title": "DailyIntel"}` 常量（`sas_review.py` 复用 `rf.OR_ATTRIBUTION_HEADERS`），全部调用点 `headers` dict 用 `**OR_ATTRIBUTION_HEADERS` 合并。commit `16ccae9`。未开 issue（跟 issue 先行原则的豁免条件一致：一次性机械改动，无后续观察点）。
+
 ## 当前系统状态（2026-07-09 下）
 
 **移除条件代号引用，改自然语言自解释（issue #34）**：用户反馈 AM/PM 报告 prompt 和 `Finance/Investment Operating Manual v1.0.md` 里大量用代号引用边界条件——Manual 第6节"条件A/B/C"、prompt 里①-⑧编号、Manual 第9节"第6条的条件A"这类文档内跨引用，代号时间长了记不住。排查还发现编号方案已经腐化的实证：`VERIFIABLE_SIGNALS_INSTRUCTION_P2` 标签写"⑤"，实际拼接位置在模板里是"⑧"之后。修复：Manual 第6节条件A/B/C 改纯描述性标题（Alpha大幅兑现/出现更高赔率机会/仓位结构性超载），第7.4/第9节内部跨引用改为直接复述规则内容；`run_finance.py` `USER_PROMPT_TEMPLATE_P2` 的①-⑧编号改为描述性粗体小标题，互相引用处改为内联复述。`Daily_Intel设计文档.md` 第7.1/7.1b/十二节同步更新旧编号描述。已存跨项目 memory `feedback_no_coded_references`（决策规则用自然语言自解释，不用字母/数字代号互相引用）。commit `0db1759`，issue #34（已关闭）。
