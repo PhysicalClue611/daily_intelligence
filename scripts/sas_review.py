@@ -31,6 +31,10 @@ else:
         _HOME, "Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview"
     )
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Cross-repo: canonical LLM-JSON-parsing helper lives in ~/Homepage (host-only
+# path — sas_review.py never runs in the Hermes MI container). See CLAUDE.md
+# "JSON 解析健壮性" note for why this isn't duplicated locally.
+sys.path.insert(0, os.path.join(_HOME, "Homepage"))
 
 from dotenv import load_dotenv
 _DI_ENV_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
@@ -46,7 +50,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import httpx
-from json_repair import repair_json
+from llm_json_utils import parse_llm_json
 
 import run_finance as rf
 import fetch_prices as fp
@@ -386,19 +390,7 @@ def _call_sas_review_llm(system_prompt: str, user_prompt: str, max_retries: int 
             data = resp.json()
             usage = data.get("usage", {})
             content = data["choices"][0]["message"].get("content", "")
-            json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-            json_str = json_match.group(1) if json_match else content.strip()
-            json_str = re.sub(r"^[^{]*", "", json_str)
-            json_str = re.sub(r"[^}]*$", "", json_str)
-            try:
-                result = json.loads(json_str)
-            except json.JSONDecodeError as e:
-                # Common failure mode: LLM emits an unescaped quote inside a
-                # rationale string, breaking strict JSON a few dozen chars in.
-                # Repair in-process instead of burning another paid call.
-                repaired = repair_json(json_str)
-                result = json.loads(repaired)
-                logger.warning(f"SAS review LLM output needed json_repair (original error: {e})")
+            result = parse_llm_json(content, logger=logger)
             result["_cost_usd"] = usage.get("cost", 0.0)
             result["_model_resolved"] = data.get("model", SAS_REVIEW_MODEL)
             return result

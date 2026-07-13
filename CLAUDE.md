@@ -23,6 +23,8 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 **手工 PLTR SAS 报告 + `sas_review.py` JSON 解析健壮性修复（issue #32 follow-up）**：手工 `--ticker PLTR` 跑通一次（$0.0538，已写入 `Finance/SAS_Review/PLTR.md` 并发邮件；注：PLTR 在 watchlist.md 里但不在 `sas_tracked_tickers.json` 自动追踪列表里，两者是独立的清单）。跑的过程中 OR log 出现两次计费调用——`_call_sas_review_llm()` 第一次调用返回的 JSON 里 rationale 字段含未转义引号，`json.loads` 硬失败，脚本原有重试逻辑直接整次重跑（含费用，第二次又花了一遍钱）。修复：解析失败时先用 `json_repair.repair_json()` 尝试就地修复，只有连修复都失败才计入 retry 消耗新的付费调用。已用真实故障字符串（rationale 内嵌引号）验证修复生效。新增依赖 `json-repair==0.61.4`（`requirements.txt`）。commit `e73ba78`。未开 issue（一次性健壮性加固，无后续观察点）。
 
+**追加重构（同日）**：用户提出应维护一个跨项目通用的 LLM JSON 清洗/修复工具，而非每个项目各写一份、且不想被特定 LLM/通道锁定。评估后同意——`json_repair`本身已经是 provider-agnostic 的修复算法，真正该复用的是"从 markdown 代码块摘出 JSON blob + 严格解析失败后修复 + 记日志"这段 glue 逻辑。canonical 版本存放在 `~/Homepage/llm_json_utils.py`（该目录本身就是各独立项目共享工具脚本的存放地，无 monorepo，靠 `sys.path.insert` 跨仓库 import，不是 pip 包）。`sas_review.py` 改为 `sys.path.insert(0, "~/Homepage")` 后 `from llm_json_utils import parse_llm_json`，原先内联的 extract+parse+repair 代码删除，`_call_sas_review_llm()` 简化为一行调用。注意：这条 cross-repo import 只在宿主机路径有效，`sas_review.py` 本身也从不在 Hermes MI 容器里跑（`_IN_CONTAINER` 分支只影响 Obsidian 路径），两者互相印证不冲突。`json-repair` 依赖仍需装在 Daily Intelligence 自己的 `.venv`（import 共享文件不会带装依赖）。已用真实 markdown 代码块+未转义引号的完整场景重新跑通验证。
+
 ## 当前系统状态（2026-07-12）
 
 **OpenRouter 调用接入归属 Header（跨项目通用约定，同步存入 `~/.claude/CLAUDE.md`）**：用户在 OR 后台发现 Hermes 调用显示 "App - Hermes Agent" 标签，本项目调用无标签。原因是 OR 通过 `HTTP-Referer`（必需）+ `X-OpenRouter-Title`（可选，日志里 App 名称来源）两个 header 做归属；本项目 3 个脚本共 11 处 OR 调用均未设置。修复：`run_finance.py`/`telegram_commands.py` 各自定义 `OR_ATTRIBUTION_HEADERS` 常量（`sas_review.py` 复用 `rf.OR_ATTRIBUTION_HEADERS`），全部调用点 `headers` dict 用 `**OR_ATTRIBUTION_HEADERS` 合并。commit `16ccae9`。未开 issue（跟 issue 先行原则的豁免条件一致：一次性机械改动，无后续观察点）。
