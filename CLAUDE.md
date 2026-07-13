@@ -19,6 +19,10 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-13 晚）
+
+**手工 PLTR SAS 报告 + `sas_review.py` JSON 解析健壮性修复（issue #32 follow-up）**：手工 `--ticker PLTR` 跑通一次（$0.0538，已写入 `Finance/SAS_Review/PLTR.md` 并发邮件；注：PLTR 在 watchlist.md 里但不在 `sas_tracked_tickers.json` 自动追踪列表里，两者是独立的清单）。跑的过程中 OR log 出现两次计费调用——`_call_sas_review_llm()` 第一次调用返回的 JSON 里 rationale 字段含未转义引号，`json.loads` 硬失败，脚本原有重试逻辑直接整次重跑（含费用，第二次又花了一遍钱）。修复：解析失败时先用 `json_repair.repair_json()` 尝试就地修复，只有连修复都失败才计入 retry 消耗新的付费调用。已用真实故障字符串（rationale 内嵌引号）验证修复生效。新增依赖 `json-repair==0.61.4`（`requirements.txt`）。commit `e73ba78`。未开 issue（一次性健壮性加固，无后续观察点）。
+
 ## 当前系统状态（2026-07-12）
 
 **OpenRouter 调用接入归属 Header（跨项目通用约定，同步存入 `~/.claude/CLAUDE.md`）**：用户在 OR 后台发现 Hermes 调用显示 "App - Hermes Agent" 标签，本项目调用无标签。原因是 OR 通过 `HTTP-Referer`（必需）+ `X-OpenRouter-Title`（可选，日志里 App 名称来源）两个 header 做归属；本项目 3 个脚本共 11 处 OR 调用均未设置。修复：`run_finance.py`/`telegram_commands.py` 各自定义 `OR_ATTRIBUTION_HEADERS` 常量（`sas_review.py` 复用 `rf.OR_ATTRIBUTION_HEADERS`），全部调用点 `headers` dict 用 `**OR_ATTRIBUTION_HEADERS` 合并。commit `16ccae9`。未开 issue（跟 issue 先行原则的豁免条件一致：一次性机械改动，无后续观察点）。
