@@ -117,6 +117,15 @@ ADANOS_BUDGET_PATH     = _PROJ_DIR / "finance_adanos_budget.json"
 FRED_API_KEY  = os.getenv("FRED_API_KEY", "")
 FRED_BASE     = "https://api.stlouisfed.org/fred/series/observations"
 
+# Brave News API (issue #14): independent Western search engine, not a Google
+# proxy like Serper/SerpApi. No longer free as of 2026 — $5/mo prepaid credit
+# then metered billing on file, so the monthly cap here is a hard stop, not a
+# soft warning, to avoid unattended overage charges.
+BRAVE_API_KEY       = os.getenv("BRAVE_API_KEY", "")
+BRAVE_BASE          = "https://api.search.brave.com/res/v1/news/search"
+BRAVE_MONTHLY_LIMIT = 800  # conservative under the ~1000-query $5 credit estimate
+BRAVE_BUDGET_PATH   = _PROJ_DIR / "finance_brave_budget.json"
+
 ET = ZoneInfo("America/New_York")
 
 # ── Watchlist parser ─────────────────────────────────────────────────────────
@@ -272,6 +281,25 @@ def save_adanos_budget(budget: dict) -> None:
 def adanos_remaining(budget: dict) -> int:
     return max(0, ADANOS_MONTHLY_LIMIT - budget.get("used", 0))
 
+
+# ── Brave News monthly budget ─────────────────────────────────────────────────
+
+def load_brave_budget() -> dict:
+    ym = _this_month_et()
+    try:
+        data = json.loads(BRAVE_BUDGET_PATH.read_text())
+        if data.get("year_month") == ym:
+            return data
+    except Exception:
+        pass
+    return {"year_month": ym, "used": 0}
+
+def save_brave_budget(budget: dict) -> None:
+    BRAVE_BUDGET_PATH.write_text(json.dumps(budget))
+
+def brave_remaining(budget: dict) -> int:
+    return max(0, BRAVE_MONTHLY_LIMIT - budget.get("used", 0))
+
 def serpapi_remaining(budget: dict) -> int:
     return max(0, SERPAPI_MONTHLY_LIMIT - budget.get("used", 0))
 
@@ -388,6 +416,60 @@ _TRUSTED_DOMAINS = [
     "barrons.com", "seekingalpha.com", "axios.com", "thestreet.com",
 ]
 
+# Video/aggregator path patterns (issue #19 direction 4): these pages are prone
+# to caption-stacking with no per-caption timestamp (see _detect_low_structure),
+# so a small scoring penalty lets the plain-article version of the same story
+# naturally outrank the video/gallery version instead of needing a hard exclude.
+_VIDEO_PATH_RE = re.compile(r"/(?:video|watch|gallery|live-blog)/", re.IGNORECASE)
+
+# Cross-source title dedup (issue #14): exact-URL dedup alone rarely catches
+# wire-service syndication (same AP/Reuters story picked up by many outlets
+# under different URLs, often paraphrased headlines).
+#
+# Character-level similarity (difflib.SequenceMatcher) was tried first and
+# empirically FAILED on real data: real headline pairs describing the same
+# ASML earnings-guidance story ("raises 2026 forecast" vs "hikes sales
+# forecast") scored 0.33-0.73 — well under any safe threshold — because
+# outlets paraphrase verbs and reorder words. Token-overlap (Jaccard on
+# significant words) tested far better on the same real pairs and is what's
+# implemented below. Scoping comparisons to results that share an anomaly
+# ticker/geo keyword (rather than comparing all pairs blindly) lets a lower,
+# more forgiving threshold work without merging unrelated stories that
+# happen to share generic financial vocabulary. Tuned against the
+# 2026-07-15 AM archive where 9 of 10 Tavily Extract slots went to just 2
+# real events — see issue #14 discussion for the worked example.
+_TITLE_DEDUP_THRESHOLD            = 0.30  # when titles share an anomaly/geo keyword
+_TITLE_DEDUP_THRESHOLD_NO_KEYWORD = 0.45  # neither title hit a tracked keyword — stricter bar
+_TITLE_DEDUP_WINDOW_HOURS = 24
+_DEDUP_STOPWORDS = {
+    "a", "an", "the", "on", "in", "at", "to", "for", "of", "as", "is", "are",
+    "with", "after", "its", "it", "and", "or", "this", "that", "from", "by", "new",
+}
+
+
+def _title_tokens_for_dedup(title: str) -> frozenset[str]:
+    """Lowercase word tokens minus stopwords/short tokens, source suffix stripped
+    (' - Reuters' / ' | CNBC') — used for Jaccard overlap, not character matching."""
+    t = title.lower().strip()
+    t = re.sub(r"\s*[-|–—]\s*[a-z0-9][a-z0-9 .]*$", "", t)
+    words = re.findall(r"[a-z0-9]+", t)
+    return frozenset(w for w in words if len(w) > 1 and w not in _DEDUP_STOPWORDS)
+
+
+def _title_keyword_hits(title: str, keywords: list[str]) -> frozenset[str]:
+    """Which tracked anomaly-ticker/geo keywords appear in this title — used to
+    scope title-dedup comparisons so unrelated stories sharing generic financial
+    words never get compared at the forgiving in-topic threshold."""
+    t = title.lower()
+    return frozenset(k for k in keywords if k and k in t)
+
+
+def _token_jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    if not a or not b:
+        return 0.0
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
 
 def score_and_filter(
     results: list[dict],
@@ -395,12 +477,24 @@ def score_and_filter(
     geo_topics: list[str],
     top_n: int = 8,
 ) -> list[dict]:
-    """Score and deduplicate search results; return top_n by composite score.
+    """Score, deduplicate (exact URL + near-duplicate title within a time window),
+    and return top_n search results by composite score.
 
     Composite = tavily_score
               + domain_bonus  (trusted financial/news source: +0.15)
               + recency_bonus (≤24h: +0.10; ≤72h: +0.05)
               + keyword_bonus (anomaly ticker or geo keyword in title/content: +0.05 each)
+              + video_penalty (video/gallery/watch path: -0.08, issue #19 direction 4)
+
+    Title dedup: different outlets covering the same wire story get different
+    URLs but paraphrased headlines. Exact-URL dedup misses this almost
+    entirely — a token-overlap match on titles that share a tracked ticker/geo
+    keyword, within a 24h publish window, catches it without needing
+    embeddings or an extra LLM call (see the module-level comment above
+    _TITLE_DEDUP_THRESHOLD for why character-level similarity was rejected).
+    Genuinely different angles on the same broader event (e.g. the
+    geopolitical act itself vs. the market's price reaction to it) score low
+    on token overlap and are correctly kept as separate, non-duplicate items.
     """
     keywords = [t.lower() for t in anomaly_tickers]
     for topic in geo_topics:
@@ -408,7 +502,7 @@ def score_and_filter(
     keywords = list(set(keywords))
 
     now = datetime.now(ET)
-    scored: list[tuple[float, dict]] = []
+    scored: list[tuple[float, dict, "datetime | None"]] = []
     seen: set[str] = set()
 
     for r in results:
@@ -420,13 +514,16 @@ def score_and_filter(
         s = float(r.get("score") or 0)
         domain = url.split("/")[2] if "//" in url else ""
         domain_bonus = 0.15 if any(d in domain for d in _TRUSTED_DOMAINS) else 0
+        video_penalty = -0.08 if _VIDEO_PATH_RE.search(url) else 0
 
         recency_bonus = 0.0
+        pub_dt = None
         pub = r.get("published_date", "")
         if pub:
             try:
                 from dateutil import parser as _dp
-                age_h = (now - _dp.parse(pub).astimezone(ET)).total_seconds() / 3600
+                pub_dt = _dp.parse(pub).astimezone(ET)
+                age_h = (now - pub_dt).total_seconds() / 3600
                 recency_bonus = 0.10 if age_h <= 24 else (0.05 if age_h <= 72 else 0)
             except Exception:
                 pass
@@ -434,10 +531,42 @@ def score_and_filter(
         text = (r.get("title", "") + " " + (r.get("content") or "")).lower()
         kw_bonus = 0.05 * sum(1 for k in keywords if k and k in text)
 
-        scored.append((s + domain_bonus + recency_bonus + kw_bonus, r))
+        scored.append((s + domain_bonus + recency_bonus + kw_bonus + video_penalty, r, pub_dt))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = [r for _, r in scored[:top_n]]
+
+    kept: list[tuple[float, dict]] = []
+    kept_meta: list[tuple[frozenset, frozenset, "datetime | None"]] = []
+    dup_count = 0
+    for score, r, pub_dt in scored:
+        title = r.get("title", "")
+        tokens = _title_tokens_for_dedup(title)
+        kw_hits = _title_keyword_hits(title.lower(), keywords)
+        is_dup = False
+        for kept_tokens, kept_kw_hits, kept_dt in kept_meta:
+            if kw_hits and kept_kw_hits:
+                if not (kw_hits & kept_kw_hits):
+                    continue  # different tracked topics — never compare
+                threshold = _TITLE_DEDUP_THRESHOLD
+            elif not kw_hits and not kept_kw_hits:
+                threshold = _TITLE_DEDUP_THRESHOLD_NO_KEYWORD  # no anchor, need a stronger bar
+            else:
+                continue  # one hit a keyword, the other didn't — different category
+            if _token_jaccard(tokens, kept_tokens) < threshold:
+                continue
+            if pub_dt and kept_dt and abs((pub_dt - kept_dt).total_seconds()) > _TITLE_DEDUP_WINDOW_HOURS * 3600:
+                continue  # same wording pattern but too far apart in time — probably unrelated
+            is_dup = True
+            break
+        if is_dup:
+            dup_count += 1
+            continue
+        kept.append((score, r))
+        kept_meta.append((tokens, kw_hits, pub_dt))
+
+    top = [r for _, r in kept[:top_n]]
+    if dup_count:
+        logger.info(f"score_and_filter: dropped {dup_count} near-duplicate-title result(s) (cross-source dedup)")
     logger.info(f"score_and_filter: {len(results)} → {len(top)} results (top_n={top_n})")
     return top
 
@@ -1068,7 +1197,7 @@ USER_PROMPT_TEMPLATE = """今日日期（ET）：{date}
 ## 过去24小时新闻（RSS）
 {news_text}
 
-{finnhub_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}{calibration_notes}
+{finnhub_news_section}{brave_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}{calibration_notes}
 ---
 
 ## 搜索任务约束（填写 tavily_queries 时遵守）
@@ -1110,7 +1239,7 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 ## 过去24小时新闻（RSS）
 {news_text}
 
-{finnhub_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}{calibration_notes}
+{finnhub_news_section}{brave_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}{calibration_notes}
 ---
 
 == 持仓与框架 ==
@@ -1549,6 +1678,62 @@ def fetch_finnhub_news(tickers: list[str], hours: int = 24) -> str:
     lines = [f"## Finnhub 即时新闻（ticker定向，过去{hours}h，来源 Finnhub）"]
     lines += [item[1] for item in items[:15]]
     logger.info(f"Finnhub news: {len(items)} items for {len(tickers)} tickers")
+    return "\n".join(lines) + "\n\n"
+
+
+def fetch_brave_news(tickers: list[str], geo_topics: list[str], budget: dict,
+                      max_queries: int = 4) -> str:
+    """Brave News API (issue #14): independent Western search engine (not a Google
+    proxy). Query-based, so one call per ticker/topic rather than a bulk feed like
+    RSS/Guardian. Hard budget-capped (see BRAVE_MONTHLY_LIMIT) since Brave dropped
+    its free tier in 2026 and bills a card once the $5 prepaid credit runs out —
+    fail-closed on budget exhaustion, never calls past the cap. Fail-open otherwise.
+    """
+    if not tickers or not BRAVE_API_KEY:
+        return ""
+    queries = [f"{t} stock news" for t in tickers[:max_queries]]
+    if geo_topics:
+        queries.append(" ".join(geo_topics[:3]) + " market impact")
+    queries = queries[:max_queries]
+
+    items: list[tuple[str, str]] = []  # (page_age iso str for sort, formatted line)
+    seen_titles: set[str] = set()
+    for query in queries:
+        if brave_remaining(budget) <= 0:
+            logger.info("Brave monthly budget exhausted, skipping remaining queries")
+            break
+        try:
+            resp = httpx.get(
+                BRAVE_BASE,
+                headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
+                params={"q": query, "freshness": "pd", "count": 8},
+                timeout=12,
+            )
+            budget["used"] = budget.get("used", 0) + 1
+            resp.raise_for_status()
+            for r in (resp.json().get("results") or [])[:8]:
+                title = (r.get("title") or "").strip()
+                if not title or title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                page_age = r.get("page_age") or ""
+                age_label = r.get("age") or page_age or "?"
+                source = (r.get("profile") or {}).get("name") or (r.get("meta_url") or {}).get("hostname") or "Brave"
+                desc = (r.get("description") or "")[:100]
+                line = f"[{age_label}] {title} ({source})"
+                if desc:
+                    line += f" — {desc}"
+                items.append((page_age, line))
+        except Exception as e:
+            logger.warning(f"Brave News query '{query}' failed: {e}")
+        time.sleep(0.2)
+    save_brave_budget(budget)
+    if not items:
+        return ""
+    items.sort(key=lambda x: x[0], reverse=True)
+    lines = [f"## Brave News（独立西方搜索引擎，本月已用 {budget['used']}/{BRAVE_MONTHLY_LIMIT}）"]
+    lines += [item[1] for item in items[:12]]
+    logger.info(f"Brave News: {len(items)} items for {len(queries)} queries")
     return "\n".join(lines) + "\n\n"
 
 
@@ -2154,6 +2339,8 @@ def build_status_message(
     guardian_enabled: bool,
     finnhub_tickers: list,
     finnhub_news_section: str,
+    brave_news_section: str,
+    brave_budget: dict,
     sonar_macro_section: str,
     polymarket_section: str,
     adanos_section: str,
@@ -2188,6 +2375,11 @@ def build_status_message(
         f"- Finnhub即时新闻: 已注入 {len(finnhub_tickers)} ticker" if finnhub_news_section
         else "- Finnhub即时新闻: 无数据/未触发"
     )
+    if BRAVE_API_KEY:
+        lines.append(
+            f"- Brave News: {'成功' if brave_news_section else '无数据/跳过'}"
+            f"（本月已用 {brave_budget['used']}/{BRAVE_MONTHLY_LIMIT}）"
+        )
     lines.append(f"- Sonar宏观快照: {'成功' if sonar_macro_section else '失败/跳过'}")
     lines.append(f"- Polymarket预测市场: {'成功' if polymarket_section else '无相关市场/跳过'}")
     if ADANOS_API_KEY:
@@ -2443,6 +2635,20 @@ def _main_body():
     finnhub_news_section = fetch_finnhub_news(_finnhub_tickers, hours=_finnhub_hours)
     logger.info(f"Finnhub news: slot={run_slot}, tickers={_finnhub_tickers}, hours={_finnhub_hours}")
 
+    # 6b2. Brave News (issue #14) — independent Western search engine, budget-capped
+    # (see BRAVE_MONTHLY_LIMIT note: Brave dropped its free tier in 2026, hard stop
+    # to avoid unattended card charges). Wrapped in try/except like the social
+    # sentiment step so a budget-file I/O hiccup can't take down the rest of the run.
+    brave_news_section = ""
+    brave_budget = {"year_month": "", "used": 0}
+    try:
+        brave_budget = load_brave_budget()
+        brave_news_section = fetch_brave_news(
+            _finnhub_tickers, list(wl["geo_keywords"].keys()), brave_budget,
+        )
+    except Exception as e:
+        logger.warning(f"Brave News step failed, continuing without it: {e}")
+
     # 6c. Sonar macro brief — real-time multi-source synthesis (AM + PM)
     # Query is built dynamically from watchlist; evolves as holdings change.
     sonar_macro_section = _sonar_macro_brief(
@@ -2511,6 +2717,7 @@ def _main_body():
         price_missing_note=price_missing_note,
         news_text=news_text,
         finnhub_news_section=finnhub_news_section,
+        brave_news_section=brave_news_section,
         sonar_macro_section=sonar_macro_section,
         social_sentiment_section=social_sentiment_section,
         tavily_section="",
@@ -2631,6 +2838,7 @@ def _main_body():
             price_missing_note=price_missing_note,
             news_text=news_text,
             finnhub_news_section=finnhub_news_section,
+            brave_news_section=brave_news_section,
             sonar_macro_section=sonar_macro_section,
             social_sentiment_section=social_sentiment_section,
             tavily_section=tavily_section,
@@ -2696,6 +2904,7 @@ def _main_body():
         today_et, slot_label, budget, serpapi_budget,
         tavily_used_before, serpapi_used_before,
         news_items, bool(guardian_key), _finnhub_tickers, finnhub_news_section,
+        brave_news_section, brave_budget,
         sonar_macro_section, polymarket_section, adanos_section, adanos_budget,
         all_search_jobs, raw_results, filtered, extract_results,
         tavily_section, llm_meta_p1, llm_meta_p2,
