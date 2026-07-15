@@ -197,6 +197,7 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
   ```
 - **push 命令**: `git push git@github-physicalclue611:PhysicalClue611/daily_intelligence.git main`
 - **Issues 追踪**: 未解决技术债、观察中功能均记录为 GitHub Issues
+- **`gh` CLI 鉴权（issue/PR 操作，2026-07-15）**：本项目禁止切换全局 `gh auth login`。`.env` 中 `GITHUB_TOKEN`（physicalclue611 PAT）通过 `GH_TOKEN="$GITHUB_TOKEN" gh <command>` 单次注入鉴权，与 git push 的 SSH alias 是两条独立通道，不要混用。
 - **由 Claude Code 负责 commit 和 push**（用户不需手动操作）
 
 ---
