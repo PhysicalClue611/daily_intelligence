@@ -19,6 +19,24 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-15）
+
+**Issue #14 部分实现：Brave News 接入 + 跨源标题去重（commit `39b888b`）**。背景：审计历史 issue 时发现今日（07-15）AM 报告真实 Extract 存档显示 9/10 名额被 ASML 财报 + 美伊霍尔木兹两个事件的重复报道占满（4份ASML财报变体、3份Iran/Hormuz变体），当天 INTC/NVDA/AMKR、PayPal-Stripe、中国GDP三个搜索 query 一条 Extract 都没进去——证明跨源去重不是理论优化，是真实发生的功能性缺陷。
+
+**Brave News**（`fetch_brave_news()`）：独立西方搜索引擎，非 Google 代理（区别于 Serper/SerpApi）。按 anomaly ticker + geo topic 逐条查询，最多4条/次。**Brave Search API 已于 2026 年取消免费层**，现为 $5/月预付额度用完后按量扣费（$0.003-0.005/次）——接入时加了硬性月度预算上限（`BRAVE_MONTHLY_LIMIT=800`，`finance_brave_budget.json`，到量自动停用不再调用，绝不产生额外扣费）。`BRAVE_API_KEY` 已存入 `.env`。
+
+**跨源标题去重（`score_and_filter()`）——方案推翻重来的真实教训**：最初提议字符级相似度（`difflib.SequenceMatcher`）+ 24h时间窗口，用真实 Extract 存档数据验证时**实测完全失效**——同一 ASML 财报事件的标题变体（"raises 2026 forecast" vs "hikes sales forecast"）字符相似度只有 0.33-0.73，远低于任何安全阈值，因为不同媒体用词和语序都不同。改用 token 重叠度（Jaccard，去停用词），且**限定只在标题命中同一个 tracked ticker/geo 关键词时才比较**（避免不相关新闻因共享通用财经词被误判重复）——这个组合在真实数据上验证有效：正确合并了 ASML 集群里2条最冗余的表述，同时正确保留了"美国重启霍尔木兹封锁"（地缘行动本身）vs"油价上涨"（市场反应）这类同一事件的不同报道角度（token重叠度低，不应合并，实测未被误删）。
+
+同时把 issue #19 方向4（wire原文优先/视频路径降权）以最小成本折进同一处打分逻辑：`/video/`、`/watch/` 路径给 -0.08 惩罚，无需硬性排除规则。
+
+**Issue 清理**：本次会话核实关闭 6 个 issue——#3（SPCX价格管道已自愈）、#6（不再推进IBKR翻转）、#8（KG已下线，纯向量版wontfix）、#9（KG vocab重复副本确认已清理）、#18（重复报告fix已生效验证）、#26（FRED流动性快照已实现，issue描述与代码不符）。核实 #17（Polymarket+Adanos社交舆情）已完整落地并有真实数据佐证（用真实key验证Adanos字段名猜测正确）。
+
+**`gh` CLI 鉴权方式确认**：本项目禁止切换全局 `gh auth login`，`.env` 中 `GITHUB_TOKEN` 通过 `GH_TOKEN="$GITHUB_TOKEN" gh <command>` 单次注入使用，详见下方 Git/GitHub 章节。
+
+**尚未验证**：以上改动已通过 py_compile + 复现真实故障场景的单元测试 + 真实 Brave API 调用验证，但未跑完整付费 AM/PM 报告流水线。下次真实运行后可 `grep "score_and_filter\|Brave News" /tmp/daily_intelligence.log` 确认线上去重命中率和 Brave 数据质量。
+
+---
+
 ## 当前系统状态（2026-07-13 晚）
 
 **手工 PLTR SAS 报告 + `sas_review.py` JSON 解析健壮性修复（issue #32 follow-up）**：手工 `--ticker PLTR` 跑通一次（$0.0538，已写入 `Finance/SAS_Review/PLTR.md` 并发邮件；注：PLTR 在 watchlist.md 里但不在 `sas_tracked_tickers.json` 自动追踪列表里，两者是独立的清单）。跑的过程中 OR log 出现两次计费调用——`_call_sas_review_llm()` 第一次调用返回的 JSON 里 rationale 字段含未转义引号，`json.loads` 硬失败，脚本原有重试逻辑直接整次重跑（含费用，第二次又花了一遍钱）。修复：解析失败时先用 `json_repair.repair_json()` 尝试就地修复，只有连修复都失败才计入 retry 消耗新的付费调用。已用真实故障字符串（rationale 内嵌引号）验证修复生效。新增依赖 `json-repair==0.61.4`（`requirements.txt`）。commit `e73ba78`。未开 issue（一次性健壮性加固，无后续观察点）。
@@ -179,7 +197,7 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 | 月度报告 | Obsidian: `Hermes/Daily Intelligence/Daily Reports/Daily_Intel_report_YYYYMM.md` | 脚本 append 写入 |
 | 持仓快照 | Obsidian: `Finance/portfolio_report_latest.md` | portfolio-agent 覆盖更新 |
 | Gmail token | `~/.hermes/token.json` | 借用 Hermes 的 OAuth token |
-| API keys | `~/Daily_Intelligence/.env` | OPENROUTER_API_KEY, TAVILY_API_KEY, SERPAPI_API_KEY, FINANCE_TELEGRAM_BOT_TOKEN, FINANCE_TELEGRAM_CHAT_ID, GUARDIAN_API_KEY, FINNHUB_API_KEY, EXA_API_KEY, PARALLEL_API_KEY, POLYGON_API_KEY（free tier 备用，未接入代码），FRED_API_KEY（流动性水位快照，issue 见2026-07-02状态）（DI 脚本只读此文件，不 fallback 到 ~/.hermes/.env） |
+| API keys | `~/Daily_Intelligence/.env` | OPENROUTER_API_KEY, TAVILY_API_KEY, SERPAPI_API_KEY, FINANCE_TELEGRAM_BOT_TOKEN, FINANCE_TELEGRAM_CHAT_ID, GUARDIAN_API_KEY, FINNHUB_API_KEY, EXA_API_KEY, PARALLEL_API_KEY, POLYGON_API_KEY（free tier 备用，未接入代码），FRED_API_KEY（流动性水位快照，issue 见2026-07-02状态），BRAVE_API_KEY（Brave News，issue #14，2026年已取消免费层，月度预算硬上限见2026-07-15状态），GITHUB_TOKEN（gh CLI 鉴权，见下方 Git/GitHub 章节）（DI 脚本只读此文件，不 fallback 到 ~/.hermes/.env） |
 | email_sender | `~/.hermes/skills/intel/china-intel/scripts/` | 共享工具，只读借用 |
 | GitHub repo | `https://github.com/PhysicalClue611/daily_intelligence` (private) | physicalclue611@gmail.com 账户，SSH alias: `github-physicalclue611` |
 
