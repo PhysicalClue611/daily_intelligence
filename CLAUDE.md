@@ -219,7 +219,7 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
   git config --local user.name "PhysicalClue611"
   git config --local user.email "physicalclue611@gmail.com"
   ```
-- **push 命令**: `git push git@github-physicalclue611:PhysicalClue611/daily_intelligence.git main`
+- **push 命令**: `git push origin main`（`origin` 已配置为 `git@github-physicalclue611:...`，与裸 URL 等价——但必须用 remote 名而非完整 URL push，否则本地 `origin/main` 追踪指针不会更新，会让其他 session/工具用 `origin/main..HEAD` 误判为"未 push"，见 2026-07-16 踩坑：GitHub 上其实已经真更新，只是本地指针滞后，另一个 Grok session 因此误报工作区有未 push 改动）
 - **Issues 追踪**: 未解决技术债、观察中功能均记录为 GitHub Issues
 - **`gh` CLI 鉴权（issue/PR 操作，2026-07-15）**：本项目禁止切换全局 `gh auth login`。`.env` 中 `GITHUB_TOKEN`（physicalclue611 PAT）通过 `GH_TOKEN="$GITHUB_TOKEN" gh <command>` 单次注入鉴权，与 git push 的 SSH alias 是两条独立通道，不要混用。
 - **由 Claude Code 负责 commit 和 push**（用户不需手动操作）
