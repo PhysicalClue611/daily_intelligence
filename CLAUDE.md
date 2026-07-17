@@ -19,6 +19,10 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-17）
+
+**本仓库存在多 agent session 并发工作（2026-07-17 发现）**：观察到至少两个 agent session 各自开了 feature branch + PR 在并行工作——`fix/apify-reddit-36-37`（PR #39，修复 issue #36/#37）和 `agent/parallel-budget-controls`（PR #40，issue #7 Parallel.ai 预算控制）。**任何新 session 涉及 git 操作前，先 `git branch --show-current` 确认当前分支、`gh pr list --state open` 确认是否已有别的 session 开着 PR，不要默认自己是仓库里唯一的改动来源**，完整原则见全局 `~/.claude/CLAUDE.md`"多 Agent/多分支并发协作仓库操作原则"一节。已有 PR 的工作只汇报不擅自 push/merge。
+
 ## 当前系统状态（2026-07-16）
 
 **Issue #17 第3步实现：Reddit 舆情接入（Apify Stock Sentiment Intelligence actor）**。前两步（Polymarket + Adanos）已于 06-25 落地，Reddit 一直空缺——官方 API 免费层限定非商业用途且 100 req/min，用户创建 Apify 账号（$5 一次性免费额度）后改用第三方聚合 actor `benthepythondev/stock-sentiment-intelligence`（专门做 WSB/r-stocks/r-investing 股票情绪聚合，非通用 Reddit 爬虫）。新增 `_reddit_sentiment_brief()`（`scripts/run_finance.py`），一次 API 调用批量查询全部待测 ticker（复用 Adanos 同一份 `_social_tickers` 优先级列表：异动标的优先，最多4个），减少按次收费的 actor 启动开销。定价 pay-per-event（$0.001/result + $0.00005/run），已用真实 token 实测 2-ticker 调用验证字段名（`ticker`/`sentiment_signal`/`mentions_24h`/`mention_change_pct`/`rank_change` 均为真实响应字段，非推测——对比 Adanos 当初字段名是猜的，这次直接测出来，更可靠）。`APIFY_MONTHLY_LIMIT=60` runs/月（`finance_apify_budget.json`，与 Brave 一致用原子写入，因为这个文件强制真实花费上限），60次×~4ticker预估月成本约 $0.25，远低于 $5 额度。**修了 Adanos 遗留的一个设计缺陷**：预算计数放在 `raise_for_status()` 之后才自增（Adanos 是先自增再校验，失败请求也计入免费额度消耗，见 issue #14 同类 bug）——这里因为是真金白银付费，不能延续那个模式。`social_sentiment_section` 拼接顺序：Polymarket + Adanos + Reddit + FRED liquidity，同一个 prompt 注入槽，未新增模板变量。`build_status_message()` TG 状态消息新增一行 `Reddit舆情(Apify)` 显示成功/额度。`.env` 新增 `APIFY_API_TOKEN`，`.gitignore` 新增 `finance_apify_budget.json`。已用真实 token 跑通 py_compile + 两次真实付费调用（一次 API 探测 + 一次集成后的函数级验证，各 ~$0.001-0.002），未跑完整 AM/PM 报告流水线验证端到端注入效果。
