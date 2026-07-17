@@ -557,7 +557,7 @@ Step 2  实时行情（三层路由）+ yfinance.news（免费，无配额）
         进度提示："获取实时行情及新闻（TICKER）..."
 
 Step 3  Parallel.ai search + extract（主，~$0.007-$0.012）
-        → _parallel_research(queries: list[str])：
+        → _parallel_research(queries) → (brief, failure_kind|None, detail)：
             search(search_queries=queries, objective=queries[0]) → 最多10条结果，单次请求
             dedup by title
             [P2] aggregator URL 优先排序：_AGGREGATOR_DOMAINS（stockanalysis/macrotrends/finviz/
@@ -573,10 +573,17 @@ Step 3  Parallel.ai search + extract（主，~$0.007-$0.012）
             Parallel 成功后，V4 Flash 判断是否存在明显盲区（缺价格路径/市场反应/基本面解释之一）
             有则生成第3条补漏 query 并再次调用 Parallel；无则直接进 Step 4
             触发时进度提示："情报补充（补漏查询）..."；fail-open，不影响主流程
-            issue #7 成本开关：Parallel 信息密度高于 Sonar，credit 用完后仍保持主路径；
-            dashboard credit < $5 时优先设置 PARALLEL_P1_ENABLED=0，只关 P1 补漏查询。
-        → 月度硬预算：finance_parallel_budget.json 记录 search/extract 估算成本；
-          PARALLEL_MONTHLY_BUDGET_USD 默认 $20，超限才降级到 Sonar/Exa。
+            issue #7 成本第一杠杆：dashboard credit < $5 时设 PARALLEL_P1_ENABLED=0，
+            只关 P1 补漏查询，主 Parallel 全文路径保持开启。
+        → 产品原则：Parallel 信息密度高于 Sonar、费用仅略高，有 key 就优先走 Parallel；
+          不因本地估算月度用量而提前改用 Sonar。
+        → 观测：finance_parallel_budget.json 记录 search/extract 估算成本（状态消息展示），
+          默认不做硬帽；PARALLEL_MONTHLY_BUDGET_USD>0 才启用可选灾难刹车。
+        → 降级条件：
+            ① Parallel 真实拒绝服务（余额不足/鉴权失败，含 401/402/403 与 billing 语义错误）
+               → 单独发一条 TG notice（6h 冷却防刷）→ Sonar/Exa
+            ② 可选硬帽触发 → 同样 TG notice → Sonar/Exa
+            ③ 其它技术失败/空结果 → fail-open 静默 Sonar，不发「余额不足」notice
         → 原始全文直接传入 Step 4，无预摘要损耗
         → 失败 fallback：Sonar（重试1次→Exa model="exa"）
         进度提示："情报检索（N条查询）..."
