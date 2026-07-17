@@ -295,7 +295,13 @@ def load_brave_budget() -> dict:
     return {"year_month": ym, "used": 0}
 
 def save_brave_budget(budget: dict) -> None:
-    BRAVE_BUDGET_PATH.write_text(json.dumps(budget))
+    """Atomic write (temp file + os.replace) — never open(path,'w')/write_text()
+    directly on this file (global CLAUDE.md 破坏性文件写入安全): a crash or kill
+    mid-write would truncate it, and the next load_brave_budget() would then
+    silently reset the hard spending cap this file exists to enforce."""
+    tmp_path = BRAVE_BUDGET_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(budget))
+    os.replace(tmp_path, BRAVE_BUDGET_PATH)
 
 def brave_remaining(budget: dict) -> int:
     return max(0, BRAVE_MONTHLY_LIMIT - budget.get("used", 0))
@@ -440,18 +446,26 @@ _VIDEO_PATH_RE = re.compile(r"/(?:video|watch|gallery|live-blog)/", re.IGNORECAS
 # real events — see issue #14 discussion for the worked example.
 _TITLE_DEDUP_THRESHOLD            = 0.30  # when titles share an anomaly/geo keyword
 _TITLE_DEDUP_THRESHOLD_NO_KEYWORD = 0.45  # neither title hit a tracked keyword — stricter bar
+_TITLE_DEDUP_STRICT_NO_DATE_THRESHOLD = 0.6  # neither side has a parseable date — require near-exact wording
 _TITLE_DEDUP_WINDOW_HOURS = 24
 _DEDUP_STOPWORDS = {
     "a", "an", "the", "on", "in", "at", "to", "for", "of", "as", "is", "are",
     "with", "after", "its", "it", "and", "or", "this", "that", "from", "by", "new",
 }
+# Source-suffix stripper: only strips a SHORT trailing "- Reuters" / "| CNBC.com"
+# style tag. Bounded to <=30 chars after the dash so it can't (as an earlier
+# version did) greedily eat the substantive back half of a headline — e.g.
+# "Iran tension escalates - Hormuz strait closure imminent" must NOT collapse
+# to the same tokens as "... - Israel considers preemptive strike" (verified
+# both reduced to an identical frozenset before this bound was added).
+_TITLE_SUFFIX_RE = re.compile(r"\s*[-|–—]\s*[a-z0-9][a-z0-9 .]{0,29}$")
 
 
 def _title_tokens_for_dedup(title: str) -> frozenset[str]:
     """Lowercase word tokens minus stopwords/short tokens, source suffix stripped
     (' - Reuters' / ' | CNBC') — used for Jaccard overlap, not character matching."""
     t = title.lower().strip()
-    t = re.sub(r"\s*[-|–—]\s*[a-z0-9][a-z0-9 .]*$", "", t)
+    t = _TITLE_SUFFIX_RE.sub("", t)
     words = re.findall(r"[a-z0-9]+", t)
     return frozenset(w for w in words if len(w) > 1 and w not in _DEDUP_STOPWORDS)
 
@@ -459,9 +473,18 @@ def _title_tokens_for_dedup(title: str) -> frozenset[str]:
 def _title_keyword_hits(title: str, keywords: list[str]) -> frozenset[str]:
     """Which tracked anomaly-ticker/geo keywords appear in this title — used to
     scope title-dedup comparisons so unrelated stories sharing generic financial
-    words never get compared at the forgiving in-topic threshold."""
+    words never get compared at the forgiving in-topic threshold.
+
+    Word-boundary matching, not raw substring: a plain `k in t` check let short
+    keywords like "us" (split from the geo-topic label "US-Iran") match inside
+    unrelated words ("focus", "trust"), which fed false keyword hits into the
+    dedup gate (verified: 'Focus shifts to Fed rate decision' and 'Consumer
+    trust index falls' both registered kw_hits={'us'})."""
     t = title.lower()
-    return frozenset(k for k in keywords if k and k in t)
+    return frozenset(
+        k for k in keywords
+        if k and re.search(r"\b" + re.escape(k) + r"\b", t)
+    )
 
 
 def _token_jaccard(a: frozenset[str], b: frozenset[str]) -> float:
@@ -474,7 +497,7 @@ def _token_jaccard(a: frozenset[str], b: frozenset[str]) -> float:
 def score_and_filter(
     results: list[dict],
     anomaly_tickers: list[str],
-    geo_topics: list[str],
+    geo_keywords: dict[str, list[str]],
     top_n: int = 8,
 ) -> list[dict]:
     """Score, deduplicate (exact URL + near-duplicate title within a time window),
@@ -495,10 +518,28 @@ def score_and_filter(
     Genuinely different angles on the same broader event (e.g. the
     geopolitical act itself vs. the market's price reaction to it) score low
     on token overlap and are correctly kept as separate, non-duplicate items.
+
+    `geo_keywords` takes the curated topic→keyword dict from watchlist.md
+    (e.g. "US-Iran": ["Iran", "nuclear", "Strait of Hormuz", ...]), not a bare
+    list of topic labels — splitting a label like "US-Iran" into ["us","iran"]
+    both misses real synonym anchors (a "Hormuz"-only headline never matched
+    an "iran"-only one, confirmed missed in the 2026-07-15 PM production run)
+    and introduces short-token false positives ("us" matching inside "focus").
     """
     keywords = [t.lower() for t in anomaly_tickers]
-    for topic in geo_topics:
-        keywords += [k.strip().lower() for k in topic.replace("-", " ").split()]
+    for kws in geo_keywords.values():
+        for kw in kws:
+            kw = kw.strip().lower()
+            if not kw:
+                continue
+            keywords.append(kw)
+            # A multi-word curated keyword ("Strait of Hormuz") requiring an
+            # exact full-phrase match in the title is too strict — real
+            # headlines often say just "Hormuz" alone (confirmed missed in
+            # the 2026-07-15 PM production run). Anchor on its significant
+            # individual words too, not just the whole phrase.
+            if " " in kw:
+                keywords += [w for w in kw.split() if len(w) > 3 and w not in _DEDUP_STOPWORDS]
     keywords = list(set(keywords))
 
     now = datetime.now(ET)
@@ -552,10 +593,16 @@ def score_and_filter(
                 threshold = _TITLE_DEDUP_THRESHOLD_NO_KEYWORD  # no anchor, need a stronger bar
             else:
                 continue  # one hit a keyword, the other didn't — different category
-            if _token_jaccard(tokens, kept_tokens) < threshold:
+            jac = _token_jaccard(tokens, kept_tokens)
+            if jac < threshold:
                 continue
-            if pub_dt and kept_dt and abs((pub_dt - kept_dt).total_seconds()) > _TITLE_DEDUP_WINDOW_HOURS * 3600:
-                continue  # same wording pattern but too far apart in time — probably unrelated
+            if pub_dt and kept_dt:
+                if abs((pub_dt - kept_dt).total_seconds()) > _TITLE_DEDUP_WINDOW_HOURS * 3600:
+                    continue  # confirmed too far apart in time — probably unrelated
+            elif jac < _TITLE_DEDUP_STRICT_NO_DATE_THRESHOLD:
+                # can't confirm publish-time proximity either way — require
+                # near-exact wording before deduping instead of an unbounded match
+                continue
             is_dup = True
             break
         if is_dup:
@@ -1691,14 +1738,21 @@ def fetch_brave_news(tickers: list[str], geo_topics: list[str], budget: dict,
     """
     if not tickers or not BRAVE_API_KEY:
         return ""
-    queries = [f"{t} stock news" for t in tickers[:max_queries]]
+    # Reserve a slot for the geo-topics query up front — slicing tickers to
+    # max_queries and appending the geo query afterward (then re-truncating to
+    # max_queries) silently dropped the geo query whenever ticker count alone
+    # already filled the quota (true for both the 8-ticker AM default and any
+    # PM run with >=4 movers), defeating half this function's purpose.
     if geo_topics:
+        ticker_slots = max(0, max_queries - 1)
+        queries = [f"{t} stock news" for t in tickers[:ticker_slots]]
         queries.append(" ".join(geo_topics[:3]) + " market impact")
-    queries = queries[:max_queries]
+    else:
+        queries = [f"{t} stock news" for t in tickers[:max_queries]]
 
-    items: list[tuple[str, str]] = []  # (page_age iso str for sort, formatted line)
+    items: list[tuple[str, str, frozenset]] = []  # (page_age iso str for sort, formatted line, tokens)
     seen_titles: set[str] = set()
-    for query in queries:
+    for i, query in enumerate(queries):
         if brave_remaining(budget) <= 0:
             logger.info("Brave monthly budget exhausted, skipping remaining queries")
             break
@@ -1709,13 +1763,26 @@ def fetch_brave_news(tickers: list[str], geo_topics: list[str], budget: dict,
                 params={"q": query, "freshness": "pd", "count": 8},
                 timeout=12,
             )
-            budget["used"] = budget.get("used", 0) + 1
             resp.raise_for_status()
+            # Only count the call against the hard cap once it's confirmed
+            # successful — an expired key or a 429/5xx used to still burn
+            # budget for zero usable results, silently exhausting the cap
+            # meant to prevent unattended overage charges.
+            budget["used"] = budget.get("used", 0) + 1
             for r in (resp.json().get("results") or [])[:8]:
                 title = (r.get("title") or "").strip()
                 if not title or title in seen_titles:
                     continue
                 seen_titles.add(title)
+                tokens = _title_tokens_for_dedup(title)
+                # Brave results never flow through score_and_filter()'s
+                # cross-source dedup (that only sees Tavily raw_results), so
+                # apply the same token-overlap check here — otherwise
+                # paraphrased duplicates across Brave's own queries (the
+                # exact failure mode this feature targets) go uncaught.
+                if any(_token_jaccard(tokens, kept_tok) >= _TITLE_DEDUP_THRESHOLD_NO_KEYWORD
+                       for _, _, kept_tok in items):
+                    continue
                 page_age = r.get("page_age") or ""
                 age_label = r.get("age") or page_age or "?"
                 source = (r.get("profile") or {}).get("name") or (r.get("meta_url") or {}).get("hostname") or "Brave"
@@ -1723,10 +1790,11 @@ def fetch_brave_news(tickers: list[str], geo_topics: list[str], budget: dict,
                 line = f"[{age_label}] {title} ({source})"
                 if desc:
                     line += f" — {desc}"
-                items.append((page_age, line))
+                items.append((page_age, line, tokens))
         except Exception as e:
             logger.warning(f"Brave News query '{query}' failed: {e}")
-        time.sleep(0.2)
+        if i < len(queries) - 1:
+            time.sleep(0.2)
     save_brave_budget(budget)
     if not items:
         return ""
@@ -2788,7 +2856,7 @@ def _main_body():
         prescreened = score_and_filter(
             raw_results,
             anomaly_ticker_syms,
-            list(wl["geo_keywords"].keys()),
+            wl["geo_keywords"],
             top_n=15,
         )
 
