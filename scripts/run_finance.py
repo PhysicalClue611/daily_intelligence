@@ -109,6 +109,19 @@ ADANOS_BASE            = "https://api.adanos.org"
 ADANOS_MONTHLY_LIMIT   = 200  # free tier is 250/mo; leave headroom for TG follow-ups/manual reruns
 ADANOS_BUDGET_PATH     = _PROJ_DIR / "finance_adanos_budget.json"
 
+# Reddit sentiment via Apify's "Stock Sentiment Intelligence" actor (issue #17 step 3):
+# Reddit's own API is free only for non-commercial use with a 100 req/min ceiling; this
+# purpose-built actor (WSB/r-stocks/r-investing mentions + BULLISH/BEARISH/NEUTRAL signal)
+# sidesteps that. Pay-per-event: ~$0.001/result + $0.00005/run, verified with a real 1-ticker
+# call on 2026-07-16 ($0.00105). One run batches all watchlist tickers, so
+# APIFY_MONTHLY_LIMIT runs/month stays far under the $5 one-time free credit
+# (60 runs × ~4 tickers ≈ $0.25/mo at these rates).
+APIFY_API_TOKEN      = os.getenv("APIFY_API_TOKEN", "")
+APIFY_BASE           = "https://api.apify.com/v2"
+APIFY_REDDIT_ACTOR   = "benthepythondev~stock-sentiment-intelligence"
+APIFY_MONTHLY_LIMIT  = 60  # runs/month, not results — see cost math above
+APIFY_BUDGET_PATH    = _PROJ_DIR / "finance_apify_budget.json"
+
 # Liquidity plumbing snapshot (Hermes/Daily Intelligence/市场见顶预警指标.md, 2026-07-02):
 # FRED is the authoritative free source for these Fed data series — precise
 # and structured, unlike asking an LLM search engine for exact numbers (see
@@ -280,6 +293,29 @@ def save_adanos_budget(budget: dict) -> None:
 
 def adanos_remaining(budget: dict) -> int:
     return max(0, ADANOS_MONTHLY_LIMIT - budget.get("used", 0))
+
+
+# ── Apify (Reddit sentiment) monthly budget ────────────────────────────────────
+
+def load_apify_budget() -> dict:
+    ym = _this_month_et()
+    try:
+        data = json.loads(APIFY_BUDGET_PATH.read_text())
+        if data.get("year_month") == ym:
+            return data
+    except Exception:
+        pass
+    return {"year_month": ym, "used": 0}
+
+def save_apify_budget(budget: dict) -> None:
+    """Atomic write — this file enforces a real-money spending cap (global CLAUDE.md
+    破坏性文件写入安全), same reasoning as save_brave_budget()."""
+    tmp_path = APIFY_BUDGET_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(budget))
+    os.replace(tmp_path, APIFY_BUDGET_PATH)
+
+def apify_remaining(budget: dict) -> int:
+    return max(0, APIFY_MONTHLY_LIMIT - budget.get("used", 0))
 
 
 # ── Brave News monthly budget ─────────────────────────────────────────────────
@@ -1597,6 +1633,54 @@ def _adanos_x_sentiment(tickers: list[str], budget: dict) -> str:
     return "\n## X/Twitter 舆情快照（Adanos）\n" + "\n".join(lines) + "\n"
 
 
+def _reddit_sentiment_brief(tickers: list[str], budget: dict) -> str:
+    """Query Apify's Stock Sentiment Intelligence actor (benthepythondev/stock-sentiment-intelligence)
+    for Reddit stock sentiment (WSB/r-stocks/r-investing mentions, momentum, BULLISH/BEARISH/NEUTRAL
+    signal) on watchlist tickers — issue #17 step 3. Field names below are real, verified against a
+    live 1-ticker call on 2026-07-16 (not guessed, unlike Adanos's schema — see its docstring).
+    Batches all tickers into a single actor run to minimize the per-run start fee. Fail-open: returns
+    "" if no token configured, budget exhausted, or the API errors. Budget is only incremented after
+    a successful response (unlike Adanos, which counts failed calls too — see issue #14 bug list)
+    since this is real pay-per-event money, not a free-tier call counter.
+    """
+    if not tickers or not APIFY_API_TOKEN:
+        return ""
+    if apify_remaining(budget) <= 0:
+        logger.info("Apify monthly budget exhausted, skipping Reddit sentiment")
+        return ""
+    try:
+        resp = httpx.post(
+            f"{APIFY_BASE}/acts/{APIFY_REDDIT_ACTOR}/run-sync-get-dataset-items",
+            headers={"Authorization": f"Bearer {APIFY_API_TOKEN}", "Content-Type": "application/json"},
+            json={"mode": "specific_tickers", "tickers": tickers, "maxResults": len(tickers)},
+            timeout=90,
+        )
+        resp.raise_for_status()
+        items = resp.json()
+        budget["used"] = budget.get("used", 0) + 1
+        logger.debug(f"Apify Reddit sentiment raw response: {json.dumps(items)[:2000]}")
+    except Exception as e:
+        logger.warning(f"Apify Reddit sentiment query failed: {e}")
+        return ""
+    lines: list[str] = []
+    for item in items:
+        ticker = item.get("ticker")
+        if not ticker:
+            continue
+        change = item.get("mention_change_pct")
+        parts = [f"{k}={v}" for k, v in
+                 [("signal", item.get("sentiment_signal")),
+                  ("mentions_24h", item.get("mentions_24h")),
+                  ("mention_chg", f"{change:+.0f}%" if change is not None else None),
+                  ("rank_chg", item.get("rank_change"))]
+                 if v is not None]
+        if parts:
+            lines.append(f"- {ticker}: {', '.join(parts)}")
+    if not lines:
+        return ""
+    return "\n## Reddit 舆情快照（Apify）\n" + "\n".join(lines) + "\n"
+
+
 def _fred_latest(series_id: str, limit: int = 1) -> list[tuple[str, float]]:
     """Fetch the latest N observations for a FRED series, skipping missing
     values ('.'). Returns [(date, value), ...] newest first. Fail-open:
@@ -2413,6 +2497,8 @@ def build_status_message(
     polymarket_section: str,
     adanos_section: str,
     adanos_budget: dict,
+    reddit_section: str,
+    apify_budget: dict,
     all_search_jobs: list,
     raw_results: list,
     filtered: list,
@@ -2454,6 +2540,11 @@ def build_status_message(
         lines.append(
             f"- Adanos X舆情: {'成功' if adanos_section else '无数据/跳过'}"
             f"（本月已用 {adanos_budget['used']}/{ADANOS_MONTHLY_LIMIT}）"
+        )
+    if APIFY_API_TOKEN:
+        lines.append(
+            f"- Reddit舆情(Apify): {'成功' if reddit_section else '无数据/跳过'}"
+            f"（本月已用 {apify_budget['used']}/{APIFY_MONTHLY_LIMIT}）"
         )
     if all_search_jobs:
         line = f"- Tavily/SerpApi搜索: {len(all_search_jobs)} 任务, {len(raw_results)} 条原始结果"
@@ -2737,14 +2828,19 @@ def _main_body():
     polymarket_section = ""
     adanos_section = ""
     adanos_budget = {"year_month": "", "used": 0}
+    reddit_section = ""
+    apify_budget = {"year_month": "", "used": 0}
     try:
         adanos_budget = load_adanos_budget()
         polymarket_section = _polymarket_brief(list(wl["geo_keywords"].keys()))
-        _adanos_tickers = list(dict.fromkeys(
+        _social_tickers = list(dict.fromkeys(
             anomaly_ticker_syms + [t for t in wl["stocks"] if t not in anomaly_ticker_syms]
         ))[:4]
-        adanos_section = _adanos_x_sentiment(_adanos_tickers, adanos_budget)
+        adanos_section = _adanos_x_sentiment(_social_tickers, adanos_budget)
         save_adanos_budget(adanos_budget)
+        apify_budget = load_apify_budget()
+        reddit_section = _reddit_sentiment_brief(_social_tickers, apify_budget)
+        save_apify_budget(apify_budget)
     except Exception as e:
         logger.warning(f"Social sentiment step failed, continuing without it: {e}")
 
@@ -2759,11 +2855,13 @@ def _main_body():
     except Exception as e:
         logger.warning(f"Liquidity snapshot step failed, continuing without it: {e}")
 
-    social_sentiment_section = polymarket_section + adanos_section + liquidity_section
+    social_sentiment_section = polymarket_section + adanos_section + reddit_section + liquidity_section
     logger.info(
         f"Social sentiment: polymarket={'yes' if polymarket_section else 'no'}, "
         f"adanos={'yes' if adanos_section else 'no'} "
-        f"(budget {adanos_budget['used']}/{ADANOS_MONTHLY_LIMIT})"
+        f"(budget {adanos_budget['used']}/{ADANOS_MONTHLY_LIMIT}), "
+        f"reddit={'yes' if reddit_section else 'no'} "
+        f"(budget {apify_budget['used']}/{APIFY_MONTHLY_LIMIT})"
     )
 
     # 7b. First LLM pass — analyze and generate search tasks
@@ -2974,6 +3072,7 @@ def _main_body():
         news_items, bool(guardian_key), _finnhub_tickers, finnhub_news_section,
         brave_news_section, brave_budget,
         sonar_macro_section, polymarket_section, adanos_section, adanos_budget,
+        reddit_section, apify_budget,
         all_search_jobs, raw_results, filtered, extract_results,
         tavily_section, llm_meta_p1, llm_meta_p2,
     )
