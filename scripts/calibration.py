@@ -5,12 +5,13 @@ AM prediction calibration closed loop (issue #10) and SAS candidate evidence
 log (issue #31). Extracted from run_finance.py (issue #42, 2026-07-17) to
 shrink that file.
 
-Leaf module except for one deferred import: _evaluate_am_predictions() needs
-call_llm/LLM_MODEL, which stayed in run_finance.py's core. A module-level
-import would be circular (run_finance.py imports evaluate_am_calibration
-from this module), so the import happens inside the function body instead —
-safe because it only runs once run_finance.py has finished importing this
-module.
+Leaf module: does not import from run_finance.py. _evaluate_am_predictions()
+gets call_llm/LLM_MODEL from llm_client.py, a shared leaf module — not a
+deferred `from run_finance import ...` inside the function body (the
+original approach here, before PR #43 review feedback pointed out it
+silently assumed run_finance.py is registered in sys.modules as
+"run_finance", which is false when it's run directly as the entrypoint, as
+launchd does — Python registers it as "__main__" instead).
 """
 import logging
 import os
@@ -21,6 +22,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from report_writers import _monthly_path
+from llm_client import call_llm, LLM_MODEL
 
 _HOME = os.path.expanduser("~")
 _IN_CONTAINER = os.path.exists("/opt/data")
@@ -91,10 +93,6 @@ def _evaluate_am_predictions(signals_text: str, price_table: str, news_context: 
     """Single cheap LLM call: judge each AM 'verifiable signal' against today's
     actual outcome data. Returns {} on any failure or empty input (fail-open).
     Cost: ~$0.0005 (small prompt, deepseek-v4-flash via OR)."""
-    # Deferred import: call_llm/LLM_MODEL stayed in run_finance.py's core (issue
-    # #42 split); module-level import here would be circular since run_finance.py
-    # imports evaluate_am_calibration from this module.
-    from run_finance import call_llm, LLM_MODEL
     if not OPENROUTER_API_KEY or not signals_text.strip():
         return {}
     prompt = f"""今日日期：{date_str}

@@ -6,12 +6,15 @@ path/dedup helpers, Context Log + Extract Archive writers, MemPalace drawer
 push, Obsidian report append, Telegram send, email footer. Extracted from
 run_finance.py (issue #42, 2026-07-17) to shrink that file.
 
-Leaf module: does not import from run_finance.py at module load time (would
-be circular, since run_finance.py imports these functions back — and
-sas_review.py accesses several via `import run_finance as rf; rf.X`).
-write_extract_archive() uses a deferred import for _source_confidence_tags
-(stayed in run_finance.py's core scoring pipeline), safe because it only
-runs once run_finance.py has finished importing this module.
+Leaf module: does not import from run_finance.py (sas_review.py accesses
+several of these via `import run_finance as rf; rf.X`, which still works —
+see run_finance.py's re-export block). write_extract_archive()'s
+_source_confidence_tags comes from scoring_utils.py, a shared leaf module —
+not a deferred `from run_finance import ...` inside the function body (the
+original approach here, before PR #43 review feedback pointed out it
+silently assumed run_finance.py is registered in sys.modules as
+"run_finance", which is false when it's run directly as the entrypoint, as
+launchd does — Python registers it as "__main__" instead).
 """
 import logging
 import os
@@ -24,6 +27,7 @@ import httpx
 
 from telegram_utils import call_telegram
 from budget_trackers import TAVILY_DAILY_LIMIT
+from scoring_utils import _source_confidence_tags
 
 _HOME = os.path.expanduser("~")
 _IN_CONTAINER = os.path.exists("/opt/data")
@@ -155,10 +159,6 @@ def write_extract_archive(
     Never mined by MemPalace. Preserves original intelligence for audit/mid-term review.
     Cleaning: lines < 60 chars stripped (nav/ads/links). Fail-open.
     """
-    # Deferred import: _source_confidence_tags stayed in run_finance.py's core
-    # scoring pipeline (issue #42 split); module-level import here would be
-    # circular since run_finance.py imports write_extract_archive from this module.
-    from run_finance import _source_confidence_tags
     if not extract_results and not filtered:
         return
     try:

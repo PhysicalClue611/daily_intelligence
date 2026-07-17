@@ -6,13 +6,14 @@ run_finance.py (issue #42, 2026-07-17) to shrink that file: Sonar macro
 brief, Polymarket, Adanos X/Twitter sentiment, Reddit sentiment (Apify),
 FRED liquidity snapshot, Finnhub news, Brave News.
 
-Leaf module: does not import from run_finance.py at module load time (would
-create a circular import, since run_finance.py imports these functions back).
-The one exception — fetch_brave_news()'s dedup helpers
-(_title_tokens_for_dedup / _token_jaccard / _TITLE_DEDUP_THRESHOLD_NO_KEYWORD,
-which stayed in run_finance.py as part of the core scoring pipeline) — uses a
-deferred import inside the function body, safe because it only runs once
-run_finance.py has finished importing this module.
+Leaf module: does not import from run_finance.py. fetch_brave_news()'s dedup
+helpers (_title_tokens_for_dedup / _token_jaccard /
+_TITLE_DEDUP_THRESHOLD_NO_KEYWORD) come from scoring_utils.py, a shared leaf
+module — not a deferred `from run_finance import ...` inside the function
+body (the original approach here, before PR #43 review feedback pointed out
+it silently assumed run_finance.py is registered in sys.modules as
+"run_finance", which is false when it's run directly as the entrypoint, as
+launchd does — Python registers it as "__main__" instead).
 """
 import json
 import logging
@@ -27,6 +28,9 @@ import httpx
 from budget_trackers import (
     adanos_remaining, apify_remaining, brave_remaining,
     save_brave_budget, BRAVE_MONTHLY_LIMIT,
+)
+from scoring_utils import (
+    _title_tokens_for_dedup, _token_jaccard, _TITLE_DEDUP_THRESHOLD_NO_KEYWORD,
 )
 
 _PROJ_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
@@ -514,12 +518,6 @@ def fetch_brave_news(tickers: list[str], geo_topics: list[str], budget: dict,
     its free tier in 2026 and bills a card once the $5 prepaid credit runs out —
     fail-closed on budget exhaustion, never calls past the cap. Fail-open otherwise.
     """
-    # Deferred import: _title_tokens_for_dedup/_token_jaccard/_TITLE_DEDUP_THRESHOLD_NO_KEYWORD
-    # stayed in run_finance.py's core scoring pipeline (issue #42 split). A
-    # module-level import here would be circular (run_finance.py imports
-    # fetch_brave_news from this module); deferring until call time is safe
-    # because run_finance.py has always finished importing this module by then.
-    from run_finance import _title_tokens_for_dedup, _token_jaccard, _TITLE_DEDUP_THRESHOLD_NO_KEYWORD
     if not tickers or not BRAVE_API_KEY:
         return ""
     # Reserve a slot for the geo-topics query up front — slicing tickers to

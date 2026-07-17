@@ -43,7 +43,6 @@ import json
 import logging
 import math
 import re
-import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -70,6 +69,8 @@ from budget_trackers import (
     load_adanos_budget, save_adanos_budget,
     load_apify_budget, save_apify_budget,
     load_brave_budget,
+    TAVILY_DAILY_LIMIT, SERPAPI_MONTHLY_LIMIT, ADANOS_MONTHLY_LIMIT,
+    APIFY_MONTHLY_LIMIT, BRAVE_MONTHLY_LIMIT,
 )
 from intel_sources import (
     _sonar_macro_brief, _polymarket_brief, _adanos_x_sentiment,
@@ -85,6 +86,23 @@ from report_writers import (
 )
 from calibration import (
     write_sas_candidate_log, _load_recent_calibration_notes, evaluate_am_calibration,
+)
+# Shared leaf modules (PR #43 review follow-up, 2026-07-17): call_llm and the
+# title-dedup/source-confidence heuristics used to live here and be reached
+# from intel_sources.py/report_writers.py/calibration.py via a deferred
+# `from run_finance import ...` inside the consuming function. That silently
+# assumed run_finance.py is registered in sys.modules under the name
+# "run_finance" — false when it's run directly as the entrypoint (as launchd
+# does): Python registers it as "__main__", so the deferred import triggered
+# a second, full execution of this module on first call. Moving these into
+# true leaf modules (imported by both run_finance.py and the modules that
+# need them) removes the assumption entirely.
+from llm_client import call_llm
+from scoring_utils import (
+    _title_tokens_for_dedup, _title_keyword_hits, _token_jaccard,
+    _TITLE_DEDUP_THRESHOLD, _TITLE_DEDUP_THRESHOLD_NO_KEYWORD,
+    _TITLE_DEDUP_STRICT_NO_DATE_THRESHOLD, _TITLE_DEDUP_WINDOW_HOURS,
+    _DEDUP_STOPWORDS, _source_confidence_tags,
 )
 
 logging.basicConfig(
@@ -106,9 +124,6 @@ OBSIDIAN    = Path(os.getenv("OBSIDIAN_PATH", _OBSIDIAN_ROOT))
 # Project-local paths (self-contained within ~/Daily_Intelligence/)
 _PROJ_DIR        = Path(os.path.dirname(os.path.abspath(__file__))).parent
 WATCHLIST_PATH   = OBSIDIAN / "Hermes/Daily Intelligence/watchlist.md"
-REPORTS_DIR      = OBSIDIAN / "Hermes/Daily Intelligence/Daily Reports"
-BUDGET_PATH      = _PROJ_DIR / "finance_tavily_budget.json"
-ARCHIVE_DIR      = _PROJ_DIR / "archives"  # Extract full-text archive (outside Obsidian, never mined)
 LOCK_FILE        = _PROJ_DIR / "run_finance.lock"  # Prevents concurrent duplicate runs
 
 TAVILY_API_KEY      = os.getenv("TAVILY_API_KEY", "")
@@ -125,19 +140,10 @@ SONAR_MODEL         = "perplexity/sonar"             # Macro brief (real-time se
 EXA_API_KEY         = os.getenv("EXA_API_KEY", "")
 EXA_BASE_URL        = "https://api.exa.ai/chat/completions"
 
-TAVILY_DAILY_LIMIT    = 20
 SERPAPI_API_KEY       = os.getenv("SERPAPI_API_KEY", "")
-SERPAPI_MONTHLY_LIMIT = 250
-SERPAPI_BUDGET_PATH   = _PROJ_DIR / "finance_serpapi_budget.json"
-FINNHUB_API_KEY       = os.getenv("FINNHUB_API_KEY", "")
-FINNHUB_BASE          = "https://finnhub.io/api/v1"
 
 # Social sentiment sources (issue C4): Polymarket (free, no auth) + Adanos X/Twitter (free tier, keyed)
-POLYMARKET_BASE        = "https://gamma-api.polymarket.com"
 ADANOS_API_KEY         = os.getenv("ADANOS_API_KEY", "")
-ADANOS_BASE            = "https://api.adanos.org"
-ADANOS_MONTHLY_LIMIT   = 200  # free tier is 250/mo; leave headroom for TG follow-ups/manual reruns
-ADANOS_BUDGET_PATH     = _PROJ_DIR / "finance_adanos_budget.json"
 
 # Reddit sentiment via Apify's "Stock Sentiment Intelligence" actor (issue #17 step 3):
 # Reddit's own API is free only for non-commercial use with a 100 req/min ceiling; this
@@ -147,29 +153,21 @@ ADANOS_BUDGET_PATH     = _PROJ_DIR / "finance_adanos_budget.json"
 # APIFY_MONTHLY_LIMIT runs/month stays far under the $5 one-time free credit
 # (60 runs × ~4 tickers ≈ $0.25/mo at these rates).
 APIFY_API_TOKEN      = os.getenv("APIFY_API_TOKEN", "")
-APIFY_BASE           = "https://api.apify.com/v2"
-APIFY_REDDIT_ACTOR   = "benthepythondev~stock-sentiment-intelligence"
-APIFY_MONTHLY_LIMIT  = 60  # runs/month, not results — see cost math above
-APIFY_BUDGET_PATH    = _PROJ_DIR / "finance_apify_budget.json"
-
-# Liquidity plumbing snapshot (Hermes/Daily Intelligence/市场见顶预警指标.md, 2026-07-02):
-# FRED is the authoritative free source for these Fed data series — precise
-# and structured, unlike asking an LLM search engine for exact numbers (see
-# issue #24, Sonar's unreliability on precise figures). No SRF usage series
-# exists on FRED; that indicator stays manual/qualitative per the doc.
-FRED_API_KEY  = os.getenv("FRED_API_KEY", "")
-FRED_BASE     = "https://api.stlouisfed.org/fred/series/observations"
 
 # Brave News API (issue #14): independent Western search engine, not a Google
 # proxy like Serper/SerpApi. No longer free as of 2026 — $5/mo prepaid credit
 # then metered billing on file, so the monthly cap here is a hard stop, not a
 # soft warning, to avoid unattended overage charges.
 BRAVE_API_KEY       = os.getenv("BRAVE_API_KEY", "")
-BRAVE_BASE          = "https://api.search.brave.com/res/v1/news/search"
-BRAVE_MONTHLY_LIMIT = 800  # conservative under the ~1000-query $5 credit estimate
-BRAVE_BUDGET_PATH   = _PROJ_DIR / "finance_brave_budget.json"
 
 ET = ZoneInfo("America/New_York")
+
+# Note: TAVILY_DAILY_LIMIT / SERPAPI_MONTHLY_LIMIT / ADANOS_MONTHLY_LIMIT /
+# APIFY_MONTHLY_LIMIT / BRAVE_MONTHLY_LIMIT are re-exported from
+# budget_trackers.py in the import block above (not re-defined here) so this
+# file's own display code (build_status_message, log lines) can never drift
+# from what's actually enforced — see PR #43 review, a prior local copy of
+# these five constants risked exactly that silent desync.
 
 # ── Watchlist parser ─────────────────────────────────────────────────────────
 
@@ -379,71 +377,6 @@ _TRUSTED_DOMAINS = [
 # so a small scoring penalty lets the plain-article version of the same story
 # naturally outrank the video/gallery version instead of needing a hard exclude.
 _VIDEO_PATH_RE = re.compile(r"/(?:video|watch|gallery|live-blog)/", re.IGNORECASE)
-
-# Cross-source title dedup (issue #14): exact-URL dedup alone rarely catches
-# wire-service syndication (same AP/Reuters story picked up by many outlets
-# under different URLs, often paraphrased headlines).
-#
-# Character-level similarity (difflib.SequenceMatcher) was tried first and
-# empirically FAILED on real data: real headline pairs describing the same
-# ASML earnings-guidance story ("raises 2026 forecast" vs "hikes sales
-# forecast") scored 0.33-0.73 — well under any safe threshold — because
-# outlets paraphrase verbs and reorder words. Token-overlap (Jaccard on
-# significant words) tested far better on the same real pairs and is what's
-# implemented below. Scoping comparisons to results that share an anomaly
-# ticker/geo keyword (rather than comparing all pairs blindly) lets a lower,
-# more forgiving threshold work without merging unrelated stories that
-# happen to share generic financial vocabulary. Tuned against the
-# 2026-07-15 AM archive where 9 of 10 Tavily Extract slots went to just 2
-# real events — see issue #14 discussion for the worked example.
-_TITLE_DEDUP_THRESHOLD            = 0.30  # when titles share an anomaly/geo keyword
-_TITLE_DEDUP_THRESHOLD_NO_KEYWORD = 0.45  # neither title hit a tracked keyword — stricter bar
-_TITLE_DEDUP_STRICT_NO_DATE_THRESHOLD = 0.6  # neither side has a parseable date — require near-exact wording
-_TITLE_DEDUP_WINDOW_HOURS = 24
-_DEDUP_STOPWORDS = {
-    "a", "an", "the", "on", "in", "at", "to", "for", "of", "as", "is", "are",
-    "with", "after", "its", "it", "and", "or", "this", "that", "from", "by", "new",
-}
-# Source-suffix stripper: only strips a SHORT trailing "- Reuters" / "| CNBC.com"
-# style tag. Bounded to <=30 chars after the dash so it can't (as an earlier
-# version did) greedily eat the substantive back half of a headline — e.g.
-# "Iran tension escalates - Hormuz strait closure imminent" must NOT collapse
-# to the same tokens as "... - Israel considers preemptive strike" (verified
-# both reduced to an identical frozenset before this bound was added).
-_TITLE_SUFFIX_RE = re.compile(r"\s*[-|–—]\s*[a-z0-9][a-z0-9 .]{0,29}$")
-
-
-def _title_tokens_for_dedup(title: str) -> frozenset[str]:
-    """Lowercase word tokens minus stopwords/short tokens, source suffix stripped
-    (' - Reuters' / ' | CNBC') — used for Jaccard overlap, not character matching."""
-    t = title.lower().strip()
-    t = _TITLE_SUFFIX_RE.sub("", t)
-    words = re.findall(r"[a-z0-9]+", t)
-    return frozenset(w for w in words if len(w) > 1 and w not in _DEDUP_STOPWORDS)
-
-
-def _title_keyword_hits(title: str, keywords: list[str]) -> frozenset[str]:
-    """Which tracked anomaly-ticker/geo keywords appear in this title — used to
-    scope title-dedup comparisons so unrelated stories sharing generic financial
-    words never get compared at the forgiving in-topic threshold.
-
-    Word-boundary matching, not raw substring: a plain `k in t` check let short
-    keywords like "us" (split from the geo-topic label "US-Iran") match inside
-    unrelated words ("focus", "trust"), which fed false keyword hits into the
-    dedup gate (verified: 'Focus shifts to Fed rate decision' and 'Consumer
-    trust index falls' both registered kw_hits={'us'})."""
-    t = title.lower()
-    return frozenset(
-        k for k in keywords
-        if k and re.search(r"\b" + re.escape(k) + r"\b", t)
-    )
-
-
-def _token_jaccard(a: frozenset[str], b: frozenset[str]) -> float:
-    if not a or not b:
-        return 0.0
-    union = a | b
-    return len(a & b) / len(union) if union else 0.0
 
 
 def score_and_filter(
@@ -691,97 +624,6 @@ def format_tavily_results(results: list[dict]) -> str:
             lines.append(f"    {content}")
     return "\n".join(lines)
 
-
-_TIMESTAMP_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
-_PHRASE_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b")
-_STRONG_TOKEN_RE = re.compile(r"\b\d{1,3}(?:\.\d+)?%|\$\d[\d,\.]*|\b\d{4}\b")
-_WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
-
-
-def _extract_key_phrases(text: str) -> set[str]:
-    """Cheap rule-based fact fingerprint: proper-noun phrases + weekday/date/number
-    tokens. Used only for rule-based cross-source corroboration (issue #19) —
-    no extra API/LLM cost. Expect false negatives on paraphrased claims; a miss
-    here means 'no rule-based match found', not proof a claim is uncorroborated."""
-    if not text:
-        return set()
-    phrases = set(_PHRASE_RE.findall(text))
-    tokens = set(m.lower() for m in _STRONG_TOKEN_RE.findall(text))
-    words = set(w.lower() for w in re.findall(r"[A-Za-z]+", text))
-    tokens |= (words & _WEEKDAYS)
-    return phrases | tokens
-
-
-def _detect_low_structure(text: str) -> bool:
-    """Heuristic for video-hub / caption-listing pages (issue #19): they pack many
-    bare timestamp prefixes ('01:32 ...') with few real sentences, unlike article
-    prose. Such pages often surface an isolated caption with no reliable date of
-    its own, which an LLM can otherwise mistake for a fresh, dated claim."""
-    if not text or len(text) < 40:
-        return False
-    ts_count = len(_TIMESTAMP_RE.findall(text))
-    sentence_count = text.count(". ") + text.count("。")
-    return ts_count >= 3 and ts_count > sentence_count
-
-
-def _lookup_published_date(url: str, candidates: list[dict]) -> tuple[str, float | None]:
-    """Resolve a published date for `url` from the pre-extract search result pool —
-    Tavily's /extract response carries no date field, only /search results do."""
-    for r in candidates:
-        if r.get("url") == url:
-            pub = r.get("published_date", "")
-            if not pub:
-                return "", None
-            try:
-                from dateutil import parser as _dp
-                age_h = (datetime.now(ET) - _dp.parse(pub).astimezone(ET)).total_seconds() / 3600
-                return pub, age_h
-            except Exception:
-                return pub, None
-    return "", None
-
-
-def _compute_corroboration(url: str, text: str, candidates: list[dict]) -> int:
-    """Rule-based cross-source check (issue #19): count distinct OTHER domains in the
-    broader candidate pool that share at least one key phrase with this result.
-    Zero cost (no extra API/LLM call), but also a rough heuristic — 0 means 'no
-    overlap found by this rule', not a confirmed single-source claim."""
-    own_domain = url.split("/")[2] if "//" in url else url
-    own_phrases = _extract_key_phrases(text)
-    if not own_phrases:
-        return 0
-    matched_domains: set[str] = set()
-    for r in candidates:
-        curl = r.get("url", "")
-        cdomain = curl.split("/")[2] if "//" in curl else curl
-        if not cdomain or cdomain == own_domain:
-            continue
-        ctext = (r.get("title", "") + " " + (r.get("content") or ""))
-        if own_phrases & _extract_key_phrases(ctext):
-            matched_domains.add(cdomain)
-    return len(matched_domains)
-
-
-def _source_confidence_tags(url: str, full_text: str, candidates: list[dict]) -> str:
-    """Build the '[信源类型/发布时间/交叉印证]' tag line for one Extract source.
-    Shared by format_extract_results() (LLM-facing) and write_extract_archive()
-    (audit trail) so both reflect the same confidence signals. See issue #19."""
-    pub_date, age_h = _lookup_published_date(url, candidates)
-    tags = []
-    if _detect_low_structure(full_text):
-        tags.append("信源类型: 视频/聚合页疑似caption堆叠-无独立时间戳，谨慎对待")
-    if not pub_date:
-        tags.append("发布时间: 未知")
-    elif age_h is not None and age_h > 72:
-        tags.append(f"发布时间: {pub_date}（约{age_h / 24:.0f}天前，警惕过时/已被后续事件覆盖）")
-    else:
-        tags.append(f"发布时间: {pub_date}")
-    corroboration = _compute_corroboration(url, full_text, candidates)
-    tags.append(
-        f"交叉印证: {corroboration}个独立域名有重叠信息佐证" if corroboration > 0
-        else "交叉印证: 未发现其他信源佐证（单一信源）"
-    )
-    return " | ".join(tags)
 
 
 def format_extract_results(results: list[dict], candidates: list[dict] | None = None) -> str:
@@ -1164,137 +1006,6 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 """
 
 
-def call_llm(prompt: str, max_retries: int = 2, model: str = LLM_MODEL,
-             system_prompt: str = SYSTEM_PROMPT) -> dict:
-    """Call DeepSeek via OpenRouter, return parsed JSON dict. Retries on network errors.
-    Pass 2 (deepseek-v4-pro) uses thinking:enabled — required by Together/Fireworks to emit content.
-    Pass 1 (deepseek-v4-flash) sends NO thinking param — thinking:disabled breaks StreamLake fallback."""
-    is_pass2 = (model == LLM_MODEL_PASS2)
-    thinking_cfg = {"type": "enabled", "budget_tokens": 3000} if is_pass2 else None
-    max_tokens = 8000 if is_pass2 else 4000
-    last_error = None
-    for attempt in range(max_retries + 1):
-        try:
-            if attempt > 0:
-                wait = 2 ** attempt
-                logger.info(f"LLM retry {attempt}/{max_retries} after {wait}s...")
-                time.sleep(wait)
-            resp = httpx.post(
-                OR_BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    **OR_ATTRIBUTION_HEADERS,
-                },
-                json={
-                    "model": model,
-                    "provider": DS_OR_PROVIDERS,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": max_tokens,
-                    "temperature": 0.2,
-                    **({"thinking": thinking_cfg} if thinking_cfg else {}),
-                },
-                timeout=180,
-            )
-            resp.raise_for_status()
-            content = ""
-            try:
-                data = resp.json()
-            except json.JSONDecodeError as e:
-                # HTTP body itself is not valid JSON (truncated/error page) — retryable
-                last_error = e
-                logger.warning(f"LLM attempt {attempt+1}: malformed HTTP JSON body: {e}")
-                continue
-            usage = data.get("usage", {})
-            logger.info(f"LLM tokens: prompt={usage.get('prompt_tokens')} "
-                        f"completion={usage.get('completion_tokens')} "
-                        f"provider={data.get('provider', 'n/a')}")
-
-            msg = data["choices"][0]["message"]
-            content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
-            json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-            json_str = json_match.group(1) if json_match else content.strip()
-            json_str = re.sub(r'^[^{]*', '', json_str)
-            json_str = re.sub(r'[^}]*$', '', json_str)
-            result = json.loads(json_str)
-            result["_llm_meta"] = {
-                "model": model,
-                "provider": data.get("provider", "n/a"),
-                "attempts": attempt + 1,
-                "fallback": False,
-            }
-            return result
-        except json.JSONDecodeError as e:
-            # Model output wasn't parseable JSON (escaping error or truncation) — retryable
-            last_error = e
-            logger.warning(f"LLM attempt {attempt+1}: returned invalid JSON: {e}\nContent: {content[:500]}")
-            continue
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code >= 500 or e.response.status_code == 429:
-                last_error = e
-                logger.warning(f"LLM attempt {attempt+1}: HTTP {e.response.status_code}")
-            else:
-                logger.error(f"LLM HTTP {e.response.status_code}: {e}")
-                return {}
-        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError,
-                httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-            last_error = e
-            logger.warning(f"LLM attempt {attempt+1}: {e}")
-        except Exception as e:
-            logger.error(f"LLM call failed: {e}")
-            return {}
-
-    logger.error(f"LLM exhausted {max_retries+1} attempts, last error: {last_error}")
-
-    # OR flex fallback (gemini via OpenRouter, service_tier=flex)
-    fallback_model = LLM_FALLBACK_PRO if is_pass2 else LLM_FALLBACK_FLASH
-    logger.warning(f"OR primary unavailable, trying OR flex fallback: {fallback_model}")
-    try:
-        resp = httpx.post(
-            OR_BASE_URL,
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                     "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
-            json={
-                "model": fallback_model,
-                "service_tier": "flex",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.2,
-            },
-            timeout=180,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        usage = data.get("usage", {})
-        logger.info(f"OR flex tokens: prompt={usage.get('prompt_tokens')} "
-                    f"completion={usage.get('completion_tokens')} "
-                    f"provider={data.get('provider', 'n/a')}")
-        msg = data["choices"][0]["message"]
-        content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
-        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-        json_str = json_match.group(1) if json_match else content.strip()
-        json_str = re.sub(r'^[^{]*', '', json_str)
-        json_str = re.sub(r'[^}]*$', '', json_str)
-        result = json.loads(json_str)
-        logger.info(f"OR flex fallback succeeded: {fallback_model}")
-        result["_llm_meta"] = {
-            "model": fallback_model,
-            "provider": data.get("provider", "n/a"),
-            "fallback": True,
-            "primary_attempts": max_retries + 1,
-        }
-        return result
-    except json.JSONDecodeError as e:
-        logger.error(f"OR flex fallback returned invalid JSON: {e}")
-    except Exception as e:
-        logger.error(f"OR flex fallback failed: {e}")
-    return {}
 
 
 
@@ -1711,7 +1422,7 @@ def _main_body():
         calibration_notes=calibration_notes,
         verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P1 if run_slot == "am" else "",
     )
-    result = call_llm(prompt)
+    result = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
     llm_meta_p1 = result.get("_llm_meta", {})
 
     # 8. Build search job list — all basic (Extract provides the depth)
