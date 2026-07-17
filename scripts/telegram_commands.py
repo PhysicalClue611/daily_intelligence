@@ -82,6 +82,38 @@ FINNHUB_API_KEY       = os.getenv("FINNHUB_API_KEY", "")
 FINNHUB_BASE          = "https://finnhub.io/api/v1"
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("%s is invalid; using default %.2f", name, default)
+        return default
+
+
+# Parallel.ai cost controls (issue #7):
+# Product rule: Parallel is higher information density (raw extract into Step 4)
+# and only slightly more expensive than Sonar. Always prefer Parallel while the
+# service accepts requests. Local estimated spend is observability only by default.
+# Optional disaster brake: set PARALLEL_MONTHLY_BUDGET_USD > 0 to hard-stop.
+# First cost lever when dashboard credit < $5: PARALLEL_P1_ENABLED=0 (skip the
+# optional 3rd gap-filling query; keep main Parallel path).
+# Sonar/Exa is fallback for real service refusal (billing/auth) or technical
+# failure — not for "local estimate exceeded". Billing refusal also sends a
+# separate TG notice (rate-limited).
+PARALLEL_BUDGET_PATH = _PROJ_DIR / "finance_parallel_budget.json"
+PARALLEL_MONTHLY_BUDGET_USD = _env_float("PARALLEL_MONTHLY_BUDGET_USD", 0.0)  # 0 = no hard cap
+PARALLEL_P1_ENABLED = os.getenv("PARALLEL_P1_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+PARALLEL_SEARCH_COST_USD = 0.005
+PARALLEL_EXTRACT_COST_USD = 0.001
+PARALLEL_EXTRACT_URL_LIMIT = 3
+PARALLEL_RESEARCH_ESTIMATE_USD = PARALLEL_SEARCH_COST_USD + PARALLEL_EXTRACT_COST_USD * PARALLEL_EXTRACT_URL_LIMIT
+PARALLEL_SERVICE_NOTICE_COOLDOWN_SEC = 6 * 3600
+_BILLING_HINTS = (
+    "credit", "billing", "payment", "balance", "quota", "insufficient",
+    "funds", "top up", "top-up", "topup", "payment required", "out of credit",
+    "no credits", "exceeded", "past due",
+)
+
 
 # ── Telegram API ──────────────────────────────────────────────────────────────
 
@@ -114,6 +146,131 @@ def load_offset() -> int:
 
 def save_offset(offset: int):
     OFFSET_FILE.write_text(json.dumps({"offset": offset}))
+
+
+# ── Parallel.ai spend observability (+ optional hard cap) ────────────────────
+
+def _parallel_month() -> str:
+    return datetime.now(ET).strftime("%Y-%m")
+
+
+def load_parallel_budget() -> dict:
+    ym = _parallel_month()
+    if PARALLEL_BUDGET_PATH.exists():
+        try:
+            data = json.loads(PARALLEL_BUDGET_PATH.read_text())
+            if data.get("year_month") == ym:
+                data.setdefault("used_usd_estimate", 0.0)
+                data.setdefault("search_calls", 0)
+                data.setdefault("extract_urls", 0)
+                data.setdefault("last_service_notice_at", "")
+                return data
+        except Exception:
+            logger.warning("Parallel budget file unreadable; resetting monthly counter")
+    return {
+        "year_month": ym,
+        "used_usd_estimate": 0.0,
+        "search_calls": 0,
+        "extract_urls": 0,
+        "last_service_notice_at": "",
+    }
+
+
+def save_parallel_budget(budget: dict) -> None:
+    tmp_path = PARALLEL_BUDGET_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(budget))
+    os.replace(tmp_path, PARALLEL_BUDGET_PATH)
+
+
+def parallel_remaining_usd(budget: dict) -> float:
+    """Remaining room under optional hard cap. Cap<=0 means unlimited (inf)."""
+    if PARALLEL_MONTHLY_BUDGET_USD <= 0:
+        return float("inf")
+    return max(0.0, PARALLEL_MONTHLY_BUDGET_USD - float(budget.get("used_usd_estimate", 0.0)))
+
+
+def _parallel_hard_cap_blocks(budget: dict, estimated_usd: float) -> bool:
+    """True only when optional hard cap is enabled and remaining is below estimate."""
+    if PARALLEL_MONTHLY_BUDGET_USD <= 0:
+        return False
+    return parallel_remaining_usd(budget) + 1e-9 < estimated_usd
+
+
+def _record_parallel_spend(budget: dict, *, search_calls: int = 0, extract_urls: int = 0) -> None:
+    """Observability counter (estimated). Not a billing source of truth."""
+    cost = (search_calls * PARALLEL_SEARCH_COST_USD) + (extract_urls * PARALLEL_EXTRACT_COST_USD)
+    budget["search_calls"] = int(budget.get("search_calls", 0)) + search_calls
+    budget["extract_urls"] = int(budget.get("extract_urls", 0)) + extract_urls
+    budget["used_usd_estimate"] = round(float(budget.get("used_usd_estimate", 0.0)) + cost, 4)
+    save_parallel_budget(budget)
+
+
+def _classify_parallel_error(exc: BaseException) -> tuple[str, str]:
+    """Return (failure_kind, detail). failure_kind is 'billing' or 'error'."""
+    detail = str(exc)[:500]
+    try:
+        from parallel import APIStatusError, AuthenticationError, PermissionDeniedError
+    except Exception:
+        APIStatusError = AuthenticationError = PermissionDeniedError = ()  # type: ignore
+
+    if AuthenticationError and isinstance(exc, AuthenticationError):
+        return "billing", detail
+    if PermissionDeniedError and isinstance(exc, PermissionDeniedError):
+        return "billing", detail
+    if APIStatusError and isinstance(exc, APIStatusError):
+        code = getattr(exc, "status_code", None)
+        if code in (401, 402, 403):
+            return "billing", detail
+        body = getattr(exc, "body", None)
+        text = f"{detail} {body}".lower()
+        if any(h in text for h in _BILLING_HINTS):
+            return "billing", detail
+        return "error", detail
+
+    low = detail.lower()
+    if any(h in low for h in _BILLING_HINTS):
+        return "billing", detail
+    return "error", detail
+
+
+def _notify_parallel_degraded(kind: str, detail: str = "") -> None:
+    """Separate TG notice (not mixed into the answer). Rate-limited per cooldown."""
+    budget = load_parallel_budget()
+    last = (budget.get("last_service_notice_at") or "").strip()
+    now = datetime.now(ET)
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=ET)
+            if (now - last_dt).total_seconds() < PARALLEL_SERVICE_NOTICE_COOLDOWN_SEC:
+                logger.info("Parallel service notice suppressed (cooldown, kind=%s)", kind)
+                return
+        except Exception:
+            pass
+
+    if kind == "billing":
+        msg = (
+            "[!] Parallel.ai 拒绝服务（余额不足或鉴权失败），"
+            "本次追问已降级到 Sonar。请检查 Parallel dashboard credit / API key。"
+        )
+    elif kind == "hard_cap":
+        msg = (
+            f"[!] Parallel 本地硬帽已触发"
+            f"（PARALLEL_MONTHLY_BUDGET_USD=${PARALLEL_MONTHLY_BUDGET_USD:.2f}），"
+            "本次追问已降级到 Sonar。硬帽为可选灾难刹车，默认关闭。"
+        )
+    else:
+        msg = f"[!] Parallel 不可用（{kind}），本次追问已降级。"
+    if detail:
+        msg += f"\n详情：{detail[:300]}"
+
+    try:
+        reply(msg)
+        budget["last_service_notice_at"] = now.isoformat()
+        save_parallel_budget(budget)
+    except Exception as e:
+        logger.warning("Failed to send Parallel service notice: %s", e)
 
 
 # ── Watchlist editor ──────────────────────────────────────────────────────────
@@ -237,6 +394,17 @@ def _build_status() -> str:
     except Exception:
         pass
 
+    parallel_used = 0.0
+    parallel_search_calls = 0
+    parallel_extract_urls = 0
+    try:
+        pb = load_parallel_budget()
+        parallel_used = float(pb.get("used_usd_estimate", 0.0))
+        parallel_search_calls = int(pb.get("search_calls", 0))
+        parallel_extract_urls = int(pb.get("extract_urls", 0))
+    except Exception:
+        pass
+
     today_et = datetime.now(ET).strftime("%Y-%m-%d")
     monthly_files = sorted(REPORTS_DIR.glob("Daily_Intel_report_*.md"), reverse=True)
     last_am, last_pm = "无", "无"
@@ -280,13 +448,21 @@ def _build_status() -> str:
         f"<b>最近AM报告：</b>{last_am}\n"
         f"<b>最近PM报告：</b>{last_pm}\n"
         f"<b>Tavily今日用量：</b>{budget_used}/{TAVILY_DAILY_LIMIT}\n"
-        f"<b>SerpApi本月用量：</b>{serpapi_used}/{SERPAPI_MONTHLY_LIMIT}\n\n"
+        f"<b>SerpApi本月用量：</b>{serpapi_used}/{SERPAPI_MONTHLY_LIMIT}\n"
+        f"<b>Parallel本月估算：</b>${parallel_used:.4f}"
+        + (
+            f" / 硬帽 ${PARALLEL_MONTHLY_BUDGET_USD:.2f}"
+            if PARALLEL_MONTHLY_BUDGET_USD > 0
+            else "（无硬帽，仅观测）"
+        )
+        + f"（search {parallel_search_calls}, extract {parallel_extract_urls}, "
+        f"P1 {'开' if PARALLEL_P1_ENABLED else '关'}）\n\n"
         f"<b>定时任务</b>\n"
         f"报告任务（5:30/20:59 PT）：{html.escape(report_task)}\n"
         f"Telegram bot（常驻）：{html.escape(tg_task)}\n\n"
         f"<b>推理流水线</b>\n"
         f"预处理+指令分类：{html.escape(LLM_MODEL)}\n"
-        f"搜索+事件合成：{html.escape(SEARCH_MODEL)}\n"
+        f"搜索+事件合成：Parallel.ai主路径，{html.escape(SEARCH_MODEL)} fallback\n"
         f"个人化推理：{html.escape(REASONING_MODEL)}（Azure）"
     )
 
@@ -549,7 +725,7 @@ def _followup_system() -> str:
     fw = _load_framework()
     base = (
         "你是 Daily Intelligence 财经情报助手。\n"
-        "实际数据来源：yfinance 实时价格、NYT/BBC/FT RSS 新闻、Perplexity 实时联网搜索。\n"
+        "实际数据来源：yfinance 实时价格、NYT/BBC/FT RSS 新闻、Parallel.ai 全文检索（Sonar/Exa fallback）。\n"
         "严禁声称拥有未实现的能力（Bloomberg实时、SEC文件、期权监测等）。\n"
         "回答规则：\n"
         "1. 若问题包含具体事件前提（如【XX在某日大涨】），先用联网搜索核实该前提是否属实，再回答。\n"
@@ -585,12 +761,28 @@ def _agg_score(url: str) -> int:
     return 0 if any(d in (url or "") for d in _AGGREGATOR_DOMAINS) else 1
 
 
-def _parallel_research(queries: list[str]) -> str:
-    """Step 3 primary: Parallel.ai search + extract — raw full-text articles, no pre-summary.
-    Accepts multiple queries for multi-angle coverage (same request, $0.005 total).
-    Extract: $0.001/URL (3 URLs). Fail-open."""
+def _parallel_research(queries: list[str]) -> tuple[str, str | None, str]:
+    """Step 3 primary: Parallel.ai search + extract — raw full-text, no pre-summary.
+
+    Returns (brief, failure_kind, detail):
+      failure_kind is None on success (brief may still be thin),
+      or one of: no_key | hard_cap | billing | error | empty.
+
+    Product rule: do not refuse Parallel because of local spend estimates.
+    Optional hard cap (PARALLEL_MONTHLY_BUDGET_USD > 0) is a disaster brake only.
+    """
     if not PARALLEL_API_KEY or not queries:
-        return ""
+        return "", "no_key", "missing PARALLEL_API_KEY or empty queries"
+
+    budget = load_parallel_budget()
+    if _parallel_hard_cap_blocks(budget, PARALLEL_RESEARCH_ESTIMATE_USD):
+        detail = (
+            f"used_est=${float(budget.get('used_usd_estimate', 0.0)):.4f} "
+            f"cap=${PARALLEL_MONTHLY_BUDGET_USD:.2f}"
+        )
+        logger.warning("Parallel optional hard cap blocks call (%s)", detail)
+        return "", "hard_cap", detail
+
     try:
         from parallel import Parallel
         client = Parallel(api_key=PARALLEL_API_KEY)
@@ -602,9 +794,10 @@ def _parallel_research(queries: list[str]) -> str:
             search_queries=queries,
             objective=primary_query,
         )
+        _record_parallel_spend(budget, search_calls=1)
         results = search_resp.results or []
         if not results:
-            return ""
+            return "", "empty", "search returned no results"
 
         # Deduplicate by title similarity before selecting extract URLs
         seen_titles: set[str] = set()
@@ -619,50 +812,67 @@ def _parallel_research(queries: list[str]) -> str:
         # P2: Prioritise aggregator pages for extract (higher information density)
         deduped.sort(key=lambda r: _agg_score(r.url or ""))
 
-        # Extract top 3 URLs for full text
-        urls = [r.url for r in deduped[:3] if r.url]
+        # Extract top N URLs — this is the density advantage over Sonar.
+        urls = [r.url for r in deduped[:PARALLEL_EXTRACT_URL_LIMIT] if r.url]
         query_label = " | ".join(queries)
         lines = [f"[Parallel.ai 情报（搜索词：{query_label}）]"]
 
         if urls:
-            extract_resp = client.extract(
-                urls=urls,
-                objective=primary_query,
-            )
-            seen_paragraphs: set[str] = set()
-            for r in (extract_resp.results or []):
-                raw = r.full_content or " ".join(r.excerpts or [])
-                if not raw:
-                    continue
-                # Strip boilerplate: short lines, nav text, markdown links
-                paras = [p.strip() for p in raw.split("\n") if len(p.strip()) > 60
-                         and not p.strip().startswith(("[", "!", "*", "#", "http"))]
-                # Dedup paragraphs across articles
-                unique_paras = []
-                for p in paras:
-                    key = p[:60].lower()
-                    if key not in seen_paragraphs:
-                        seen_paragraphs.add(key)
-                        unique_paras.append(p)
-                content = "\n".join(unique_paras)[:4000]
-                if not content:
-                    continue
-                pub = f" ({r.publish_date})" if r.publish_date else ""
-                lines.append(f"\n### {r.title or r.url}{pub}")
-                lines.append(content)
+            # Only trim extract count when optional hard cap is enabled and room is tight.
+            if PARALLEL_MONTHLY_BUDGET_USD > 0:
+                remaining = parallel_remaining_usd(budget)
+                if remaining != float("inf"):
+                    affordable = int((remaining + 1e-9) / PARALLEL_EXTRACT_COST_USD)
+                    urls = urls[:max(0, min(len(urls), affordable))]
+            if not urls:
+                logger.warning("Parallel extract skipped: optional hard cap leaves room for search only")
+            else:
+                extract_resp = client.extract(
+                    urls=urls,
+                    objective=primary_query,
+                )
+                _record_parallel_spend(budget, extract_urls=len(urls))
+                seen_paragraphs: set[str] = set()
+                for r in (extract_resp.results or []):
+                    raw = r.full_content or " ".join(r.excerpts or [])
+                    if not raw:
+                        continue
+                    # Strip boilerplate: short lines, nav text, markdown links
+                    paras = [p.strip() for p in raw.split("\n") if len(p.strip()) > 60
+                             and not p.strip().startswith(("[", "!", "*", "#", "http"))]
+                    # Dedup paragraphs across articles
+                    unique_paras = []
+                    for p in paras:
+                        key = p[:60].lower()
+                        if key not in seen_paragraphs:
+                            seen_paragraphs.add(key)
+                            unique_paras.append(p)
+                    content = "\n".join(unique_paras)[:4000]
+                    if not content:
+                        continue
+                    pub = f" ({r.publish_date})" if r.publish_date else ""
+                    lines.append(f"\n### {r.title or r.url}{pub}")
+                    lines.append(content)
 
         # Remaining deduped results as excerpt summaries (no full extract)
-        for r in deduped[3:6]:
+        for r in deduped[PARALLEL_EXTRACT_URL_LIMIT:PARALLEL_EXTRACT_URL_LIMIT + 3]:
             excerpt = " ".join(r.excerpts or [])[:300]
             if excerpt:
                 lines.append(f"\n- {r.title or r.url}: {excerpt}")
 
         brief = "\n".join(lines)
-        logger.info(f"Parallel research: {len(brief)} chars ({len(urls)} extracts, {len(results)} results, {len(queries)} queries)")
-        return brief
+        # Success if we have more than the header line
+        if len(lines) <= 1:
+            return "", "empty", "no extractable content"
+        logger.info(
+            "Parallel research: %d chars (%d extracts, %d results, %d queries)",
+            len(brief), len(urls), len(results), len(queries),
+        )
+        return brief, None, ""
     except Exception as e:
-        logger.warning(f"Parallel research failed: {e}")
-        return ""
+        kind, detail = _classify_parallel_error(e)
+        logger.warning("Parallel research failed (%s): %s", kind, detail)
+        return "", kind, detail
 
 
 def _detect_research_gap(question_intent: str, queries: list[str], brief: str) -> str | None:
@@ -1050,22 +1260,37 @@ def _llm_followup(question: str, pre: dict) -> str:
     if not search_queries:
         search_queries = [search_query]
     reply(f"情报检索（{len(search_queries)}条查询）...")
-    research_brief = _parallel_research(search_queries)
-    research_source = "Parallel.ai"
+    research_brief, parallel_fail, parallel_detail = _parallel_research(search_queries)
+    research_source = "Parallel.ai" if research_brief else "N/A"
 
-    # P1: Adaptive 3rd query — gap detection (only when Parallel succeeded, max 1 extra query)
-    if research_brief and len(search_queries) < 3:
+    # P1: Adaptive 3rd query — issue #7's first cost lever. Dashboard credit < $5
+    # → set PARALLEL_P1_ENABLED=0; main Parallel path stays on.
+    if PARALLEL_P1_ENABLED and research_brief and len(search_queries) < 3:
         gap_q = _detect_research_gap(question_intent, search_queries, research_brief)
         if gap_q:
             logger.info(f"Gap detected, 3rd query: {gap_q}")
             reply("情报补充（补漏查询）...")
-            extra = _parallel_research([gap_q])
+            extra, extra_fail, extra_detail = _parallel_research([gap_q])
             if extra:
                 research_brief = research_brief + "\n\n" + extra
                 search_queries = search_queries + [gap_q]
+            elif extra_fail in ("billing", "hard_cap"):
+                # Main brief already good; still surface service problem once.
+                _notify_parallel_degraded(extra_fail, extra_detail)
 
     if not research_brief:
-        logger.warning("Parallel research empty, falling back to Sonar")
+        # Billing/hard_cap: explicit TG notice, then Sonar. Technical empty/error:
+        # fail-open to Sonar without a "余额不足" notice.
+        if parallel_fail in ("billing", "hard_cap"):
+            _notify_parallel_degraded(parallel_fail, parallel_detail)
+            logger.warning(
+                "Parallel unavailable (%s); falling back to Sonar", parallel_fail
+            )
+        else:
+            logger.warning(
+                "Parallel research empty (%s); falling back to Sonar",
+                parallel_fail or "unknown",
+            )
         price_context_for_sonar = "; ".join(
             line.strip() for line in price_anchor.splitlines() if line.startswith("  ")
         ) if price_anchor else ""
