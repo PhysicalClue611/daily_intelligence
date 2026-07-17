@@ -250,7 +250,13 @@ def load_budget() -> dict:
 
 
 def save_budget(budget: dict) -> None:
-    BUDGET_PATH.write_text(json.dumps(budget))
+    """Atomic write (temp file + os.replace) — never open(path,'w')/write_text()
+    directly on this file (global CLAUDE.md 破坏性文件写入安全): a crash or kill
+    mid-write would truncate it, and the next load_budget() would then silently
+    reset the daily quota counter this file exists to enforce. See issue #41."""
+    tmp_path = BUDGET_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(budget))
+    os.replace(tmp_path, BUDGET_PATH)
 
 
 def budget_remaining(budget: dict) -> int:
@@ -273,7 +279,11 @@ def load_serpapi_budget() -> dict:
     return {"year_month": ym, "used": 0}
 
 def save_serpapi_budget(budget: dict) -> None:
-    SERPAPI_BUDGET_PATH.write_text(json.dumps(budget))
+    """Atomic write (temp file + os.replace) — see save_budget() docstring; same
+    reasoning applies to this monthly counter. See issue #41."""
+    tmp_path = SERPAPI_BUDGET_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(budget))
+    os.replace(tmp_path, SERPAPI_BUDGET_PATH)
 
 
 # ── Adanos monthly budget ─────────────────────────────────────────────────────
@@ -289,7 +299,11 @@ def load_adanos_budget() -> dict:
     return {"year_month": ym, "used": 0}
 
 def save_adanos_budget(budget: dict) -> None:
-    ADANOS_BUDGET_PATH.write_text(json.dumps(budget))
+    """Atomic write (temp file + os.replace) — see save_budget() docstring; same
+    reasoning applies to this monthly counter. See issue #41."""
+    tmp_path = ADANOS_BUDGET_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(budget))
+    os.replace(tmp_path, ADANOS_BUDGET_PATH)
 
 def adanos_remaining(budget: dict) -> int:
     return max(0, ADANOS_MONTHLY_LIMIT - budget.get("used", 0))
