@@ -1639,9 +1639,18 @@ def _reddit_sentiment_brief(tickers: list[str], budget: dict) -> str:
     signal) on watchlist tickers — issue #17 step 3. Field names below are real, verified against a
     live 1-ticker call on 2026-07-16 (not guessed, unlike Adanos's schema — see its docstring).
     Batches all tickers into a single actor run to minimize the per-run start fee. Fail-open: returns
-    "" if no token configured, budget exhausted, or the API errors. Budget is only incremented after
-    a successful response (unlike Adanos, which counts failed calls too — see issue #14 bug list)
-    since this is real pay-per-event money, not a free-tier call counter.
+    "" if no token configured, budget exhausted, or the API errors.
+
+    Budget (real pay-per-event money — issue #36):
+      - +1 after a successful HTTP response (2xx + body received), including empty/malformed
+        payloads (run was still started and may have been billed).
+      - +1 on httpx.TimeoutException after the POST was sent (client stays at 90s wall clock;
+        Apify sync may still complete and bill server-side — hard cap must not under-count).
+      - no +1 on ConnectError (request never left / never reached Apify).
+      - no +1 on other pre-response failures (unlike Adanos free-tier, which counts first).
+
+    Parsing (issue #37): mention_change_pct is coerced per item via float(); a dirty value
+    only drops that field, never the whole multi-ticker batch.
     """
     if not tickers or not APIFY_API_TOKEN:
         return ""
@@ -1653,7 +1662,7 @@ def _reddit_sentiment_brief(tickers: list[str], budget: dict) -> str:
             f"{APIFY_BASE}/acts/{APIFY_REDDIT_ACTOR}/run-sync-get-dataset-items",
             headers={"Authorization": f"Bearer {APIFY_API_TOKEN}", "Content-Type": "application/json"},
             json={"mode": "specific_tickers", "tickers": tickers, "maxResults": len(tickers)},
-            timeout=90,
+            timeout=90,  # wall-clock cap for main pipeline; not Apify's 300s sync ceiling
         )
         resp.raise_for_status()
         items = resp.json()
@@ -1675,14 +1684,32 @@ def _reddit_sentiment_brief(tickers: list[str], budget: dict) -> str:
             if not ticker:
                 continue
             change = item.get("mention_change_pct")
+            mention_chg = None
+            if change is not None:
+                try:
+                    mention_chg = f"{float(change):+.0f}%"
+                except (TypeError, ValueError):
+                    # Dirty actor field: omit mention_chg only; keep other fields / other tickers
+                    # (issue #37 — previously f"{change:+.0f}%" raised and wiped the whole batch).
+                    pass
             parts = [f"{k}={v}" for k, v in
                      [("signal", item.get("sentiment_signal")),
                       ("mentions_24h", item.get("mentions_24h")),
-                      ("mention_chg", f"{change:+.0f}%" if change is not None else None),
+                      ("mention_chg", mention_chg),
                       ("rank_chg", item.get("rank_change"))]
                      if v is not None]
             if parts:
                 lines.append(f"- {ticker}: {', '.join(parts)}")
+    except httpx.TimeoutException as e:
+        # Request was sent; Apify may still bill. Count conservatively (issue #36).
+        budget["used"] = budget.get("used", 0) + 1
+        logger.warning(
+            f"Apify Reddit sentiment timed out after 90s, counting budget conservatively: {e}"
+        )
+        return ""
+    except httpx.ConnectError as e:
+        logger.warning(f"Apify Reddit sentiment connect failed (not counting budget): {e}")
+        return ""
     except Exception as e:
         logger.warning(f"Apify Reddit sentiment query failed: {e}")
         return ""
