@@ -31,6 +31,8 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 **Issue 清理**：本次会话核实关闭 6 个 issue——#3（SPCX价格管道已自愈）、#6（不再推进IBKR翻转）、#8（KG已下线，纯向量版wontfix）、#9（KG vocab重复副本确认已清理）、#18（重复报告fix已生效验证）、#26（FRED流动性快照已实现，issue描述与代码不符）。核实 #17（Polymarket+Adanos社交舆情）已完整落地并有真实数据佐证（用真实key验证Adanos字段名猜测正确）。
 
+**次日 `/code-review` 修复7个真实bug（2026-07-16，commit `fa01f34`）**：对上面的 Brave News + 跨源去重代码跑 `/code-review`，8个findings全部verified，修了7个（1个budget-tracker三胞胎重复代码技术债延后）。最关键的一条：`score_and_filter()` 关键词锚定原先靠拆分话题标签本身（"US-Iran"→"us"/"iran"），既漏（"Hormuz"单独出现时锚不上，正是07-15 PM报告里实际漏网那对重复项的根因）又误报（"us"子串命中"focus"/"trust"）。改为直接用 watchlist.md 里已经维护好的完整 `geo_keywords` 字典，并把多词短语（"Strait of Hormuz"）拆出关键单词各自入锚。另外三个是真实防护漏洞：`fetch_brave_news()` 的 geo_topics query 被 `max_queries` 二次截断吞掉（AM slot 8个ticker时永远查不到地缘话题）；budget计数在 `raise_for_status()` 之前自增，key失效也照样烧硬上限；Brave自己的结果从未经过跨源去重。全部用真实存档数据+真实API调用验证，不是纸面推理。详见 issue #14 评论。
+
 **`gh` CLI 鉴权方式确认**：本项目禁止切换全局 `gh auth login`，`.env` 中 `GITHUB_TOKEN` 通过 `GH_TOKEN="$GITHUB_TOKEN" gh <command>` 单次注入使用，详见下方 Git/GitHub 章节。
 
 **尚未验证**：以上改动已通过 py_compile + 复现真实故障场景的单元测试 + 真实 Brave API 调用验证，但未跑完整付费 AM/PM 报告流水线。下次真实运行后可 `grep "score_and_filter\|Brave News" /tmp/daily_intelligence.log` 确认线上去重命中率和 Brave 数据质量。
