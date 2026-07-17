@@ -14,6 +14,7 @@ finance_serpapi_budget.json
 finance_adanos_budget.json
 finance_brave_budget.json
 finance_apify_budget.json
+finance_parallel_budget.json
 sas_tracked_tickers.json
 sas_review.lock
 

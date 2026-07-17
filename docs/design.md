@@ -573,6 +573,10 @@ Step 3  Parallel.ai search + extract（主，~$0.007-$0.012）
             Parallel 成功后，V4 Flash 判断是否存在明显盲区（缺价格路径/市场反应/基本面解释之一）
             有则生成第3条补漏 query 并再次调用 Parallel；无则直接进 Step 4
             触发时进度提示："情报补充（补漏查询）..."；fail-open，不影响主流程
+            issue #7 成本开关：Parallel 信息密度高于 Sonar，credit 用完后仍保持主路径；
+            dashboard credit < $5 时优先设置 PARALLEL_P1_ENABLED=0，只关 P1 补漏查询。
+        → 月度硬预算：finance_parallel_budget.json 记录 search/extract 估算成本；
+          PARALLEL_MONTHLY_BUDGET_USD 默认 $20，超限才降级到 Sonar/Exa。
         → 原始全文直接传入 Step 4，无预摘要损耗
         → 失败 fallback：Sonar（重试1次→Exa model="exa"）
         进度提示："情报检索（N条查询）..."

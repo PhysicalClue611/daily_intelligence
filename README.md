@@ -144,6 +144,8 @@ GUARDIAN_API_KEY=...          # Guardian Open Platform, free 500/day
 SERPAPI_API_KEY=...           # Google search fallback when Tavily quota exhausted
 EXA_API_KEY=...               # Exa search, Sonar fallback
 PARALLEL_API_KEY=...          # Parallel.ai full-text research for Telegram Q&A ($20 one-time credit)
+PARALLEL_MONTHLY_BUDGET_USD=20 # Optional hard cap for estimated paid Parallel usage
+PARALLEL_P1_ENABLED=1          # Optional: set 0 to disable the adaptive 3rd Parallel query
 ```
 
 ### Where to get each key
@@ -159,7 +161,9 @@ PARALLEL_API_KEY=...          # Parallel.ai full-text research for Telegram Q&A 
 | `FINANCE_TELEGRAM_CHAT_ID` | Your Telegram user or group chat ID | Send a message to your bot, then call `getUpdates` to find your chat ID. |
 | `GUARDIAN_API_KEY` | [open-platform.theguardian.com](https://open-platform.theguardian.com) | Free, 500 req/day. |
 | `SERPAPI_API_KEY` | [serpapi.com](https://serpapi.com) | Free tier: 100 searches/month. Only used when Tavily daily quota is exhausted. |
-| `PARALLEL_API_KEY` | [parallel.ai](https://parallel.ai) | One-time $20 credit (~2000 deep-search sessions). Powers Telegram follow-up Q&A. |
+| `PARALLEL_API_KEY` | [parallel.ai](https://parallel.ai) | One-time $20 credit, then paid usage. Powers Telegram follow-up Q&A. |
+| `PARALLEL_MONTHLY_BUDGET_USD` | Local setting | Estimated monthly hard cap for Parallel search/extract. Default: `$20`; set `0` to disable the local cap. |
+| `PARALLEL_P1_ENABLED` | Local setting | Optional cost lever for issue #7. Default: `1`; set `0` when Parallel dashboard credit drops below `$5` to keep main Parallel research but skip the adaptive 3rd query. |
 
 ### Environment variable for Obsidian path
 
@@ -310,6 +314,7 @@ Daily_Intelligence/
 ├── .env                        API keys (gitignored)
 ├── finance_tavily_budget.json  Tavily daily usage counter (auto-reset, gitignored)
 ├── finance_serpapi_budget.json SerpApi monthly counter (auto-reset, gitignored)
+├── finance_parallel_budget.json Parallel estimated monthly spend counter (auto-reset, gitignored)
 ├── sas_tracked_tickers.json    SAS tracked-ticker list (auto-maintained, gitignored)
 ├── tg_offset.json              Telegram polling offset (gitignored)
 └── .venv/                      Python virtual environment (gitignored)
