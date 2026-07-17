@@ -1659,23 +1659,33 @@ def _reddit_sentiment_brief(tickers: list[str], budget: dict) -> str:
         items = resp.json()
         budget["used"] = budget.get("used", 0) + 1
         logger.debug(f"Apify Reddit sentiment raw response: {json.dumps(items)[:2000]}")
+        # Parsing stays inside this try so a malformed payload (e.g. Apify returning a
+        # non-list error object instead of the dataset) still hits the except below and
+        # returns "" — if this loop threw uncaught, the caller's outer try/except in
+        # main() would catch it too, but *before* save_apify_budget() runs, silently
+        # losing the budget["used"] increment for a call that was already paid for.
+        if not isinstance(items, list):
+            logger.warning(f"Apify Reddit sentiment: unexpected response shape {type(items)}, expected list")
+            return ""
+        lines: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ticker = item.get("ticker")
+            if not ticker:
+                continue
+            change = item.get("mention_change_pct")
+            parts = [f"{k}={v}" for k, v in
+                     [("signal", item.get("sentiment_signal")),
+                      ("mentions_24h", item.get("mentions_24h")),
+                      ("mention_chg", f"{change:+.0f}%" if change is not None else None),
+                      ("rank_chg", item.get("rank_change"))]
+                     if v is not None]
+            if parts:
+                lines.append(f"- {ticker}: {', '.join(parts)}")
     except Exception as e:
         logger.warning(f"Apify Reddit sentiment query failed: {e}")
         return ""
-    lines: list[str] = []
-    for item in items:
-        ticker = item.get("ticker")
-        if not ticker:
-            continue
-        change = item.get("mention_change_pct")
-        parts = [f"{k}={v}" for k, v in
-                 [("signal", item.get("sentiment_signal")),
-                  ("mentions_24h", item.get("mentions_24h")),
-                  ("mention_chg", f"{change:+.0f}%" if change is not None else None),
-                  ("rank_chg", item.get("rank_change"))]
-                 if v is not None]
-        if parts:
-            lines.append(f"- {ticker}: {', '.join(parts)}")
     if not lines:
         return ""
     return "\n## Reddit 舆情快照（Apify）\n" + "\n".join(lines) + "\n"
