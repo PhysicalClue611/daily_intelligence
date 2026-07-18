@@ -288,6 +288,17 @@ def compute_calibration_metrics(window_days: int = 10) -> dict:
     except Exception as e:
         logger.warning(f"Reading calibration metrics failed (non-fatal): {e}")
         return {}
+    # Dedup by date, last write wins: FINANCE_FORCE_RUN (see the "强制运行"
+    # TG command) explicitly bypasses run_finance.py's same-day dedup check,
+    # so a manual re-run can append a second line for a date already
+    # recorded. The write side stays pure append-only (audit trail, no
+    # in-place edits) — dedup happens only here, at read time, so a re-run
+    # doesn't silently double-count that day's verdicts into the rolling
+    # window or inflate the "N trading days" the window claims to span.
+    by_date = {}
+    for r in records:
+        by_date[r.get("date", "")] = r
+    records = list(by_date.values())
     if len(records) < 3:
         return {}
 
