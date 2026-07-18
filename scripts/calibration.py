@@ -13,6 +13,7 @@ silently assumed run_finance.py is registered in sys.modules as
 "run_finance", which is false when it's run directly as the entrypoint, as
 launchd does — Python registers it as "__main__" instead).
 """
+import json
 import logging
 import os
 import re
@@ -63,6 +64,18 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 CALIBRATION_LOG_PATH = OBSIDIAN / "Hermes/Daily Intelligence/预判校准记录.md"
 CALIBRATION_BACKUP_PATH = _PROJ_DIR / "backups" / "预判校准记录_backup.md"
 
+# Structured metrics substrate (2026-07-18, issue #10 follow-up). The two
+# paths above are prose, human-readable, and are what AM re-reads for
+# qualitative "recursive improvement". This JSONL is a parallel,
+# machine-computable record of the same daily verdicts — one line per PM
+# run — so hit-rate / inconclusive-rate / miss-type trends can be computed
+# without re-parsing markdown prose. Project-local, gitignored, append-only
+# like every other tracker in this project (see 破坏性文件写入安全 in global
+# CLAUDE.md — 'a' mode only, never 'w').
+CALIBRATION_METRICS_PATH = _PROJ_DIR / "finance_calibration_log.jsonl"
+
+_MISS_TYPES = ("framework_falsified", "threshold_miscalibrated")
+
 _CALIBRATION_SYSTEM_PROMPT = (
     "你是一名负责复盘财经分析准确率的助理。任务是拿今早报告里的具体预判，"
     "对照今天实际发生的情况做核验，并提炼出对未来分析有参考价值的教训。"
@@ -109,16 +122,25 @@ def _evaluate_am_predictions(signals_text: str, price_table: str, news_context: 
 
 任务：
 1. 对清单中每一条，判断 hit（命中）/ miss（未命中）/ inconclusive（无法判断），给一句话理由。
-2. 写一段"知识条目"（knowledge_entry）——不是简单罗列对错，而是提炼一条对未来分析有参考价值的教训或验证
+2. 对每一条额外标注 resolvable_from_eod_data（true/false）：该条判断能否仅凭今日收盘价/成交量/汇率/收益率等
+   已有数据判定，不需要额外的新闻/事件内容确认。若判断结果依赖"某新闻是否发生/某证词说了什么"这类无法从
+   价格表直接读出的信息，则为 false。
+3. 若某条 verdict 为 miss，额外标注 miss_type：
+   - "framework_falsified"：预判背后的因果逻辑本身在今天被证明是错的（如"地缘风险应传导至科技股"但实际没传导）
+   - "threshold_miscalibrated"：方向/逻辑基本合理，只是具体价位/百分比阈值设得不对（卡在了边界外一点点，
+     或波动幅度被低估/高估）
+   非 miss 的条目该字段留 null。
+4. 写一段"知识条目"（knowledge_entry）——不是简单罗列对错，而是提炼一条对未来分析有参考价值的教训或验证
    （例如某类判断的系统性偏差、某条框架逻辑被验证有效），供未来生成 AM 报告时参考。50-150字。
-3. 判断今天的校验结果是否重要到需要出现在今晚报告正文里。原则：
+5. 判断今天的校验结果是否重要到需要出现在今晚报告正文里。原则：
    - 只有当某条高置信度判断被证伪、或某条核心框架逻辑被验证、或存在需要立即警惕的偏差模式时才算"重要"
    - 普通的命中/未命中是常态，不是新闻，不需要展示
    - 宁可少展示，不要为了"有内容"就展示
 
 输出 JSON（不要附加任何其他文字）：
 {{
-  "verdicts": [{{"claim": "...", "verdict": "hit|miss|inconclusive", "reasoning": "..."}}],
+  "verdicts": [{{"claim": "...", "verdict": "hit|miss|inconclusive", "reasoning": "...",
+                 "resolvable_from_eod_data": true, "miss_type": "framework_falsified|threshold_miscalibrated|null"}}],
   "knowledge_entry": "...",
   "worth_surfacing": true,
   "surface_blurb": "若 worth_surfacing 为 true，一段可直接放进今晚报告正文的文字（含具体原因）；否则留空字符串"
@@ -199,6 +221,188 @@ def _write_calibration_knowledge(date_str: str, knowledge_entry: str, verdicts: 
         logger.warning(f"Calibration MemPalace drawer skipped (non-fatal, not the durable store): {e}")
 
 
+def _normalize_verdict(raw) -> str:
+    """LLM output may drift on casing ('Hit', 'MISS') even with an explicit
+    enum in the prompt — normalize before matching so a drifted string
+    doesn't silently vanish from both counts and n_total (which would
+    otherwise drop the whole day's metrics row while the prose knowledge
+    entry still gets written, letting the two diverge)."""
+    return str(raw).strip().lower() if raw is not None else ""
+
+
+def _coerce_bool(raw) -> bool:
+    """Same LLM-JSON-drift defense for booleans: some models emit "true"/1
+    instead of a JSON boolean. Only recognized truthy forms count — anything
+    else (including absence) is False, matching the previous strict
+    `is True` behavior for the common case."""
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("true", "yes", "1")
+    return False
+
+
+def _write_calibration_metrics(date_str: str, verdicts: list) -> None:
+    """Append one aggregated JSON line to CALIBRATION_METRICS_PATH — the
+    structured counterpart to _write_calibration_knowledge()'s prose entry.
+    Fail-open: a write failure here must never affect the main report
+    pipeline (same contract as every other writer in this module)."""
+    if not verdicts:
+        return
+    counts = {"hit": 0, "miss": 0, "inconclusive": 0}
+    resolvable = 0
+    miss_type_counts = {"framework_falsified": 0, "threshold_miscalibrated": 0, "unclassified": 0}
+    for v in verdicts:
+        if not isinstance(v, dict):
+            continue
+        verdict = _normalize_verdict(v.get("verdict"))
+        if verdict not in counts:
+            logger.warning(f"Calibration verdict unrecognized, dropping this row: {v.get('verdict')!r}")
+            continue
+        counts[verdict] += 1
+        # Only count resolvable_from_eod_data for verdicts that were
+        # actually accepted above — otherwise a row with an unrecognized
+        # verdict string can still increment `resolvable` while contributing
+        # nothing to n_total, letting resolvable_rate exceed 1.0 downstream.
+        if _coerce_bool(v.get("resolvable_from_eod_data")):
+            resolvable += 1
+        if verdict == "miss":
+            miss_type = _normalize_verdict(v.get("miss_type")) or None
+            if miss_type in _MISS_TYPES:
+                miss_type_counts[miss_type] += 1
+            else:
+                miss_type_counts["unclassified"] += 1
+    n_total = counts["hit"] + counts["miss"] + counts["inconclusive"]
+    if n_total == 0:
+        return
+    record = {
+        "date": date_str,
+        "n_hit": counts["hit"],
+        "n_miss": counts["miss"],
+        "n_inconclusive": counts["inconclusive"],
+        "n_total": n_total,
+        "n_resolvable_from_eod": resolvable,
+        "miss_type_counts": miss_type_counts,
+    }
+    try:
+        CALIBRATION_METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CALIBRATION_METRICS_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        logger.info(f"Calibration metrics logged → {CALIBRATION_METRICS_PATH.name} ({record})")
+    except Exception as e:
+        logger.warning(f"Calibration metrics write failed (non-fatal): {e}")
+
+
+def compute_calibration_metrics(window_days: int = 10) -> dict:
+    """Read CALIBRATION_METRICS_PATH and compute rolling stats over the most
+    recent `window_days` recorded days (one JSONL line = one PM run's
+    aggregated verdicts, not one signal — so this is trading days, not
+    individual signal count). Returns {} if the file is missing or has fewer
+    than 3 recorded days (not enough to be meaningful). Fail-open: any parse
+    error on an individual line is skipped, not fatal."""
+    if not CALIBRATION_METRICS_PATH.exists():
+        return {}
+    records = []
+    try:
+        for line in CALIBRATION_METRICS_PATH.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # Validate shape before it ever reaches dedup/sort below: a line
+            # that's valid JSON but not an object (e.g. `[]`, `123`) would
+            # raise AttributeError on .get(), and a missing/null/malformed
+            # date would either collapse onto a shared "" dedup key or make
+            # records.sort() raise TypeError comparing None to str — either
+            # way escaping the fail-open contract this docstring promises,
+            # with no caller-side try/except on the TG command path.
+            if not isinstance(obj, dict) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(obj.get("date") or "")):
+                continue
+            records.append(obj)
+    except Exception as e:
+        logger.warning(f"Reading calibration metrics failed (non-fatal): {e}")
+        return {}
+    # Dedup by date, last write wins: FINANCE_FORCE_RUN (see the "强制运行"
+    # TG command) explicitly bypasses run_finance.py's same-day dedup check,
+    # so a manual re-run can append a second line for a date already
+    # recorded. The write side stays pure append-only (audit trail, no
+    # in-place edits) — dedup happens only here, at read time, so a re-run
+    # doesn't silently double-count that day's verdicts into the rolling
+    # window or inflate the "N trading days" the window claims to span.
+    by_date = {}
+    for r in records:
+        by_date[r.get("date", "")] = r
+    records = list(by_date.values())
+    if len(records) < 3:
+        return {}
+
+    records.sort(key=lambda r: r.get("date", ""))
+    window = records[-window_days:]
+
+    n_hit = sum(r.get("n_hit", 0) for r in window)
+    n_miss = sum(r.get("n_miss", 0) for r in window)
+    n_inconclusive = sum(r.get("n_inconclusive", 0) for r in window)
+    n_resolvable = sum(r.get("n_resolvable_from_eod", 0) for r in window)
+    n_total = n_hit + n_miss + n_inconclusive
+    n_decidable = n_hit + n_miss
+
+    miss_types = {"framework_falsified": 0, "threshold_miscalibrated": 0, "unclassified": 0}
+    for r in window:
+        mt = r.get("miss_type_counts", {})
+        for k in miss_types:
+            miss_types[k] += mt.get(k, 0)
+
+    return {
+        "window_days": len(window),
+        "date_range": (window[0].get("date", ""), window[-1].get("date", "")),
+        "n_total_signals": n_total,
+        "hit_rate": round(n_hit / n_decidable, 3) if n_decidable else None,
+        "inconclusive_rate": round(n_inconclusive / n_total, 3) if n_total else None,
+        "resolvable_rate": round(n_resolvable / n_total, 3) if n_total else None,
+        "n_miss": n_miss,
+        "miss_type_counts": miss_types,
+    }
+
+
+def format_calibration_metrics_report(window_days: int = 10) -> str:
+    """Human-readable summary of compute_calibration_metrics(), for the TG
+    on-demand ("校准统计") command only — the AM prompt banner does NOT use
+    this; _load_recent_calibration_notes() builds its own shorter one-line
+    banner directly from compute_calibration_metrics(), since the full
+    multi-line report here is sized for a human reading Telegram, not for
+    prompt-budget-conscious LLM injection. Returns a "not enough data yet"
+    message rather than an empty string, so the TG command always has
+    something legible to send back."""
+    m = compute_calibration_metrics(window_days)
+    if not m:
+        return "校准数据不足（少于3个交易日记录），暂无统计可展示。"
+    hit_pct = f"{m['hit_rate']*100:.0f}%" if m["hit_rate"] is not None else "N/A"
+    inc_pct = f"{m['inconclusive_rate']*100:.0f}%" if m["inconclusive_rate"] is not None else "N/A"
+    res_pct = f"{m['resolvable_rate']*100:.0f}%" if m["resolvable_rate"] is not None else "N/A"
+    mt = m["miss_type_counts"]
+    mt_total = mt["framework_falsified"] + mt["threshold_miscalibrated"] + mt["unclassified"]
+    mt_line = "无 miss 记录"
+    if mt_total:
+        mt_line = (
+            f"框架证伪 {mt['framework_falsified']}/{mt_total}、"
+            f"阈值未卡准 {mt['threshold_miscalibrated']}/{mt_total}、"
+            f"未分类 {mt['unclassified']}/{mt_total}"
+        )
+    start, end = m["date_range"]
+    return (
+        f"预判校准统计（{start} ~ {end}，{m['window_days']}个交易日，{m['n_total_signals']}条信号）\n"
+        f"命中率（可判定内）：{hit_pct}\n"
+        f"inconclusive率：{inc_pct}\n"
+        f"仅凭EOD数据可判定的信号占比：{res_pct}\n"
+        f"miss 类型分布：{mt_line}"
+    )
+
+
 # ── SAS candidate evidence log (issue #31) ────────────────────────────────
 # Pass 2 flags news/events matching the Investment Operating Manual's 7.4
 # internal-signal list or Section 6 cognitive-upgrade criteria via the
@@ -261,7 +465,25 @@ def _load_recent_calibration_notes(max_entries: int = 5, max_chars: int = 1200) 
             body = "\n".join(lines)
             if len(body) > max_chars:
                 body = body[:max_chars] + "\n[...truncated]"
-            return "## 近期预判校准教训（供参考，非当前持仓）\n" + body + "\n"
+
+            # Quantitative anchor ahead of the prose lessons (issue #10
+            # follow-up, 2026-07-18): gives AM a number to calibrate against,
+            # not just qualitative anecdotes. Degrades silently — if there's
+            # not enough structured history yet, this adds nothing and the
+            # banner is skipped rather than showing a "not enough data" stub
+            # inside the AM prompt (that message is only useful to a human
+            # reading the TG command, not to the LLM generating predictions).
+            metrics = compute_calibration_metrics()
+            stats_banner = ""
+            if metrics and metrics.get("hit_rate") is not None:
+                hit_pct = round(metrics["hit_rate"] * 100)
+                inc_pct = round(metrics["inconclusive_rate"] * 100) if metrics.get("inconclusive_rate") is not None else None
+                stats_banner = f"## 近期预判校准统计（近{metrics['window_days']}个交易日）\n命中率{hit_pct}%"
+                if inc_pct is not None:
+                    stats_banner += f"，inconclusive率{inc_pct}%"
+                stats_banner += "\n\n"
+
+            return stats_banner + "## 近期预判校准教训（供参考，非当前持仓）\n" + body + "\n"
         except Exception as e:
             logger.warning(f"Reading calibration notes from {path} failed (non-fatal): {e}")
             continue
@@ -295,6 +517,7 @@ def evaluate_am_calibration(today_et: str, run_slot: str, price_table: str,
         verdicts = evaluation.get("verdicts", [])
         if knowledge_entry:
             _write_calibration_knowledge(today_et, knowledge_entry, verdicts)
+        _write_calibration_metrics(today_et, verdicts)
 
         if evaluation.get("worth_surfacing") and evaluation.get("surface_blurb"):
             report_md += f"\n\n---\n\n## 预判校验\n{evaluation['surface_blurb']}\n"
