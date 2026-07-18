@@ -19,6 +19,20 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-18）
+
+**Issue #10 十日复盘 + PR #44：AM预判校准闭环的测量基础设施升级**。距 07-02 上线已运行10个交易日（07-06~07-17），首次做量化复盘：39条可验证信号，总体命中率34.4%（11 hit/21 miss/7 inconclusive），前后两段（07-06~07-10 vs 07-13~07-17）命中率从23.5%升至46.7%、inconclusive率从26%降到6%，且行为转折时间点与07-13当天写入的教训（"避免依赖事后确认的事件"）精确对齐——方向符合"自回归优化在起作用"的假设，但样本量太小（各段15-17条）+ 存在混淆变量（07-13恰好赶上美联储证词+ASML财报两个真实日历事件），不足以下"验证生效"的结论，只能算阳性信号。完整数据见 issue #10 评论。
+
+**PR #44（issue #10 后续，分两轮提交）**：核心闭环机制（AM输出可验证信号→PM核验→知识回注AM）本身未改动，只加测量基础设施层——PM评估器新增 `resolvable_from_eod_data`（该信号能否仅凭EOD价格数据判定）和 `miss_type`（`framework_falsified` 框架证伪 vs `threshold_miscalibrated` 阈值未卡准）两个判定维度；新增结构化 `finance_calibration_log.jsonl`（gitignore、纯append）与既有Obsidian散文记录并行；`compute_calibration_metrics()` 计算滚动窗口统计；`_load_recent_calibration_notes()` 在教训原文前新增量化统计横幅（如"命中率34%，inconclusive率6%"），让AM读教训时有数字锚点——这是本次唯一触碰"闭环"本身的改动；新增TG指令「校准统计」。
+
+**两轮code review共修复4个真实bug**：自查（`/code-review` medium）发现 `compute_calibration_metrics()` 未按日期去重，`强制运行`重跑同一天PM会导致该天信号被重复计入滚动窗口。Grok独立inline review（同一PR）额外发现3个真实bug——`compute_calibration_metrics()`对脏数据（`date: null`、非对象JSON行）无防护，且TG「校准统计」调用链上无外层try/except，脏数据能直接崩掉bot进程；`resolvable_from_eod_data`计数未绑定合法verdict分支，LLM大小写漂移（"Hit"而非"hit"）会导致`resolvable_rate`统计值超过1.0。全部修复并有针对性单元测试验证（构造脏数据/大小写漂移/重复日期等真实触发场景，非纸面推理）。经用户确认后squash-merge（`d73f24b`）+ 删除远程分支，`telegram_commands.py`改动触发已知踩坑（坑32），重启了`com.daily-intel.finance.telegram`。
+
+**Grok review质量评价**：3个bug全部验证属实、无误报，且发现了本地自查`/code-review`遗漏的问题（自查只测了正常路径的重复计数，没测脏数据/类型漂移这类对抗性输入）；3条suggestion中2条采纳（verdict大小写归一化、LLM布尔值容错解析）、1条搁置（TG关键词短路建议，判断方向对但未意识到这是`_unified_preprocess`架构级通用缺口而非`calibration_report`独有，已开issue #45单独追踪，不在此PR内打局部补丁）；1个nit（docstring错误声称被AM banner使用）已修。
+
+**新开issue #45**：`_unified_preprocess`（`telegram_commands.py`）全部现有指令（状态/强制运行/加删ticker等）均无关键词短路，完全依赖LLM分类，存在低概率但非零成本的误路由风险（如"校准统计"被误判为`followup`触发Parallel/Sonar付费搜索）。优先级低，视TG实际使用中是否真的多次触发误路由再决定是否动手。
+
+**下一步观察方向**（严格遵循"每周稳定小增量"节奏，本次不做AM信号生成规则本身的改动）：① 量化横幅注入后1-2周命中率/inconclusive率滚动值是否有可归因变化；② `miss_type`分布积累到有意义样本量（预计3-4周）后，评估框架证伪vs阈值未卡准的比例，作为后续是否收紧AM规则的依据。
+
 ## 当前系统状态（2026-07-17）
 
 **本仓库存在多 agent session 并发工作（2026-07-17 发现）**：观察到至少两个 agent session 各自开了 feature branch + PR 在并行工作——`fix/apify-reddit-36-37`（PR #39，修复 issue #36/#37）和 `agent/parallel-budget-controls`（PR #40，issue #7 Parallel.ai 预算控制）。**任何新 session 涉及 git 操作前，先 `git branch --show-current` 确认当前分支、`gh pr list --state open` 确认是否已有别的 session 开着 PR，不要默认自己是仓库里唯一的改动来源**，完整原则见全局 `~/.claude/CLAUDE.md`"多 Agent/多分支并发协作仓库操作原则"一节。已有 PR 的工作只汇报不擅自 push/merge。
