@@ -33,6 +33,7 @@ import httpx
 from dotenv import load_dotenv
 
 from telegram_utils import call_telegram
+from calibration import format_calibration_metrics_report
 
 _HOME = os.path.expanduser("~")
 _DI_ENV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
@@ -579,6 +580,7 @@ def _unified_preprocess(text: str) -> dict:
     add_recipient / remove_recipient
     status                      （查看系统状态）
     force_run                   （强制触发报告）
+    calibration_report          （查看AM预判校准统计，如"校准统计"/"预判准确率"/"校准周报"）
     followup                    （财经/宏观追问）
     unknown
 
@@ -1510,6 +1512,9 @@ def execute(cmd: dict) -> str:
         reply_html(_build_status())
         return ""
 
+    elif action == "calibration_report":
+        return format_calibration_metrics_report()
+
     elif action == "force_run":
         now_et = datetime.now(ET)
         slot = "pm" if now_et.hour >= 18 else "am"
@@ -1535,6 +1540,7 @@ def execute(cmd: dict) -> str:
             "• 加/删收件人\n"
             "• 状态\n"
             "• 强制运行\n"
+            "• 校准统计（AM预判命中率/趋势）\n"
             "• 直接提问（财经追问）"
         )
 
