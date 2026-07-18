@@ -102,7 +102,7 @@ from scoring_utils import (
     _title_tokens_for_dedup, _title_keyword_hits, _token_jaccard,
     _TITLE_DEDUP_THRESHOLD, _TITLE_DEDUP_THRESHOLD_NO_KEYWORD,
     _TITLE_DEDUP_STRICT_NO_DATE_THRESHOLD, _TITLE_DEDUP_WINDOW_HOURS,
-    _DEDUP_STOPWORDS, _source_confidence_tags,
+    _DEDUP_STOPWORDS, _source_confidence_tags, build_keyword_set,
 )
 
 logging.basicConfig(
@@ -411,21 +411,11 @@ def score_and_filter(
     an "iran"-only one, confirmed missed in the 2026-07-15 PM production run)
     and introduces short-token false positives ("us" matching inside "focus").
     """
-    keywords = [t.lower() for t in anomaly_tickers]
-    for kws in geo_keywords.values():
-        for kw in kws:
-            kw = kw.strip().lower()
-            if not kw:
-                continue
-            keywords.append(kw)
-            # A multi-word curated keyword ("Strait of Hormuz") requiring an
-            # exact full-phrase match in the title is too strict — real
-            # headlines often say just "Hormuz" alone (confirmed missed in
-            # the 2026-07-15 PM production run). Anchor on its significant
-            # individual words too, not just the whole phrase.
-            if " " in kw:
-                keywords += [w for w in kw.split() if len(w) > 3 and w not in _DEDUP_STOPWORDS]
-    keywords = list(set(keywords))
+    # build_keyword_set() (scoring_utils.py) does the same lowering + multi-word
+    # phrase word-splitting described above — shared with the corroboration
+    # fingerprint (_extract_key_phrases) as of issue #19 follow-up so both keyword
+    # anchoring paths stay in sync.
+    keywords = build_keyword_set(anomaly_tickers, geo_keywords)
 
     now = datetime.now(ET)
     scored: list[tuple[float, dict, "datetime | None"]] = []
@@ -626,7 +616,11 @@ def format_tavily_results(results: list[dict]) -> str:
 
 
 
-def format_extract_results(results: list[dict], candidates: list[dict] | None = None) -> str:
+def format_extract_results(
+    results: list[dict],
+    candidates: list[dict] | None = None,
+    extra_keywords: list[str] | None = None,
+) -> str:
     """Format Extract results (full chunks, up to 600 chars each).
 
     Each source gets a confidence tag line (structure type / date confidence /
@@ -636,6 +630,8 @@ def format_extract_results(results: list[dict], candidates: list[dict] | None = 
     with no date of its own was reported as a confirmed "signing set for Friday").
     `candidates` is the broader pre-extract search result pool (has published_date
     and title/content for corroboration matching); pass score_and_filter's output.
+    `extra_keywords` is build_keyword_set()'s output — plugs the corroboration
+    fingerprint's single-token/all-caps entity gap (issue #19 follow-up).
     """
     if not results:
         return ""
@@ -648,7 +644,7 @@ def format_extract_results(results: list[dict], candidates: list[dict] | None = 
         full_text = " ".join((c.get("content") or "") for c in chunks) or raw
 
         lines.append(f"\n  来源: {url}")
-        lines.append(f"    [{_source_confidence_tags(url, full_text, candidates)}]")
+        lines.append(f"    [{_source_confidence_tags(url, full_text, candidates, extra_keywords)}]")
         if chunks:
             for i, chunk in enumerate(chunks[:2]):
                 text = (chunk.get("content") or "")[:600]
@@ -1509,15 +1505,21 @@ def _main_body():
             ).strip()
             extract_results = tavily_extract(extract_urls, extract_q, budget)
 
+        corroboration_keywords = build_keyword_set(anomaly_ticker_syms, wl["geo_keywords"])
         if extract_results:
-            tavily_section = format_extract_results(extract_results, candidates=prescreened)
+            tavily_section = format_extract_results(
+                extract_results, candidates=prescreened, extra_keywords=corroboration_keywords
+            )
             logger.info(f"Using Extract chunks for Pass 2 ({len(extract_results)} sources)")
         elif filtered:
             tavily_section = format_tavily_results(filtered)
             logger.info(f"Extract unavailable, using search summaries ({len(filtered)} results)")
 
     # 9b. Archive cleaned Extract full text to local disk (outside Obsidian, never mined)
-    write_extract_archive(today_et, run_slot, now_et, all_search_jobs, filtered, extract_results)
+    write_extract_archive(
+        today_et, run_slot, now_et, all_search_jobs, filtered, extract_results,
+        extra_keywords=corroboration_keywords if raw_results else None,
+    )
 
     # 10. If Tavily added new data, do a second LLM pass to incorporate it
     # Pass 2 uses SYSTEM_PROMPT_P2 (Layer A) + personal context (Layer B) for portfolio-aware analysis.

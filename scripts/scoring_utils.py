@@ -92,17 +92,54 @@ _STRONG_TOKEN_RE = re.compile(r"\b\d{1,3}(?:\.\d+)?%|\$\d[\d,\.]*|\b\d{4}\b")
 _WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
 
 
-def _extract_key_phrases(text: str) -> set[str]:
+def build_keyword_set(anomaly_tickers: list[str], geo_keywords: dict[str, list[str]]) -> list[str]:
+    """Lowercased anomaly-ticker + geo-keyword anchor list, shared by score_and_filter
+    (title-dedup/scoring keyword bonus) and _extract_key_phrases (corroboration
+    fingerprint, issue #19 follow-up). `geo_keywords` takes the curated topic→keyword
+    dict from watchlist.md, not bare topic labels — splitting a label like "US-Iran"
+    into ["us","iran"] both misses real synonym anchors and introduces short-token
+    false positives ("us" matching inside "focus"). A multi-word curated keyword
+    ("Strait of Hormuz") also gets its significant individual words anchored
+    separately — real headlines often say just "Hormuz" alone (confirmed missed in
+    the 2026-07-15 PM production run)."""
+    keywords = [t.strip().lower() for t in anomaly_tickers if t and t.strip()]
+    for kws in geo_keywords.values():
+        for kw in kws:
+            kw = kw.strip().lower()
+            if not kw:
+                continue
+            keywords.append(kw)
+            if " " in kw:
+                keywords += [w for w in kw.split() if len(w) > 3 and w not in _DEDUP_STOPWORDS]
+    return list(set(keywords))
+
+
+def _extract_key_phrases(text: str, extra_keywords: list[str] | None = None) -> set[str]:
     """Cheap rule-based fact fingerprint: proper-noun phrases + weekday/date/number
     tokens. Used only for rule-based cross-source corroboration (issue #19) —
     no extra API/LLM cost. Expect false negatives on paraphrased claims; a miss
-    here means 'no rule-based match found', not proof a claim is uncorroborated."""
+    here means 'no rule-based match found', not proof a claim is uncorroborated.
+
+    `_PHRASE_RE` requires 2+ Title-Case words, so it structurally cannot match
+    single-token entities ("Hormuz") or all-caps ones ("US") — confirmed as a
+    real false-negative source in the 2026-07-17 PM archive (a CNBC piece was
+    tagged single-source despite NYPost/World Oil/MarineLink/Bloomberg covering
+    the same Iran/Hormuz story in the same batch). `extra_keywords` (pass
+    build_keyword_set()'s output) plugs that gap with word-boundary matches
+    against the caller's own tracked ticker/geo vocabulary — same anchoring
+    approach score_and_filter already uses for title-dedup."""
     if not text:
         return set()
     phrases = set(_PHRASE_RE.findall(text))
     tokens = set(m.lower() for m in _STRONG_TOKEN_RE.findall(text))
     words = set(w.lower() for w in re.findall(r"[A-Za-z]+", text))
     tokens |= (words & _WEEKDAYS)
+    if extra_keywords:
+        t_lower = text.lower()
+        tokens |= {
+            kw for kw in extra_keywords
+            if kw and re.search(r"\b" + re.escape(kw) + r"\b", t_lower)
+        }
     return phrases | tokens
 
 
@@ -135,13 +172,15 @@ def _lookup_published_date(url: str, candidates: list[dict]) -> tuple[str, float
     return "", None
 
 
-def _compute_corroboration(url: str, text: str, candidates: list[dict]) -> int:
+def _compute_corroboration(
+    url: str, text: str, candidates: list[dict], extra_keywords: list[str] | None = None
+) -> int:
     """Rule-based cross-source check (issue #19): count distinct OTHER domains in the
     broader candidate pool that share at least one key phrase with this result.
     Zero cost (no extra API/LLM call), but also a rough heuristic — 0 means 'no
     overlap found by this rule', not a confirmed single-source claim."""
     own_domain = url.split("/")[2] if "//" in url else url
-    own_phrases = _extract_key_phrases(text)
+    own_phrases = _extract_key_phrases(text, extra_keywords)
     if not own_phrases:
         return 0
     matched_domains: set[str] = set()
@@ -151,15 +190,21 @@ def _compute_corroboration(url: str, text: str, candidates: list[dict]) -> int:
         if not cdomain or cdomain == own_domain:
             continue
         ctext = (r.get("title", "") + " " + (r.get("content") or ""))
-        if own_phrases & _extract_key_phrases(ctext):
+        if own_phrases & _extract_key_phrases(ctext, extra_keywords):
             matched_domains.add(cdomain)
     return len(matched_domains)
 
 
-def _source_confidence_tags(url: str, full_text: str, candidates: list[dict]) -> str:
+def _source_confidence_tags(
+    url: str, full_text: str, candidates: list[dict], extra_keywords: list[str] | None = None
+) -> str:
     """Build the '[信源类型/发布时间/交叉印证]' tag line for one Extract source.
     Shared by format_extract_results() (LLM-facing) and write_extract_archive()
-    (audit trail) so both reflect the same confidence signals. See issue #19."""
+    (audit trail) so both reflect the same confidence signals. See issue #19.
+
+    `extra_keywords` (build_keyword_set() output) plugs the single-token/all-caps
+    entity gap in the corroboration fingerprint — optional/backward-compatible,
+    omitting it just falls back to the original phrase-only matching."""
     pub_date, age_h = _lookup_published_date(url, candidates)
     tags = []
     if _detect_low_structure(full_text):
@@ -170,7 +215,7 @@ def _source_confidence_tags(url: str, full_text: str, candidates: list[dict]) ->
         tags.append(f"发布时间: {pub_date}（约{age_h / 24:.0f}天前，警惕过时/已被后续事件覆盖）")
     else:
         tags.append(f"发布时间: {pub_date}")
-    corroboration = _compute_corroboration(url, full_text, candidates)
+    corroboration = _compute_corroboration(url, full_text, candidates, extra_keywords)
     tags.append(
         f"交叉印证: {corroboration}个独立域名有重叠信息佐证" if corroboration > 0
         else "交叉印证: 未发现其他信源佐证（单一信源）"
