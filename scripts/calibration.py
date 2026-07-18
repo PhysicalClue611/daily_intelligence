@@ -221,6 +221,29 @@ def _write_calibration_knowledge(date_str: str, knowledge_entry: str, verdicts: 
         logger.warning(f"Calibration MemPalace drawer skipped (non-fatal, not the durable store): {e}")
 
 
+def _normalize_verdict(raw) -> str:
+    """LLM output may drift on casing ('Hit', 'MISS') even with an explicit
+    enum in the prompt — normalize before matching so a drifted string
+    doesn't silently vanish from both counts and n_total (which would
+    otherwise drop the whole day's metrics row while the prose knowledge
+    entry still gets written, letting the two diverge)."""
+    return str(raw).strip().lower() if raw is not None else ""
+
+
+def _coerce_bool(raw) -> bool:
+    """Same LLM-JSON-drift defense for booleans: some models emit "true"/1
+    instead of a JSON boolean. Only recognized truthy forms count — anything
+    else (including absence) is False, matching the previous strict
+    `is True` behavior for the common case."""
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("true", "yes", "1")
+    return False
+
+
 def _write_calibration_metrics(date_str: str, verdicts: list) -> None:
     """Append one aggregated JSON line to CALIBRATION_METRICS_PATH — the
     structured counterpart to _write_calibration_knowledge()'s prose entry.
@@ -234,13 +257,19 @@ def _write_calibration_metrics(date_str: str, verdicts: list) -> None:
     for v in verdicts:
         if not isinstance(v, dict):
             continue
-        verdict = v.get("verdict")
-        if verdict in counts:
-            counts[verdict] += 1
-        if v.get("resolvable_from_eod_data") is True:
+        verdict = _normalize_verdict(v.get("verdict"))
+        if verdict not in counts:
+            logger.warning(f"Calibration verdict unrecognized, dropping this row: {v.get('verdict')!r}")
+            continue
+        counts[verdict] += 1
+        # Only count resolvable_from_eod_data for verdicts that were
+        # actually accepted above — otherwise a row with an unrecognized
+        # verdict string can still increment `resolvable` while contributing
+        # nothing to n_total, letting resolvable_rate exceed 1.0 downstream.
+        if _coerce_bool(v.get("resolvable_from_eod_data")):
             resolvable += 1
         if verdict == "miss":
-            miss_type = v.get("miss_type")
+            miss_type = _normalize_verdict(v.get("miss_type")) or None
             if miss_type in _MISS_TYPES:
                 miss_type_counts[miss_type] += 1
             else:
@@ -282,9 +311,19 @@ def compute_calibration_metrics(window_days: int = 10) -> dict:
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # Validate shape before it ever reaches dedup/sort below: a line
+            # that's valid JSON but not an object (e.g. `[]`, `123`) would
+            # raise AttributeError on .get(), and a missing/null/malformed
+            # date would either collapse onto a shared "" dedup key or make
+            # records.sort() raise TypeError comparing None to str — either
+            # way escaping the fail-open contract this docstring promises,
+            # with no caller-side try/except on the TG command path.
+            if not isinstance(obj, dict) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(obj.get("date") or "")):
+                continue
+            records.append(obj)
     except Exception as e:
         logger.warning(f"Reading calibration metrics failed (non-fatal): {e}")
         return {}
@@ -332,11 +371,13 @@ def compute_calibration_metrics(window_days: int = 10) -> dict:
 
 def format_calibration_metrics_report(window_days: int = 10) -> str:
     """Human-readable summary of compute_calibration_metrics(), for the TG
-    on-demand command and for injection into the AM prompt banner. Returns a
-    "not enough data yet" message rather than an empty string, so callers
-    that display this directly (TG command) always get something legible;
-    callers that need graceful degradation (AM prompt banner) check
-    compute_calibration_metrics() directly instead."""
+    on-demand ("校准统计") command only — the AM prompt banner does NOT use
+    this; _load_recent_calibration_notes() builds its own shorter one-line
+    banner directly from compute_calibration_metrics(), since the full
+    multi-line report here is sized for a human reading Telegram, not for
+    prompt-budget-conscious LLM injection. Returns a "not enough data yet"
+    message rather than an empty string, so the TG command always has
+    something legible to send back."""
     m = compute_calibration_metrics(window_days)
     if not m:
         return "校准数据不足（少于3个交易日记录），暂无统计可展示。"
