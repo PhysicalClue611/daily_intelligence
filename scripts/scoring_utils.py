@@ -135,11 +135,7 @@ def _extract_key_phrases(text: str, extra_keywords: list[str] | None = None) -> 
     words = set(w.lower() for w in re.findall(r"[A-Za-z]+", text))
     tokens |= (words & _WEEKDAYS)
     if extra_keywords:
-        t_lower = text.lower()
-        tokens |= {
-            kw for kw in extra_keywords
-            if kw and re.search(r"\b" + re.escape(kw) + r"\b", t_lower)
-        }
+        tokens |= _title_keyword_hits(text, extra_keywords)
     return phrases | tokens
 
 

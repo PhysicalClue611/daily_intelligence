@@ -1462,6 +1462,7 @@ def _main_body():
     raw_results: list[dict] = []
     filtered: list[dict] = []        # populated in Layer 2b; needed for archive writer
     extract_results: list[dict] = [] # populated in Layer 3; needed for archive writer
+    corroboration_keywords: list[str] = []  # populated below; needed for archive writer
     for job in all_search_jobs:
         if budget_remaining(budget) < 1:
             logger.info("Tavily budget exhausted, stopping search")
@@ -1518,7 +1519,7 @@ def _main_body():
     # 9b. Archive cleaned Extract full text to local disk (outside Obsidian, never mined)
     write_extract_archive(
         today_et, run_slot, now_et, all_search_jobs, filtered, extract_results,
-        extra_keywords=corroboration_keywords if raw_results else None,
+        extra_keywords=corroboration_keywords,
     )
 
     # 10. If Tavily added new data, do a second LLM pass to incorporate it
