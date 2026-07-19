@@ -33,6 +33,18 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 **下一步观察方向**（严格遵循"每周稳定小增量"节奏，本次不做AM信号生成规则本身的改动）：① 量化横幅注入后1-2周命中率/inconclusive率滚动值是否有可归因变化；② `miss_type`分布积累到有意义样本量（预计3-4周）后，评估框架证伪vs阈值未卡准的比例，作为后续是否收紧AM规则的依据。
 
+**Issue #19 收尾 + PR #46：跨源印证指纹漏检单token/全大写实体（同日晚间，独立于上面issue #10工作）**。背景：用户在GitHub网页发现issue #19正文被"Grok (via GitHub connector)"整个覆盖替换成一条review文本（应该是走了PATCH issue body而非POST comment，`editor: PhysicalClue611`）——用GraphQL `userContentEdits`历史找回原文并恢复，Grok review改存为独立comment后删除（因为质量一般，用户要求换Grok CLI重跑）。用户已直接告知Grok全局记住"review issue只能加comment不能改body"，不需要在本项目CLAUDE.md重复记录这条（属于Grok自身行为准则，不是本项目代码问题）。
+
+Grok CLI 4.5 Medium重新review issue #19后，逐条验证确认属实（`_PHRASE_RE`正则结构性缺陷、真实07-17 archive里CNBC被错标"单一信源"、Pass 2 prompt "N≥1"门槛原文引用）——分类处理：① 正则漏检单token/全大写实体（"Hormuz"/"US"）→ 本issue下开PR修复；② Pass 2强断言应与普通背景事实使用不同印证门槛→ 拆到独立issue #47（设计取舍，需观察真实数据再决定，避免约束太严导致LLM输出过度保守）；③ 方向4只是轻量v1、方向5继续暂缓→ 记录不处理。
+
+**PR #46**：新增`build_keyword_set()`（从`score_and_filter`已有逻辑提取共享），`extra_keywords`参数贯穿`_extract_key_phrases`→`_compute_corroboration`→`_source_confidence_tags`。用真实07-17 archive复现验证：CNBC案例印证数从0→4。经两轮`/code-review`（low+medium，各发现并修复cleanup findings，无correctness bug）。
+
+**合并前又发现一个真实回归（PR #46自己引入的）**：Grok CLI对PR #46的inline review（GitHub API上以`PENDING`状态存在，未提交，故网页/API均不可见——通过`gh api .../reviews/{id}` + `.../reviews/{id}/comments`直接读取才发现）指出：复用`score_and_filter()`的宽松关键词表（含拆分词"east"/"middle"、含anomaly ticker）做跨源印证判定，会把"仅共享拆分词或ticker但完全不同事件"的两篇报道误判为"已印证"——现场用真实数据复现两个假阳性场景全部属实（东海岸停电 vs 东亚芯片需求共享"east"；同ticker财报vs CEO离职共享"INTC"）。修复：`build_keyword_set()`新增`split_phrases`参数，跨源印证路径改用`split_phrases=False`（只保留字面配置关键词，不拆分不含ticker），原始bug修复效果不受影响。详见坑记录第81条。**教训**：这个回归是本人在同一PR里引入、且被自己两轮`/code-review`漏掉的，交叉验证（哪怕是另一个LLM的review）在这里体现了实际价值，不是走过场。
+
+**多次Grok review质量对比（同一issue/PR，4个不同来源）**：iOS App fast模式（issue级）→ 把issue body整个覆盖，且内容质量本身也一般（漏检已解决项、无代码引用）；iOS App fast模式（PR级）→ 举了一个不成立的假阳性例子（watchlist里根本没有裸"US"关键词，2026-07-16已修复的坑24就是同一类问题）；iOS App heavy模式（PR级）→ 质量明显提升，但把PR #43（issue #42）的leaf module架构工作错误地记到PR #46头上；Grok CLI 4.5 Medium（issue级+PR级inline）→ 全部claim逐条验证属实，且PR级review抓到了本人自己漏掉的真实回归。**结论**：不同触发方式/模式下同一个"Grok"品牌的review质量差异巨大，评价他人（或其他LLM）的review时必须逐条对照真实代码/配置验证，不能只看是否"读起来专业"。
+
+Issue #19已关闭（关闭条件B：核心防护done，issue #47单独跟踪残余设计问题）。PR #46已squash merge（`89c68f6`）。
+
 ## 当前系统状态（2026-07-17）
 
 **本仓库存在多 agent session 并发工作（2026-07-17 发现）**：观察到至少两个 agent session 各自开了 feature branch + PR 在并行工作——`fix/apify-reddit-36-37`（PR #39，修复 issue #36/#37）和 `agent/parallel-budget-controls`（PR #40，issue #7 Parallel.ai 预算控制）。**任何新 session 涉及 git 操作前，先 `git branch --show-current` 确认当前分支、`gh pr list --state open` 确认是否已有别的 session 开着 PR，不要默认自己是仓库里唯一的改动来源**，完整原则见全局 `~/.claude/CLAUDE.md`"多 Agent/多分支并发协作仓库操作原则"一节。已有 PR 的工作只汇报不擅自 push/merge。
@@ -552,6 +564,7 @@ _Tavily: N/10_
 78. Sonar 宏观快照过时/幻觉信息（曾报WTI>$100，实际$68.58），未限定检索时间窗+未锚定实时价格 → 详见 `docs/PITFALLS.md#78`
 79. getUpdates 同步重试是多余复杂度，轮询循环本身节奏已是现成的重试机制 → 详见 `docs/PITFALLS.md#79`
 80. `call_llm()` 把 429 限流当不可重试的 4xx，Pass 1 直接放弃生成空报告 → 详见 `docs/PITFALLS.md#80`
+81. 跨源印证指纹复用"打分用宽松关键词表"导致假阳性（同ticker/同拆分词但不同事件误判为已印证）→ 详见 `docs/PITFALLS.md#81`
 
 ---
 
