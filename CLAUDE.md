@@ -19,6 +19,12 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-19）
+
+**巡检误报修复：新增 `write_heartbeat()` 心跳文件，取代巡检脚本对 launchd exit code + Obsidian header 的反推判断**。背景：外部巡检系统对 07-18（周六）的 finance am/pm 报了 WARN——launchd exit=0 但 Obsidian 无对应 header。根因排查：07-18 是非交易日，`run_finance.py` 第一步 NYSE 交易日检查后本就会 `exit 0` 不产出报告，这是设计内行为；即使是交易日，第7步"无异动+无地缘触发"同样会静默 `exit 0`。巡检脚本靠"launchd是否成功退出"+"Obsidian有无header"两个信号反推业务状态，这个反推链条本身就是错的——用户明确否决了"让巡检脚本内置NYSE交易日历做判断"的方案（业务逻辑判断权不该下放给巡检系统）。
+
+修复改为职责分离：`run_finance.py` 新增 `write_heartbeat(slot, outcome, date_str)`（原子写入 `~/Daily_Intelligence/last_run_status.json`，已入 `.gitignore`），覆盖 `_main_body()` 全部退出路径——`skipped_non_trading_day`/`skipped_duplicate`/`skipped_lock_held`/`skipped_no_signal`/`error`/`report_sent`，以及 `__main__` 顶层异常兜底。巡检系统改为只读这个文件的 `timestamp`+`outcome`，新鲜度够即判定正常（不关心 outcome 具体是什么），文件未按预期时间窗更新才是真正异常（进程没跑起来/卡死）。已用真实周日运行验证（`is_nyse_trading_day()` 返回 `False`，心跳正确写入 `outcome: skipped_non_trading_day`）。巡检脚本本身的改动待后续在巡检项目侧完成（不属于本项目范围）。
+
 ## 当前系统状态（2026-07-18）
 
 **Issue #10 十日复盘 + PR #44：AM预判校准闭环的测量基础设施升级**。距 07-02 上线已运行10个交易日（07-06~07-17），首次做量化复盘：39条可验证信号，总体命中率34.4%（11 hit/21 miss/7 inconclusive），前后两段（07-06~07-10 vs 07-13~07-17）命中率从23.5%升至46.7%、inconclusive率从26%降到6%，且行为转折时间点与07-13当天写入的教训（"避免依赖事后确认的事件"）精确对齐——方向符合"自回归优化在起作用"的假设，但样本量太小（各段15-17条）+ 存在混淆变量（07-13恰好赶上美联储证词+ASML财报两个真实日历事件），不足以下"验证生效"的结论，只能算阳性信号。完整数据见 issue #10 评论。

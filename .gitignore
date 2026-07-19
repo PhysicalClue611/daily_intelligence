@@ -18,6 +18,7 @@ finance_parallel_budget.json
 sas_tracked_tickers.json
 sas_review.lock
 finance_calibration_log.jsonl
+last_run_status.json
 
 # IBKR gateway — not distributed (broker-specific, contains platform binaries)
 ibkr/
