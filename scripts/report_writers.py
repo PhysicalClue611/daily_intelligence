@@ -154,10 +154,18 @@ def write_extract_archive(
     all_search_jobs: list,
     filtered: list,
     extract_results: list,
+    extra_keywords: list | None = None,
 ) -> None:
     """Write cleaned Tavily Extract full text to local archive outside Obsidian.
     Never mined by MemPalace. Preserves original intelligence for audit/mid-term review.
     Cleaning: lines < 60 chars stripped (nav/ads/links). Fail-open.
+    `extra_keywords` is build_keyword_set()'s output, threaded into the same
+    corroboration fingerprint used by format_extract_results() so both draw on the
+    same keyword vocabulary (issue #19 follow-up). Note this does NOT mean the two
+    always report identical corroboration counts for the same URL: this function is
+    called with the Layer 2b `filtered` pool (top 10, post-Haiku) while
+    format_extract_results() is called with the wider `prescreened` pool (top 15,
+    pre-Haiku) — pre-existing split, not something this parameter changes.
     """
     if not extract_results and not filtered:
         return
@@ -198,7 +206,7 @@ def write_extract_archive(
                 raw = r.get("raw_content", "")
                 full_text = " ".join((c.get("content") or "") for c in chunks) or raw
                 lines.append(f"\n### {url}")
-                lines.append(f"[{_source_confidence_tags(url, full_text, filtered)}]\n")
+                lines.append(f"[{_source_confidence_tags(url, full_text, filtered, extra_keywords)}]\n")
                 if chunks:
                     for chunk in chunks:
                         text = chunk.get("content") or ""
