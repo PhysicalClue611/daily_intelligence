@@ -1506,7 +1506,13 @@ def _main_body():
             ).strip()
             extract_results = tavily_extract(extract_urls, extract_q, budget)
 
-        corroboration_keywords = build_keyword_set(anomaly_ticker_syms, wl["geo_keywords"])
+        # split_phrases=False (scoring_utils.py): corroboration needs a narrower
+        # keyword set than score_and_filter's ranking bonus — a single generic
+        # split word ("east" from "Middle East") or shared ticker alone isn't
+        # evidence of independent confirmation (verified false-positive, PR #46
+        # review); literal curated keywords are still enough to fix the original
+        # 2026-07-17 miss.
+        corroboration_keywords = build_keyword_set([], wl["geo_keywords"], split_phrases=False)
         if extract_results:
             tavily_section = format_extract_results(
                 extract_results, candidates=prescreened, extra_keywords=corroboration_keywords

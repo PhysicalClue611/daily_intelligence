@@ -160,8 +160,12 @@ def write_extract_archive(
     Never mined by MemPalace. Preserves original intelligence for audit/mid-term review.
     Cleaning: lines < 60 chars stripped (nav/ads/links). Fail-open.
     `extra_keywords` is build_keyword_set()'s output, threaded into the same
-    corroboration fingerprint used by format_extract_results() so the archive and
-    the LLM-facing tags agree (issue #19 follow-up).
+    corroboration fingerprint used by format_extract_results() so both draw on the
+    same keyword vocabulary (issue #19 follow-up). Note this does NOT mean the two
+    always report identical corroboration counts for the same URL: this function is
+    called with the Layer 2b `filtered` pool (top 10, post-Haiku) while
+    format_extract_results() is called with the wider `prescreened` pool (top 15,
+    pre-Haiku) — pre-existing split, not something this parameter changes.
     """
     if not extract_results and not filtered:
         return

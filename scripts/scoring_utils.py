@@ -92,24 +92,40 @@ _STRONG_TOKEN_RE = re.compile(r"\b\d{1,3}(?:\.\d+)?%|\$\d[\d,\.]*|\b\d{4}\b")
 _WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
 
 
-def build_keyword_set(anomaly_tickers: list[str], geo_keywords: dict[str, list[str]]) -> list[str]:
-    """Lowercased anomaly-ticker + geo-keyword anchor list, shared by score_and_filter
-    (title-dedup/scoring keyword bonus) and _extract_key_phrases (corroboration
-    fingerprint, issue #19 follow-up). `geo_keywords` takes the curated topic→keyword
-    dict from watchlist.md, not bare topic labels — splitting a label like "US-Iran"
-    into ["us","iran"] both misses real synonym anchors and introduces short-token
-    false positives ("us" matching inside "focus"). A multi-word curated keyword
-    ("Strait of Hormuz") also gets its significant individual words anchored
-    separately — real headlines often say just "Hormuz" alone (confirmed missed in
-    the 2026-07-15 PM production run)."""
-    keywords = [t.strip().lower() for t in anomaly_tickers if t and t.strip()]
+def build_keyword_set(
+    anomaly_tickers: list[str],
+    geo_keywords: dict[str, list[str]],
+    split_phrases: bool = True,
+) -> list[str]:
+    """Lowercased anomaly-ticker + geo-keyword anchor list. `geo_keywords` takes the
+    curated topic→keyword dict from watchlist.md, not bare topic labels — splitting
+    a label like "US-Iran" into ["us","iran"] both misses real synonym anchors and
+    introduces short-token false positives ("us" matching inside "focus").
+
+    `split_phrases=True` (default; used by score_and_filter for title-dedup/scoring
+    keyword bonus) also anchors a multi-word curated keyword's ("Strait of Hormuz")
+    significant individual words — real headlines often say just "Hormuz" alone
+    (confirmed missed in the 2026-07-15 PM production run) — and includes anomaly
+    tickers. This is fine for a soft +0.05 ranking bonus, but too permissive for
+    _compute_corroboration's "independently confirmed" claim: a single split word
+    ("east"/"middle" from "Middle East", "white"/"house" from "White House") or a
+    shared ticker alone is not evidence two sources cover the same event — verified
+    two *unrelated* stories sharing only "east", or two *unrelated* same-ticker
+    stories, both registered false corroboration under the permissive set (PR #46
+    review). `split_phrases=False` (used for the corroboration fingerprint, issue
+    #19 follow-up) keeps only the literal curated keyword values — still enough to
+    fix the original 2026-07-17 miss (rescued via the literal keyword "iran", not
+    a derived split word) — and drops anomaly tickers entirely."""
+    keywords: list[str] = []
+    if split_phrases:
+        keywords.extend(t.strip().lower() for t in anomaly_tickers if t and t.strip())
     for kws in geo_keywords.values():
         for kw in kws:
             kw = kw.strip().lower()
             if not kw:
                 continue
             keywords.append(kw)
-            if " " in kw:
+            if split_phrases and " " in kw:
                 keywords += [w for w in kw.split() if len(w) > 3 and w not in _DEDUP_STOPWORDS]
     return list(set(keywords))
 
@@ -121,13 +137,17 @@ def _extract_key_phrases(text: str, extra_keywords: list[str] | None = None) -> 
     here means 'no rule-based match found', not proof a claim is uncorroborated.
 
     `_PHRASE_RE` requires 2+ Title-Case words, so it structurally cannot match
-    single-token entities ("Hormuz") or all-caps ones ("US") — confirmed as a
-    real false-negative source in the 2026-07-17 PM archive (a CNBC piece was
-    tagged single-source despite NYPost/World Oil/MarineLink/Bloomberg covering
-    the same Iran/Hormuz story in the same batch). `extra_keywords` (pass
-    build_keyword_set()'s output) plugs that gap with word-boundary matches
-    against the caller's own tracked ticker/geo vocabulary — same anchoring
-    approach score_and_filter already uses for title-dedup."""
+    single-token entities ("Hormuz") or all-caps ones — confirmed as a real
+    false-negative source in the 2026-07-17 PM archive (a CNBC piece was tagged
+    single-source despite NYPost/World Oil/MarineLink/Bloomberg covering the same
+    Iran/Hormuz story in the same batch; the rescue there was via the literal
+    curated keyword "iran", not a derived split word). `extra_keywords` (pass
+    build_keyword_set(..., split_phrases=False)'s output — see that function's
+    docstring for why the corroboration path needs a narrower set than scoring)
+    plugs the gap with word-boundary matches, but only for whatever tokens are
+    actually present in the caller's curated keyword vocabulary — an all-caps
+    entity like "US" is only rescued if "US"/"us" is itself a configured
+    watchlist keyword, which it currently isn't."""
     if not text:
         return set()
     phrases = set(_PHRASE_RE.findall(text))
