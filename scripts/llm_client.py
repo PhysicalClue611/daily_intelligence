@@ -21,10 +21,16 @@ explicitly or were updated to.
 import json
 import logging
 import os
-import re
+import sys
 import time
 
 import httpx
+
+# Cross-repo: canonical LLM-JSON-parsing helper lives in ~/Homepage (host-only
+# path). See CLAUDE.md "JSON 解析健壮性" note for why this isn't duplicated
+# locally; scripts/sas_review.py uses the same import pattern.
+sys.path.insert(0, os.path.join(os.path.expanduser("~"), "Homepage"))
+from llm_json_utils import parse_llm_json
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +94,15 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
 
             msg = data["choices"][0]["message"]
             content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
-            json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-            json_str = json_match.group(1) if json_match else content.strip()
-            json_str = re.sub(r'^[^{]*', '', json_str)
-            json_str = re.sub(r'[^}]*$', '', json_str)
-            result = json.loads(json_str)
+            result = parse_llm_json(content, logger=logger)
+            if not isinstance(result, dict):
+                # A malformed outer object whose only cleanly-parsing substring is a
+                # nested array (e.g. tavily_queries) makes parse_llm_json return that
+                # array instead of the dict — treat as unparseable JSON, same as a
+                # JSONDecodeError, so it's retried rather than crashing on result[...].
+                raise json.JSONDecodeError(
+                    f"parse_llm_json returned {type(result).__name__}, expected dict",
+                    content, 0)
             result["_llm_meta"] = {
                 "model": model,
                 "provider": data.get("provider", "n/a"),
@@ -150,11 +160,11 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                     f"provider={data.get('provider', 'n/a')}")
         msg = data["choices"][0]["message"]
         content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
-        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-        json_str = json_match.group(1) if json_match else content.strip()
-        json_str = re.sub(r'^[^{]*', '', json_str)
-        json_str = re.sub(r'[^}]*$', '', json_str)
-        result = json.loads(json_str)
+        result = parse_llm_json(content, logger=logger)
+        if not isinstance(result, dict):
+            raise json.JSONDecodeError(
+                f"parse_llm_json returned {type(result).__name__}, expected dict",
+                content, 0)
         logger.info(f"OR flex fallback succeeded: {fallback_model}")
         result["_llm_meta"] = {
             "model": fallback_model,

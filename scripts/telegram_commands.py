@@ -39,6 +39,12 @@ _HOME = os.path.expanduser("~")
 _DI_ENV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 load_dotenv(_DI_ENV)
 
+# Cross-repo: canonical LLM-JSON-parsing helper lives in ~/Homepage (host-only
+# path). See CLAUDE.md "JSON 解析健壮性" note for why this isn't duplicated
+# locally; scripts/sas_review.py uses the same import pattern.
+sys.path.insert(0, os.path.join(_HOME, "Homepage"))
+from llm_json_utils import parse_llm_json
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -610,9 +616,14 @@ followup类必填（action == followup）：
             "temperature": 0,
         }, timeout=20)
         msg = resp.json()["choices"][0]["message"]
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "",
-                     (msg.get("content") or msg.get("reasoning_content") or "").strip()).strip()
-        result = json.loads(raw)
+        result = parse_llm_json(msg.get("content") or msg.get("reasoning_content") or "", logger=logger)
+        if not isinstance(result, dict):
+            # A malformed outer object whose only cleanly-parsing substring is a
+            # nested array (e.g. search_queries) makes parse_llm_json return that
+            # array instead of the dict — run() does cmd["_raw_text"] = text right
+            # after this call, which would raise TypeError on a list and crash the
+            # whole polling loop. Treat it as a failed preprocess instead.
+            raise ValueError(f"parse_llm_json returned {type(result).__name__}, expected dict")
         logger.info(f"Unified preprocess: {result}")
         return result
     except Exception as e:
