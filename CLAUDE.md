@@ -19,6 +19,10 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-20）
+
+**移除 2026-07-19 心跳文件机制（`write_heartbeat()`）**。背景：07-19 为修复外部巡检系统对非交易日/无信号跳过的误报，给 `run_finance.py` 加了 `write_heartbeat()`（原子写入 `last_run_status.json`，覆盖全部退出路径），并把巡检侧改用读取该文件的判据需求转交给巡检脚本维护 session。用户随后直接在巡检脚本里去除了对本项目的巡检——本项目不再被外部巡检监控，`write_heartbeat()` 及其全部调用点因此失去唯一消费方，属于死代码，移除。`HEARTBEAT_PATH`/`last_run_status.json` 的 `.gitignore` 条目同步移除。GitHub issue #48（心跳机制的设计与验证记录）已关闭，本次移除未新开 issue（纯粹的死代码清理，无需追踪）。**保留的历史价值**：本节上方"2026-07-19"条目完整记录了当时的根因排查（非交易日/无异动跳过是设计内行为、巡检不该内置NYSE交易日历、职责分离原则）——这套排查结论本身仍然成立，只是巡检监控范围的决策变了，不代表当时的分析有误，故不删除旧条目。
+
 ## 当前系统状态（2026-07-19 晚，issue #49 / PR #50）
 
 **`llm_client.py`/`telegram_commands.py` 迁移至 `llm_json_utils.parse_llm_json()`**。此前 `sas_review.py` 已用这个跨项目 canonical JSON 提取/修复工具（`~/Homepage/llm_json_utils.py`，issue #15/PR #22 重写），但 `llm_client.py::call_llm()`（主调用+OR flex fallback 两处）和 `telegram_commands.py::_unified_preprocess()` 仍是重写前的手写正则（fence 剥离 + 掐头去尾找花括号），后者结尾散文带花括号时会截断错位——这正是 `llm_json_utils.py` 重写要修的那个 bug，在这两处原样复现。改为统一 `sys.path.insert(0, "~/Homepage")` + `from llm_json_utils import parse_llm_json`，与 `sas_review.py` 同一引入模式。已用真实"结尾散文带花括号"/"fence 内未转义引号需 repair"两个场景验证解析结果正确（旧正则会错位）。

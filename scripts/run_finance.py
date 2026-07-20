@@ -259,32 +259,6 @@ def is_nyse_trading_day() -> bool:
         return datetime.now().weekday() < 5  # Mon–Fri
 
 
-# ── Heartbeat (external healthcheck reads this, never infers from launchd
-# exit code + Obsidian header presence — this file is the single authority
-# on whether a run's outcome was intentional-skip vs error) ─────────────────
-
-HEARTBEAT_PATH = _PROJ_DIR / "last_run_status.json"
-
-
-def write_heartbeat(slot: str, outcome: str, date_str: str = "") -> None:
-    """Atomic write (temp file + os.replace) — see budget_trackers.py save_budget()
-    docstring for why. Fail-open: heartbeat write must never crash the run it's
-    reporting on. Call at every exit path in _main_body(), including early returns."""
-    try:
-        now_et = datetime.now(ET)
-        payload = {
-            "timestamp": now_et.isoformat(),
-            "date": date_str or now_et.strftime("%Y-%m-%d"),
-            "slot": slot,
-            "outcome": outcome,
-        }
-        tmp_path = HEARTBEAT_PATH.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-        os.replace(tmp_path, HEARTBEAT_PATH)
-    except Exception:
-        logger.exception("Failed to write heartbeat (non-fatal)")
-
-
 def serpapi_search(query: str, budget: dict) -> list[dict]:
     if not SERPAPI_API_KEY:
         return []
@@ -1156,9 +1130,6 @@ def _acquire_lock():
     except IOError:
         fd.close()
         logger.info("Another run_finance instance is already running (lock held), exiting")
-        _now_et = datetime.now(ET)
-        _prelim_slot = os.getenv("FINANCE_FORCE_SLOT", "") or ("pm" if _now_et.hour >= 18 else "am")
-        write_heartbeat(_prelim_slot, "skipped_lock_held", _now_et.strftime("%Y-%m-%d"))
         sys.exit(0)
 
 
@@ -1227,9 +1198,6 @@ def _main_body():
     # 1. Trading day check (skip if force_date or force_run is set)
     if not force_date and not force_run and not is_nyse_trading_day():
         logger.info("Non-trading day, exiting")
-        _now_et = datetime.now(ET)
-        _prelim_slot = force_slot if force_slot in ("am", "pm") else ("pm" if _now_et.hour >= 18 else "am")
-        write_heartbeat(_prelim_slot, "skipped_non_trading_day", _now_et.strftime("%Y-%m-%d"))
         sys.exit(0)
 
     if force_date:
@@ -1252,14 +1220,12 @@ def _main_body():
     # 1b. Duplicate guard — check monthly file for this slot's section header
     if _monthly_dedup(today_et, slot_label) and not force_run:
         logger.info(f"Report already exists for {today_et} {slot_label}, exiting")
-        write_heartbeat(run_slot, "skipped_duplicate", today_et)
         sys.exit(0)
 
     # 2. Load watchlist
     wl = load_watchlist()
     if not wl["recipients"]:
         logger.error("No recipients in watchlist.md, aborting")
-        write_heartbeat(run_slot, "error", today_et)
         sys.exit(1)
 
     # 3. Load Tavily budget
@@ -1321,7 +1287,6 @@ def _main_body():
 
     if not has_anomaly and not triggered_geo_topics:
         logger.info("No price anomalies, no geo/macro RSS hits — skipping")
-        write_heartbeat(run_slot, "skipped_no_signal", today_et)
         sys.exit(0)
 
     # 6. Fetch personal knowledge base context (fail-open)
@@ -1599,7 +1564,6 @@ def _main_body():
             f"[!] Daily_Intel {today_et} {slot_label} 生成失败：Pass 1/Pass 2 均未返回有效 report_md，"
             f"本次报告未发送。详见 /tmp/daily_intelligence.log"
         )
-        write_heartbeat(run_slot, "error", today_et)
         sys.exit(0)
 
     # Fix report title for PM slot (LLM always writes 开盘前简报 regardless of slot)
@@ -1654,7 +1618,6 @@ def _main_body():
     )
     send_telegram_report(status_md, "")
 
-    write_heartbeat(run_slot, "report_sent", today_et)
     logger.info(f"=== Done. Tavily used today: {budget['used']}/{TAVILY_DAILY_LIMIT} ===")
 
 
@@ -1668,7 +1631,4 @@ if __name__ == "__main__":
         send_telegram_alert(
             f"[!] Daily_Intel 运行崩溃：{type(e).__name__}: {e}\n详见 /tmp/daily_intelligence.log"
         )
-        _now_et = datetime.now(ET)
-        _fallback_slot = os.getenv("FINANCE_FORCE_SLOT", "") or ("pm" if _now_et.hour >= 18 else "am")
-        write_heartbeat(_fallback_slot, "error", _now_et.strftime("%Y-%m-%d"))
         sys.exit(1)
