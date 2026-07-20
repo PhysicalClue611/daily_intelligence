@@ -19,6 +19,12 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-19 晚，issue #49 / PR #50）
+
+**`llm_client.py`/`telegram_commands.py` 迁移至 `llm_json_utils.parse_llm_json()`**。此前 `sas_review.py` 已用这个跨项目 canonical JSON 提取/修复工具（`~/Homepage/llm_json_utils.py`，issue #15/PR #22 重写），但 `llm_client.py::call_llm()`（主调用+OR flex fallback 两处）和 `telegram_commands.py::_unified_preprocess()` 仍是重写前的手写正则（fence 剥离 + 掐头去尾找花括号），后者结尾散文带花括号时会截断错位——这正是 `llm_json_utils.py` 重写要修的那个 bug，在这两处原样复现。改为统一 `sys.path.insert(0, "~/Homepage")` + `from llm_json_utils import parse_llm_json`，与 `sas_review.py` 同一引入模式。已用真实"结尾散文带花括号"/"fence 内未转义引号需 repair"两个场景验证解析结果正确（旧正则会错位）。
+
+**PR review 抓到一个真实 P1（同日追加修复）**：`parse_llm_json()` 文档明确声明返回类型是 `Any` 而非 `dict`——当外层 JSON 对象本身损坏（如未转义引号），但对象内部某个数组字段（`search_queries`/`tavily_queries`）单独能完整解析时，"挑最长的可解析候选"这条启发式会直接返回那个数组而不是修复外层对象。两处消费方都默认拿到的是 dict：`call_llm()` 做 `result["_llm_meta"] = {...}` 会 `TypeError`，被外层兜底的 `except Exception: return {}` 悄悄吞掉（不重试，静默丢弃一个"看起来有效"的响应）；`_unified_preprocess()` 的调用方 `run()` 紧接着做 `cmd["_raw_text"] = text`，同样 `TypeError`，但这里没有任何 try/except 包裹，会直接崩掉整个 Telegram 长轮询循环（KeepAlive 会重启，但同样畸形的响应会反复触发崩溃循环）。修复：两处均加 `isinstance(result, dict)` 判空——`call_llm()` 里改为 `raise json.JSONDecodeError(...)`，复用既有的"当作解析失败重试"路径；`_unified_preprocess()` 里改为 `raise ValueError(...)`，落进既有的 `except Exception -> {"action": "unknown"}` 兜底。已用构造出的真实触发字符串（未转义引号在前、结构完好的数组在后）复现问题并验证修复后两处均优雅降级、不崩溃。`telegram_commands.py` 改动触发已知踩坑（坑32），已重启 `com.daily-intel.finance.telegram` 并确认日志显示 `Finance Telegram bot started`。squash-merge 至 `main`（`10e1963`），远程分支已删除，issue #49 随 merge 自动关闭。
+
 ## 当前系统状态（2026-07-19）
 
 **巡检误报修复：新增 `write_heartbeat()` 心跳文件，取代巡检脚本对 launchd exit code + Obsidian header 的反推判断**。背景：外部巡检系统对 07-18（周六）的 finance am/pm 报了 WARN——launchd exit=0 但 Obsidian 无对应 header。根因排查：07-18 是非交易日，`run_finance.py` 第一步 NYSE 交易日检查后本就会 `exit 0` 不产出报告，这是设计内行为；即使是交易日，第7步"无异动+无地缘触发"同样会静默 `exit 0`。巡检脚本靠"launchd是否成功退出"+"Obsidian有无header"两个信号反推业务状态，这个反推链条本身就是错的——用户明确否决了"让巡检脚本内置NYSE交易日历做判断"的方案（业务逻辑判断权不该下放给巡检系统）。
@@ -571,6 +577,7 @@ _Tavily: N/10_
 79. getUpdates 同步重试是多余复杂度，轮询循环本身节奏已是现成的重试机制 → 详见 `docs/PITFALLS.md#79`
 80. `call_llm()` 把 429 限流当不可重试的 4xx，Pass 1 直接放弃生成空报告 → 详见 `docs/PITFALLS.md#80`
 81. 跨源印证指纹复用"打分用宽松关键词表"导致假阳性（同ticker/同拆分词但不同事件误判为已印证）→ 详见 `docs/PITFALLS.md#81`
+82. `parse_llm_json()` 可能返回非dict（外层对象损坏但内部数组能独立解析），消费方未判空导致静默丢弃/daemon崩溃 → 详见 `docs/PITFALLS.md#82`
 
 ---
 

@@ -273,6 +273,16 @@ bot 是 `KeepAlive` 常驻进程，改完 `telegram_commands.py` 必须 `launchc
 
 **修复**：`build_keyword_set()` 新增 `split_phrases` 参数（默认 `True`，`score_and_filter` 用途不变）；跨源印证路径改用 `split_phrases=False`，只保留 watchlist.md 里字面配置的关键词（不拆分多词短语、不含 anomaly ticker），验证原始 07-17 CNBC 漏检案例修复效果不受影响（印证数仍为 4），两个新发现的假阳性场景均归零。
 
+### 82. `parse_llm_json()` 可能返回非 dict，消费方未判空（issue #49/PR #50 review）
+
+（2026-07-19 发现修复，PR #50）`llm_client.py::call_llm()` 和 `telegram_commands.py::_unified_preprocess()` 迁移到共享的 `~/Homepage/llm_json_utils.py::parse_llm_json()` 后，PR review 指出该函数文档明确声明返回类型是 `Any` 而非 `dict`——外层 JSON 对象本身损坏（如未转义引号）但对象内部某个数组字段（如 `search_queries`）单独能完整解析时，`_find_balanced_json()` "挑最长可解析候选"的启发式会直接返回那个数组，而不是尝试修复外层对象。
+
+**影响**：两处消费方都默认拿到 dict。`call_llm()` 做 `result["_llm_meta"] = {...}` 触发 `TypeError`，被外层兜底的 `except Exception: return {}` 悄悄吞掉——不重试，静默丢弃一个"看起来有效"的响应；`_unified_preprocess()` 的调用方 `run()` 紧接着做 `cmd["_raw_text"] = text`，同样 `TypeError`，但这里没有 try/except 包裹，直接崩掉整个 Telegram 长轮询循环（KeepAlive 会重启，但同样畸形的响应会反复触发崩溃循环）。
+
+**修复**：两处均加 `isinstance(result, dict)` 判空——`call_llm()` 里改为 `raise json.JSONDecodeError(...)`，复用既有的"解析失败→重试→OR flex fallback"路径；`_unified_preprocess()` 里改为 `raise ValueError(...)`，落进既有的 `except Exception -> {"action": "unknown"}` 兜底。已用构造出的真实触发字符串（未转义引号在前、结构完好的数组在后）复现问题并验证修复后两处均优雅降级、不崩溃。
+
+**教训**：复用一个显式声明返回类型为 `Any` 的共享工具函数时，不能想当然假设"平时都是 dict 所以一直是 dict"——必须在消费方加类型判空，尤其是该函数本身设计目标就是兜底处理畸形输入的场景。
+
 **举一反三**：一份"关键词/实体锚定表"被两个精度要求不同的下游消费者共用时，默认应该分开构建（哪怕逻辑重叠 90%），而不是假设"宽松版本对严格场景也够用"——本条与坑 #47（"数据质量>LLM档次"）同属"看似安全的复用，实际隐藏了场景差异"一类。
 
 ---
