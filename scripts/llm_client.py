@@ -95,6 +95,14 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
             msg = data["choices"][0]["message"]
             content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
             result = parse_llm_json(content, logger=logger)
+            if not isinstance(result, dict):
+                # A malformed outer object whose only cleanly-parsing substring is a
+                # nested array (e.g. tavily_queries) makes parse_llm_json return that
+                # array instead of the dict — treat as unparseable JSON, same as a
+                # JSONDecodeError, so it's retried rather than crashing on result[...].
+                raise json.JSONDecodeError(
+                    f"parse_llm_json returned {type(result).__name__}, expected dict",
+                    content, 0)
             result["_llm_meta"] = {
                 "model": model,
                 "provider": data.get("provider", "n/a"),
@@ -153,6 +161,10 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
         msg = data["choices"][0]["message"]
         content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
         result = parse_llm_json(content, logger=logger)
+        if not isinstance(result, dict):
+            raise json.JSONDecodeError(
+                f"parse_llm_json returned {type(result).__name__}, expected dict",
+                content, 0)
         logger.info(f"OR flex fallback succeeded: {fallback_model}")
         result["_llm_meta"] = {
             "model": fallback_model,

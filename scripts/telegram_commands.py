@@ -617,6 +617,13 @@ followup类必填（action == followup）：
         }, timeout=20)
         msg = resp.json()["choices"][0]["message"]
         result = parse_llm_json(msg.get("content") or msg.get("reasoning_content") or "", logger=logger)
+        if not isinstance(result, dict):
+            # A malformed outer object whose only cleanly-parsing substring is a
+            # nested array (e.g. search_queries) makes parse_llm_json return that
+            # array instead of the dict — run() does cmd["_raw_text"] = text right
+            # after this call, which would raise TypeError on a list and crash the
+            # whole polling loop. Treat it as a failed preprocess instead.
+            raise ValueError(f"parse_llm_json returned {type(result).__name__}, expected dict")
         logger.info(f"Unified preprocess: {result}")
         return result
     except Exception as e:
