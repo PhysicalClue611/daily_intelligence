@@ -35,6 +35,9 @@ from dotenv import load_dotenv
 from telegram_utils import call_telegram
 from calibration import format_calibration_metrics_report
 from budget_tracker import save_quota
+from budget_trackers import (
+    load_budget, load_serpapi_budget, TAVILY_DAILY_LIMIT, SERPAPI_MONTHLY_LIMIT,
+)
 
 _HOME = os.path.expanduser("~")
 _DI_ENV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
@@ -71,7 +74,6 @@ DS_OR_PROVIDERS    = {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": Tr
 
 _PROJ_DIR = Path(__file__).parent.parent
 OFFSET_FILE = _PROJ_DIR / "tg_offset.json"
-BUDGET_PATH = _PROJ_DIR / "finance_tavily_budget.json"
 
 _OBSIDIAN_ROOT = os.path.join(
     _HOME,
@@ -82,10 +84,7 @@ WATCHLIST_PATH = OBSIDIAN / "Hermes/Daily Intelligence/watchlist.md"
 REPORTS_DIR = OBSIDIAN / "Hermes/Daily Intelligence/Daily Reports"
 
 ET = ZoneInfo("America/New_York")
-TAVILY_DAILY_LIMIT    = 10
 SERPAPI_API_KEY       = os.getenv("SERPAPI_API_KEY", "")
-SERPAPI_MONTHLY_LIMIT = 250
-SERPAPI_BUDGET_PATH   = _PROJ_DIR / "finance_serpapi_budget.json"
 FINNHUB_API_KEY       = os.getenv("FINNHUB_API_KEY", "")
 FINNHUB_BASE          = "https://finnhub.io/api/v1"
 
@@ -387,20 +386,18 @@ def _build_status() -> str:
     recipients = _get_sec("收件人")
     geo = _get_sec("地缘政治关键词")
 
+    # issue #41: use the real loaders (already fail-open / reset-on-stale-period)
+    # instead of hand-rolled raw json.loads() reads that duplicated the same
+    # reset-check logic a second time, imperfectly.
     budget_used = 0
     try:
-        b = json.loads(BUDGET_PATH.read_text())
-        if b.get("date") == datetime.now(ET).strftime("%Y-%m-%d"):
-            budget_used = b.get("used", 0)
+        budget_used = load_budget().get("used", 0)
     except Exception:
         pass
 
     serpapi_used = 0
     try:
-        ym = datetime.now(ET).strftime("%Y-%m")
-        sb = json.loads(SERPAPI_BUDGET_PATH.read_text()) if SERPAPI_BUDGET_PATH.exists() else {}
-        if sb.get("year_month") == ym:
-            serpapi_used = sb.get("used", 0)
+        serpapi_used = load_serpapi_budget().get("used", 0)
     except Exception:
         pass
 
