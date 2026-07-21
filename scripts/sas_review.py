@@ -266,7 +266,12 @@ def _load_candidate_entries(ticker: str, max_entries: int = 10) -> str:
 
 def _fetch_tavily_context(ticker: str) -> str:
     """One basic Tavily search for broader quarterly context. Shares the same
-    daily budget pool as the AM/PM pipeline (load_budget/save_budget)."""
+    daily budget pool as the AM/PM pipeline (load_budget/save_budget).
+
+    Note: rf.tavily_search() already calls rf.save_budget() internally on
+    success (see run_finance.py), so this function must not call
+    rf.save_budget() again — issue #41 flagged that as a redundant
+    (harmless but pointless) double-save."""
     budget = rf.load_budget()
     if rf.budget_remaining(budget) < 1:
         return ""
@@ -276,7 +281,6 @@ def _fetch_tavily_context(ticker: str) -> str:
             f"{ticker} quarterly earnings review strategy {year}",
             budget, days=100, search_depth="basic", max_results=8,
         )
-        rf.save_budget(budget)
         if not results:
             return ""
         lines = [f"- [{r.get('published_date', '?')}] {r.get('title', '')}: {r.get('content', '')[:300]}"
