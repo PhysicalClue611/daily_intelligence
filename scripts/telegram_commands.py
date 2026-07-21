@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 
 from telegram_utils import call_telegram
 from calibration import format_calibration_metrics_report
+from budget_tracker import save_quota
 
 _HOME = os.path.expanduser("~")
 _DI_ENV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
@@ -184,9 +185,11 @@ def load_parallel_budget() -> dict:
 
 
 def save_parallel_budget(budget: dict) -> None:
-    tmp_path = PARALLEL_BUDGET_PATH.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(budget))
-    os.replace(tmp_path, PARALLEL_BUDGET_PATH)
+    """Atomic write via the shared budget_tracker primitive (issue #41) — the
+    load side stays hand-written (partial-schema setdefault backfill, unlike
+    the other five trackers' reset-to-fresh-dict contract), only the atomic
+    tmp-file + os.replace boilerplate is shared."""
+    save_quota(PARALLEL_BUDGET_PATH, budget)
 
 
 def parallel_remaining_usd(budget: dict) -> float:
