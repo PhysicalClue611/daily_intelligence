@@ -18,6 +18,7 @@ launchd does — Python registers it as "__main__" instead).
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -58,6 +59,29 @@ FINNHUB_BASE    = "https://finnhub.io/api/v1"
 
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 BRAVE_BASE    = "https://api.search.brave.com/res/v1/news/search"
+
+_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
+
+
+def _sanitize_field(value, max_len: int = 80) -> str:
+    """Collapse whitespace/newlines and truncate an untrusted third-party field
+    before it's interpolated into markdown that gets injected straight into the
+    Pass 1/2 prompt (issue #38). Polymarket/Adanos/Apify are unvalidated
+    third-party responses — an embedded newline in a returned value could forge
+    a fake `##` section boundary and mislead the LLM about where a section ends.
+    """
+    return re.sub(r"\s+", " ", str(value)).strip()[:max_len]
+
+
+def _sanitize_ticker(value) -> str | None:
+    """Whitelist a ticker symbol echoed back from an untrusted third-party
+    response (issue #38's echo-back is Apify's Reddit sentiment actor, which
+    returns `ticker` per row rather than us controlling it directly). Returns
+    None — caller should skip the row — if it doesn't look like a real ticker.
+    """
+    v = str(value).strip().upper()
+    return v if _TICKER_RE.match(v) else None
+
 
 def _sonar_macro_brief(
     slot: str,
@@ -226,7 +250,7 @@ def _polymarket_brief(geo_topics: list[str], max_topics: int = 4) -> str:
                 for m in sub_markets[:3]:
                     if m.get("closed"):
                         continue
-                    question = (m.get("question") or m.get("title") or event_title or "").strip()
+                    question = _sanitize_field(m.get("question") or m.get("title") or event_title or "", max_len=120)
                     if not question or question in seen:
                         continue
                     raw_prices = m.get("outcomePrices")
@@ -237,7 +261,7 @@ def _polymarket_brief(geo_topics: list[str], max_topics: int = 4) -> str:
                     except (TypeError, json.JSONDecodeError):
                         prices, outcomes = None, None
                     if prices and outcomes:
-                        pairs = ", ".join(f"{o}:{float(p):.0%}" for o, p in zip(outcomes, prices))
+                        pairs = ", ".join(f"{_sanitize_field(o, 20)}:{float(p):.0%}" for o, p in zip(outcomes, prices))
                         lines.append(f"- [{topic}] {question} → {pairs}")
                         seen.add(question)
                         found_for_topic += 1
@@ -281,7 +305,7 @@ def _adanos_x_sentiment(tickers: list[str], budget: dict) -> str:
             bullish  = data.get("bullish_ratio", data.get("sentiment_score", data.get("sentiment")))
             mentions = data.get("mentions", data.get("mention_count"))
             trend    = data.get("trend", data.get("trend_direction"))
-            parts = [f"{k}={v}" for k, v in
+            parts = [f"{k}={_sanitize_field(v)}" for k, v in
                      [("buzz", buzz), ("bullish", bullish), ("mentions", mentions), ("trend", trend)]
                      if v is not None]
             if parts:
@@ -341,7 +365,7 @@ def _reddit_sentiment_brief(tickers: list[str], budget: dict) -> str:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            ticker = item.get("ticker")
+            ticker = _sanitize_ticker(item.get("ticker"))
             if not ticker:
                 continue
             change = item.get("mention_change_pct")
@@ -353,7 +377,7 @@ def _reddit_sentiment_brief(tickers: list[str], budget: dict) -> str:
                     # Dirty actor field: omit mention_chg only; keep other fields / other tickers
                     # (issue #37 — previously f"{change:+.0f}%" raised and wiped the whole batch).
                     pass
-            parts = [f"{k}={v}" for k, v in
+            parts = [f"{k}={_sanitize_field(v)}" for k, v in
                      [("signal", item.get("sentiment_signal")),
                       ("mentions_24h", item.get("mentions_24h")),
                       ("mention_chg", mention_chg),
