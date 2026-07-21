@@ -19,6 +19,18 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-20 晚，issue #41 / PR #51）
+
+**参数化统一 6 个 budget/quota tracker，issue #41 关闭**。issue #41 的原子写入部分早前已在 `1bb3620` 修完；剩余"6份 load/save/remaining 逻辑重复、未参数化"这半部分本次解决。新增叶子模块 `scripts/quota_store.py`（`load_quota`/`save_quota`/`remaining`），只承载 Tavily/SerpApi/Adanos/Apify/Brave 五个 tracker 真正重复的样板逻辑（读JSON/校验周期键/原子写）；`budget_trackers.py` 五个函数改为委托调用，**公开名字/签名完全不变**，`run_finance.py`/`intel_sources.py`/`sas_review.py` 里的全部调用点零改动。Parallel（`telegram_commands.py`）**刻意不纳入**同一契约——它的 `load` 是 setdefault 部分schema补全（其余5个是整体重置），`remaining` 在无上限时返回 `float("inf")`（其余5个是 `max(0, limit-used)` 的int），且有一套跟其余5个都不同的美元加权双字段+独立通知冷却字段模型；只让 `save_parallel_budget()` 复用共享的原子写入，其余原样保留。设计上明确不参数化"何时计入用量"（Adanos收到任何HTTP响应就计数 vs Apify成功/超时计数+连接失败不计数 vs Brave仅成功计数）和"谁来save"（Brave自己函数内部save vs Adanos/Apify靠调用方save）——这些是已经分化的业务行为，硬塞进通用函数当flag只会制造新bug。
+
+调查过程中额外确认两个真实bug，同一PR一并修复：① `sas_review.py::_fetch_tavily_context()` 对同一个 `budget` dict 做了冗余的二次 `rf.save_budget()`（`rf.tavily_search()` 内部已经存过一次），已删除；② `telegram_commands.py` 硬编码 `TAVILY_DAILY_LIMIT=10`，与 `budget_trackers.py` 实际生效的 `20` 不一致——TG「状态」指令的Tavily用量分母显示错了一段时间，已修正为从 `budget_trackers.py` 导入真实常量。
+
+**PR #51 流程细节值得记录**：另一个 agent session（同一 GitHub 账号 PhysicalClue611）对本 PR 留了一条 **PENDING**（未 submit）review——网页和常规 `gh pr view`/列表 API 都看不到，必须直接调 `gh api .../pulls/{n}/reviews/{id}/comments` 才能读到内容（与此前 PR #46 的经历一致，见 issue #19 状态记录）。该 review 给出 0 bugs / 1 suggestion / 1 nit，均属实：suggestion 指出 `_build_status()` 迁移到新 loader 后外层 `try/except: pass` 已是死代码（loader 本身已 fail-open，外层 except 只会把 loader 内部真 bug 静默吞成 `used=0`），已删除；nit 指出 `budget_tracker.py`（新 primitive，单数）vs `budget_trackers.py`（已有 wrapper，复数）一字之差容易 import 写错，标注"not blocking"但顺手 rename 成 `quota_store.py`。**尝试 inline 回复 review thread 时失败**——GitHub API 报错"user_id can only have one pending review per pull request"：因为本 token 和该 PENDING review 是同一账号，回复会和这条别人未提交的 pending review 冲突，遂改用 PR 顶层 comment 说明修复对应的 commit，没有强行 submit/dismiss 别人的 pending review。
+
+**`/code-review` 无法被 LLM 直接调用**（`disable-model-invocation`），只能用户手动触发——push 前置 hook 拦截时改为手动做等效审查（完整读diff、查未用import、查循环import、逐函数验证行为等价性），未使用 `/code-review` skill 本身。
+
+PR `b636496` 经用户确认后 squash-merge（`b77b3f6a`），删除远程分支，issue #41 关闭。`telegram_commands.py` 改动触发已知踩坑（坑32），已重启 `com.daily-intel.finance.telegram`。
+
 ## 当前系统状态（2026-07-20）
 
 **移除 2026-07-19 心跳文件机制（`write_heartbeat()`）**。背景：07-19 为修复外部巡检系统对非交易日/无信号跳过的误报，给 `run_finance.py` 加了 `write_heartbeat()`（原子写入 `last_run_status.json`，覆盖全部退出路径），并把巡检侧改用读取该文件的判据需求转交给巡检脚本维护 session。用户随后直接在巡检脚本里去除了对本项目的巡检——本项目不再被外部巡检监控，`write_heartbeat()` 及其全部调用点因此失去唯一消费方，属于死代码，移除。`HEARTBEAT_PATH`/`last_run_status.json` 的 `.gitignore` 条目同步移除。GitHub issue #48（心跳机制的设计与验证记录）已关闭，本次移除未新开 issue（纯粹的死代码清理，无需追踪）。**保留的历史价值**：本节上方"2026-07-19"条目完整记录了当时的根因排查（非交易日/无异动跳过是设计内行为、巡检不该内置NYSE交易日历、职责分离原则）——这套排查结论本身仍然成立，只是巡检监控范围的决策变了，不代表当时的分析有误，故不删除旧条目。
@@ -582,6 +594,7 @@ _Tavily: N/10_
 80. `call_llm()` 把 429 限流当不可重试的 4xx，Pass 1 直接放弃生成空报告 → 详见 `docs/PITFALLS.md#80`
 81. 跨源印证指纹复用"打分用宽松关键词表"导致假阳性（同ticker/同拆分词但不同事件误判为已印证）→ 详见 `docs/PITFALLS.md#81`
 82. `parse_llm_json()` 可能返回非dict（外层对象损坏但内部数组能独立解析），消费方未判空导致静默丢弃/daemon崩溃 → 详见 `docs/PITFALLS.md#82`
+83. 回复别人未submit的PENDING GitHub review会422（同账号只能有一个pending review）→ 详见 `docs/PITFALLS.md#83`
 
 ---
 

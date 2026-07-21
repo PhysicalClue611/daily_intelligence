@@ -352,6 +352,9 @@ LLM 始终写「开盘前简报」，需在写文件前 `re.sub` 替换为「夜
 ### 49. 格式硬约束压制 LLM 分析深度
 （2026-05-21 发现）将 V4 Flash 套进"每节1-3句"的5节硬格式，输出反而比无格式约束的 Hermes（同样 V4 Flash）浅很多。根本原因：硬格式迫使模型"填格子"而非自由展开推理。修复：改为参考建议（"分析维度参考，自由展开，不要机械填格子"），V4 Flash 输出深度立即对标 Hermes 水平。
 
+### 83. 回复别人未 submit 的 PENDING GitHub review 会 422（issue #41/PR #51）
+（2026-07-20 发现）另一个 agent session（同一 GitHub 账号）在 PR #51 上留了一条 `PENDING`（未 submit）review——这类 review 网页和常规 `gh pr view`/列表 API 都看不到，得直接调 `gh api repos/{o}/{r}/pulls/{n}/reviews/{id}/comments` 才能读到内容（此前 PR #46 也踩过，见 issue #19 状态记录）。本次新发现：处理完该 review 的 finding 后，尝试用 `POST .../pulls/{n}/comments/{comment_id}/replies` 对每条 inline comment 做 thread 回复，两次调用均返回 422 `"user_id can only have one pending review per pull request"`——因为鉴权 token 和该 PENDING review 是同一账号，GitHub 会把这次回复尝试当成"要在同一 PR 上开第二个 pending review"，与那条别人未提交的 review 冲突。**教训**：多 agent 共用同一 GitHub 账号协作时，如果撞见别人未 submit 的 PENDING review，inline 回复线程大概率会因为"同账号只能有一个 pending review"而失败；退化方案是改用 PR 顶层 issue comment（`POST .../issues/{n}/comments`）说明修复对应的 commit，不强行 submit/dismiss 别人未完成的 review（那是审查者自己的工作状态，不该被其他 session 代为收尾）。
+
 ---
 
 ## 十、凭据与日志卫生
