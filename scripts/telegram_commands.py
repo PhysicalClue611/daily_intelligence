@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 
 from telegram_utils import call_telegram
 from calibration import format_calibration_metrics_report
-from budget_tracker import save_quota
+from quota_store import save_quota
 from budget_trackers import (
     load_budget, load_serpapi_budget, TAVILY_DAILY_LIMIT, SERPAPI_MONTHLY_LIMIT,
 )
@@ -184,7 +184,7 @@ def load_parallel_budget() -> dict:
 
 
 def save_parallel_budget(budget: dict) -> None:
-    """Atomic write via the shared budget_tracker primitive (issue #41) — the
+    """Atomic write via the shared quota_store primitive (issue #41) — the
     load side stays hand-written (partial-schema setdefault backfill, unlike
     the other five trackers' reset-to-fresh-dict contract), only the atomic
     tmp-file + os.replace boilerplate is shared."""
@@ -388,18 +388,12 @@ def _build_status() -> str:
 
     # issue #41: use the real loaders (already fail-open / reset-on-stale-period)
     # instead of hand-rolled raw json.loads() reads that duplicated the same
-    # reset-check logic a second time, imperfectly.
-    budget_used = 0
-    try:
-        budget_used = load_budget().get("used", 0)
-    except Exception:
-        pass
-
-    serpapi_used = 0
-    try:
-        serpapi_used = load_serpapi_budget().get("used", 0)
-    except Exception:
-        pass
+    # reset-check logic a second time, imperfectly. No try/except here — both
+    # loaders already swallow I/O/parse/stale-period errors internally and
+    # return a fresh {"used": 0, ...} dict; wrapping them again would only
+    # catch an actual bug inside the loader and silently mask it as 0.
+    budget_used = load_budget().get("used", 0)
+    serpapi_used = load_serpapi_budget().get("used", 0)
 
     parallel_used = 0.0
     parallel_search_calls = 0
