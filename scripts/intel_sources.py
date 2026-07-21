@@ -61,26 +61,47 @@ BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 BRAVE_BASE    = "https://api.search.brave.com/res/v1/news/search"
 
 _TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _sanitize_field(value, max_len: int = 80) -> str:
-    """Collapse whitespace/newlines and truncate an untrusted third-party field
-    before it's interpolated into markdown that gets injected straight into the
-    Pass 1/2 prompt (issue #38). Polymarket/Adanos/Apify are unvalidated
-    third-party responses — an embedded newline in a returned value could forge
-    a fake `##` section boundary and mislead the LLM about where a section ends.
+    """Collapse whitespace/newlines, strip other control characters, and
+    truncate an untrusted third-party field before it's interpolated into
+    markdown that gets injected straight into the Pass 1/2 prompt (issue #38).
+    Polymarket/Adanos/Apify are unvalidated third-party responses — an
+    embedded newline in a returned value could forge a fake `##` section
+    boundary and mislead the LLM about where a section ends; other control
+    bytes are stripped too since they serve no legitimate purpose in a
+    one-line sentiment field. Input is bounded before the regex passes run,
+    so a pathological multi-MB field doesn't get fully processed pre-cap.
     """
-    return re.sub(r"\s+", " ", str(value)).strip()[:max_len]
+    raw = str(value)[: max_len * 4]
+    collapsed = re.sub(r"\s+", " ", raw).strip()
+    return _CONTROL_CHARS_RE.sub("", collapsed)[:max_len]
 
 
-def _sanitize_ticker(value) -> str | None:
+def _sanitize_ticker(value, allowed: set[str] | None = None) -> str | None:
     """Whitelist a ticker symbol echoed back from an untrusted third-party
     response (issue #38's echo-back is Apify's Reddit sentiment actor, which
     returns `ticker` per row rather than us controlling it directly). Returns
-    None — caller should skip the row — if it doesn't look like a real ticker.
+    None — caller should skip the row — if it doesn't look like a real ticker,
+    or (when `allowed` is given) if it wasn't one of the tickers we actually
+    requested — a well-formed but unsolicited symbol (e.g. an actor echoing
+    back `AAPL` when we only asked about `NVDA`) is still not something we
+    want rendered into the prompt as if we'd asked for it.
+
+    Non-`str` input (None, bool, dict, ...) is rejected before stringifying —
+    `str(None).upper()` is `"NONE"`, which *matches* the ticker shape regex,
+    so validating type first is required, not cosmetic.
     """
-    v = str(value).strip().upper()
-    return v if _TICKER_RE.match(v) else None
+    if not isinstance(value, str):
+        return None
+    v = value.strip().upper()
+    if not _TICKER_RE.match(v):
+        return None
+    if allowed is not None and v not in allowed:
+        return None
+    return v
 
 
 def _sonar_macro_brief(
@@ -261,7 +282,7 @@ def _polymarket_brief(geo_topics: list[str], max_topics: int = 4) -> str:
                     except (TypeError, json.JSONDecodeError):
                         prices, outcomes = None, None
                     if prices and outcomes:
-                        pairs = ", ".join(f"{_sanitize_field(o, 20)}:{float(p):.0%}" for o, p in zip(outcomes, prices))
+                        pairs = ", ".join(f"{_sanitize_field(o, max_len=20)}:{float(p):.0%}" for o, p in zip(outcomes, prices))
                         lines.append(f"- [{topic}] {question} → {pairs}")
                         seen.add(question)
                         found_for_topic += 1
@@ -342,6 +363,7 @@ def _reddit_sentiment_brief(tickers: list[str], budget: dict) -> str:
     if apify_remaining(budget) <= 0:
         logger.info("Apify monthly budget exhausted, skipping Reddit sentiment")
         return ""
+    requested = {t.strip().upper() for t in tickers}
     try:
         resp = httpx.post(
             f"{APIFY_BASE}/acts/{APIFY_REDDIT_ACTOR}/run-sync-get-dataset-items",
@@ -365,7 +387,7 @@ def _reddit_sentiment_brief(tickers: list[str], budget: dict) -> str:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            ticker = _sanitize_ticker(item.get("ticker"))
+            ticker = _sanitize_ticker(item.get("ticker"), allowed=requested)
             if not ticker:
                 continue
             change = item.get("mention_change_pct")
