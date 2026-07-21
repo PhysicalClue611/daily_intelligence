@@ -3,10 +3,17 @@ Daily Intelligence — budget trackers
 =====================================
 Load/save/remaining helpers for every quota- or spend-capped external service
 (Tavily, SerpApi, Adanos, Apify, Brave). Extracted from run_finance.py (issue
-#42, 2026-07-17) to shrink that file; the duplication across these five
-near-identical implementations is tracked separately and NOT resolved here
-(see issue #41 — this file only relocates them, it does not parameterize them
-into one shared function).
+#42, 2026-07-17) to shrink that file. The genuinely duplicated boilerplate
+(read JSON / check reset period key / atomic write) across these five is now
+parameterized into `budget_tracker.py`'s `load_quota`/`save_quota`/`remaining`
+(issue #41) — the functions below are thin per-service wrappers over that
+primitive. What is deliberately NOT folded into the shared primitive: the
+increment amount and the trigger condition for counting a call against the
+quota, which differ per service (Adanos counts on any HTTP response before
+raise_for_status; Apify counts on success and on timeout-after-send but not
+on connect error; Brave counts on success only and self-saves inside its own
+fetch function) — those stay at each call site in run_finance.py/
+intel_sources.py, unchanged.
 
 Leaf module: does not import from run_finance.py, to avoid a circular import
 (run_finance.py imports these names back for its own use and for
@@ -17,6 +24,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+from budget_tracker import load_quota, save_quota, remaining
 
 _PROJ_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
 ET = ZoneInfo("America/New_York")
@@ -34,34 +43,20 @@ BRAVE_MONTHLY_LIMIT    = 800  # conservative under the ~1000-query $5 credit est
 
 # ── Tavily budget ────────────────────────────────────────────────────────────
 
-def _today_et() -> str:
-    return datetime.now(ET).strftime("%Y-%m-%d")
-
-
 def load_budget() -> dict:
-    today = _today_et()
-    if BUDGET_PATH.exists():
-        try:
-            data = json.loads(BUDGET_PATH.read_text())
-            if data.get("date") == today:
-                return data
-        except Exception:
-            pass
-    return {"date": today, "used": 0}
+    return load_quota(BUDGET_PATH, "daily")
 
 
 def save_budget(budget: dict) -> None:
-    """Atomic write (temp file + os.replace) — never open(path,'w')/write_text()
-    directly on this file (global CLAUDE.md 破坏性文件写入安全): a crash or kill
-    mid-write would truncate it, and the next load_budget() would then silently
-    reset the daily quota counter this file exists to enforce. See issue #41."""
-    tmp_path = BUDGET_PATH.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(budget))
-    os.replace(tmp_path, BUDGET_PATH)
+    """Atomic write via the shared budget_tracker primitive — see its
+    save_quota() docstring for why this must never be a direct
+    open(path,'w')/write_text() (global CLAUDE.md 破坏性文件写入安全). See
+    issue #41."""
+    save_quota(BUDGET_PATH, budget)
 
 
 def budget_remaining(budget: dict) -> int:
-    return max(0, TAVILY_DAILY_LIMIT - budget.get("used", 0))
+    return remaining(budget, TAVILY_DAILY_LIMIT)
 
 
 # ── SerpApi monthly budget ────────────────────────────────────────────────────
