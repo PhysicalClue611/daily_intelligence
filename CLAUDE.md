@@ -19,6 +19,16 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-21，issue #38 / PR #52）
+
+**社交舆情字段消毒，issue #38 关闭**。`_polymarket_brief()`/`_adanos_x_sentiment()`/`_reddit_sentiment_brief()`（`scripts/intel_sources.py`）此前把第三方返回字段（Polymarket question/outcome、Adanos buzz/bullish/mentions/trend、Apify ticker/signal/mentions_24h/rank_change）未经消毒直接拼进 markdown 注入 Pass 1/2 prompt——第三方响应里的换行符可伪造出假的 `##` 小节边界，误导 LLM 对 prompt 结构的解读。新增 `_sanitize_field()`（折叠空白+剔除控制字符+长度截断）和 `_sanitize_ticker()`（`^[A-Z]{1,5}$` 白名单 + 可选 `allowed` 参数做请求集合成员校验），三处注入点全部套用；Adanos/Polymarket 的 ticker 本就是调用方自己传入（可信），只有 Apify Reddit 的 `ticker` 是第三方在响应里回传（不可信），因此只有这一处需要白名单校验。
+
+**PR #52 经历两轮真实 review 抓到 1 个真 bug（同账号 PhysicalClue611，判断是 Grok 通过该账号发起，与本项目历史上"Grok via GitHub connector"的协作模式一致）**：`_sanitize_ticker` 先 `str(value)` 再做类型判断——`str(None).upper()` 等于 `"NONE"`，恰好匹配自己写的 `^[A-Z]{1,5}$` 白名单正则，导致 Apify 返回缺失/`null` ticker 的行不再被 `if not ticker: continue` 跳过，反而以 `- NONE: signal=...` 形式渲染进 prompt——这正是修复本身引入的回归，且本人自查时只测试了畸形*字符串*输入（注入换行、超长字符串），从未测试 `None` 这个函数自己文档承诺要拒绝的输入类型。同批修复 3 条 suggestion（ticker 白名单增加请求集合成员校验、`_sanitize_field` 补充控制字符剔除+提前截断防病态大字段、Polymarket 关键字参数风格统一）+ 1 条 nit。第二轮 review 确认前 4 项修复全部生效，仅剩"缺自动化测试"一条 suggestion（非阻断），已追加 `scripts/test_intel_sources_sanitize.py`（无 pytest 依赖的纯函数断言脚本，8/8 通过）一并解决。
+
+**教训**：这次的 bug 不是"复杂逻辑出错"，是"验证覆盖面不够"——写了针对性的对抗性测试（畸形字符串），却漏了函数自己文档里明确写出的另一类输入（`None`/`missing`）。手动等效 code review（因 `/code-review` 无法被模型直接调用）容易系统性偏向"我认为对抗者会怎么攻击"而非"这个函数完整的输入定义域"，后者才是纯函数测试该覆盖的范围。
+
+经用户确认后 squash-merge（`f519cd5`），删除远程分支，issue #38 通过 PR body 的 `Closes #38` 自动关闭（另补发总结评论，因为 `gh issue close --comment` 在 issue 已被自动关闭后会整体失败，评论也不会发出——需要拆成独立的 `gh issue comment` 调用）。
+
 ## 当前系统状态（2026-07-20 晚，issue #41 / PR #51）
 
 **参数化统一 6 个 budget/quota tracker，issue #41 关闭**。issue #41 的原子写入部分早前已在 `1bb3620` 修完；剩余"6份 load/save/remaining 逻辑重复、未参数化"这半部分本次解决。新增叶子模块 `scripts/quota_store.py`（`load_quota`/`save_quota`/`remaining`），只承载 Tavily/SerpApi/Adanos/Apify/Brave 五个 tracker 真正重复的样板逻辑（读JSON/校验周期键/原子写）；`budget_trackers.py` 五个函数改为委托调用，**公开名字/签名完全不变**，`run_finance.py`/`intel_sources.py`/`sas_review.py` 里的全部调用点零改动。Parallel（`telegram_commands.py`）**刻意不纳入**同一契约——它的 `load` 是 setdefault 部分schema补全（其余5个是整体重置），`remaining` 在无上限时返回 `float("inf")`（其余5个是 `max(0, limit-used)` 的int），且有一套跟其余5个都不同的美元加权双字段+独立通知冷却字段模型；只让 `save_parallel_budget()` 复用共享的原子写入，其余原样保留。设计上明确不参数化"何时计入用量"（Adanos收到任何HTTP响应就计数 vs Apify成功/超时计数+连接失败不计数 vs Brave仅成功计数）和"谁来save"（Brave自己函数内部save vs Adanos/Apify靠调用方save）——这些是已经分化的业务行为，硬塞进通用函数当flag只会制造新bug。
@@ -595,6 +605,7 @@ _Tavily: N/10_
 81. 跨源印证指纹复用"打分用宽松关键词表"导致假阳性（同ticker/同拆分词但不同事件误判为已印证）→ 详见 `docs/PITFALLS.md#81`
 82. `parse_llm_json()` 可能返回非dict（外层对象损坏但内部数组能独立解析），消费方未判空导致静默丢弃/daemon崩溃 → 详见 `docs/PITFALLS.md#82`
 83. 回复别人未submit的PENDING GitHub review会422（同账号只能有一个pending review）→ 详见 `docs/PITFALLS.md#83`
+84. 消毒函数"先str()再判断类型"，导致None/bool绕过自己刚建的白名单（str(None).upper()=="NONE"合法匹配ticker正则）→ 详见 `docs/PITFALLS.md#84`
 
 ---
 

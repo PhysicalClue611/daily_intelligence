@@ -355,6 +355,9 @@ LLM 始终写「开盘前简报」，需在写文件前 `re.sub` 替换为「夜
 ### 83. 回复别人未 submit 的 PENDING GitHub review 会 422（issue #41/PR #51）
 （2026-07-20 发现）另一个 agent session（同一 GitHub 账号）在 PR #51 上留了一条 `PENDING`（未 submit）review——这类 review 网页和常规 `gh pr view`/列表 API 都看不到，得直接调 `gh api repos/{o}/{r}/pulls/{n}/reviews/{id}/comments` 才能读到内容（此前 PR #46 也踩过，见 issue #19 状态记录）。本次新发现：处理完该 review 的 finding 后，尝试用 `POST .../pulls/{n}/comments/{comment_id}/replies` 对每条 inline comment 做 thread 回复，两次调用均返回 422 `"user_id can only have one pending review per pull request"`——因为鉴权 token 和该 PENDING review 是同一账号，GitHub 会把这次回复尝试当成"要在同一 PR 上开第二个 pending review"，与那条别人未提交的 review 冲突。**教训**：多 agent 共用同一 GitHub 账号协作时，如果撞见别人未 submit 的 PENDING review，inline 回复线程大概率会因为"同账号只能有一个 pending review"而失败；退化方案是改用 PR 顶层 issue comment（`POST .../issues/{n}/comments`）说明修复对应的 commit，不强行 submit/dismiss 别人未完成的 review（那是审查者自己的工作状态，不该被其他 session 代为收尾）。
 
+### 84. 消毒函数写成"先 str() 再判断类型"，导致 `None`/`bool` 绕过自己刚建的白名单（issue #38/PR #52）
+（2026-07-21 发现修复）修 issue #38（第三方情报字段未消毒即注入 Pass1/2 prompt）时写了 `_sanitize_ticker(value)`：内部先 `str(value).strip().upper()`，再拿去匹配 `^[A-Z]{1,5}$` 白名单正则。`str(None)` 的字面值是 `"None"`，`.upper()` 后变成 `"NONE"`——4 个大写字母，恰好合法匹配自己写的正则。结果是：修复前 `if not ticker: continue` 能正确跳过 Apify 返回缺失/`null` 的 ticker 行；修复后同样的输入被 `_sanitize_ticker` 转换成真值字符串 `"NONE"`，那一行反而被当作合法数据渲染进 prompt——防御性重构本身引入了新的正确性回归，且方向是"更危险"而非"更安全"（未消毒变成了看似消毒实则放行伪造数据）。自查时只对抗性测试了畸形*字符串*输入（注入换行、超长字符串），从未测试 `None`——恰恰是函数自己文档写明要拒绝的输入类型；两轮独立 code review（同账号，判断为 Grok）第一轮就抓到了这个 bug。**教训**：任何"先归一化/强制转换再校验格式"的消毒函数，都要显式检查 `isinstance(value, expected_type)` 放在最前面，不能依赖"改出来的字符串長得不像通过白名单"的运气；针对性对抗测试（想着"攻击者会怎么构造恶意输入"）容易系统性遗漏函数自身类型契约里最朴素的那类输入（`None`/`missing`/错误类型），补齐覆盖面的方法是照函数文档承诺的完整输入定义域逐条测，而不是只测"看起来像攻击"的输入。
+
 ---
 
 ## 十、凭据与日志卫生
