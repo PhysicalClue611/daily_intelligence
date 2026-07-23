@@ -207,7 +207,7 @@ def _sonar_macro_brief(
             {"role": "system", "content": system},
             {"role": "user",   "content": query},
         ],
-        "max_tokens": 800,
+        "max_tokens": 1500,
         "temperature": 0.1,
         "provider": {"order": ["Perplexity"], "allow_fallbacks": False},
         "search_recency_filter": "day",
@@ -223,8 +223,19 @@ def _sonar_macro_brief(
                 timeout=30,
             )
             resp.raise_for_status()
-            brief = resp.json()["choices"][0]["message"]["content"].strip()
-            logger.info(f"Sonar macro brief ({slot_label}): {len(brief)} chars")
+            data = resp.json()
+            choice = data["choices"][0]
+            brief = choice["message"]["content"].strip()
+            usage = data.get("usage", {})
+            finish_reason = choice.get("finish_reason")
+            logger.info(f"Sonar macro brief ({slot_label}): {len(brief)} chars "
+                        f"prompt_tokens={usage.get('prompt_tokens')} "
+                        f"completion_tokens={usage.get('completion_tokens')} "
+                        f"finish_reason={finish_reason} provider={data.get('provider', 'n/a')}")
+            if finish_reason == "length":
+                logger.warning(f"Sonar macro brief ({slot_label}): truncated by max_tokens "
+                                f"(finish_reason=length) — content may be cut off before "
+                                f"staleness disclaimer/timestamp requirements were satisfied")
             return f"\n## Sonar 宏观快照（{slot_label}，实时）\n{brief}\n"
         except Exception as e:
             if attempt == 0:
