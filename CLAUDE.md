@@ -19,6 +19,20 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-23，issue #53 / PR #54）
+
+**语义过滤模型从 deepseek-v4-flash 切换至 google/gemma-4-31b-it，issue #53 关闭**。背景：2026-07-22 生产环境真实崩溃（`_haiku_relevance_filter()` 报 `'NoneType' object has no attribute 'strip'`）——`deepseek-v4-flash` 即使不发 `thinking`/`reasoning` key，在当前 OR 路由下仍会隐式产生 reasoning token，把 `max_tokens=80` 的预算烧在看不见的思考上，导致 `content` 返回 `null`；同批还确认 `DS_OR_PROVIDERS` 的 provider pin（`DigitalOcean`/`Venice`）并未被 OpenRouter 可靠遵守（实际路由到了 Alibaba）。issue #53 用真实付费调用对姊妹项目 LLM-eval 框架（`PC611-homepage`）测出的唯一 100% 通过模型 `google/gemma-4-31b-it` 做验证，两档 `max_tokens`（80/150）均确认 `completion_tokens_details.reasoning_tokens=0`、`finish_reason=stop`，成本反而更低，验证通过。
+
+**PR #54 实现**：`SEMANTIC_FILTER_MODEL` 切换 + 移除不可靠的 provider pin；`_haiku_relevance_filter()` 改名为 `_semantic_relevance_filter()`（原名从未用过 Haiku，issue 最后一条评论指出的命名误导一并解决）；返回值从 `list[dict]` 改为 `(filtered, meta)`，`meta` 携带真实 provider/fallback 信息，`build_status_message()` TG 状态行不再硬编码 `"OR/DigitalOcean"`；`run_finance.py` 模块级 `DS_OR_PROVIDERS` 常量确认全文件无其他引用后一并删除（Pass 1/2 走 `call_llm()`，那边在 `llm_client.py` 有自己独立的一份）。
+
+**PR review 抓到 4 处真实问题（协作者账号 `blacktomb42`，与此前"同账号 PhysicalClue611 发起的 Grok review"是不同的协作模式——本次是仓库的另一个 collaborator 账号，approve 状态下带 4 条 inline review）**，全部verified并修复：① `max_tokens=80` 对 prose/代码块包裹的输出几乎没有余量（本次崩溃的根因就是预算耗尽），提到 200；② 成功响应缺 usage/finish_reason 日志——这正是当初崩溃要靠额外付费调用才能诊断出来的原因，补上 `prompt_tokens`/`completion_tokens`/`reasoning_tokens`/`finish_reason` 日志，并对"`finish_reason=length` 且内容为空"的情况加显式"budget exhausted"告警；③ `sem_filter_meta` 原先用同一个 `{}` 同时表示"从未调用 LLM"（无候选/无 key）和"主备均失败"，导致 TG 状态消息把跳过路径误报成"LLM 主+备均失败"——改为 `{"skipped": "no_results"|"no_api_key"}` vs `{}` 两种语义分离；④ 缺自动化回归测试——新增 `scripts/test_run_finance_semantic_filter.py`（mock `httpx.post` 复现 `content=None`/`finish_reason=length` 的真实故障形态，5/5 通过，无 pytest 依赖，同 `test_intel_sources_sanitize.py` 的模式）。
+
+经用户确认后 squash-merge（`a9cbdca`），删除远程分支，issue #53 通过 PR body 的 `Closes #53` 自动关闭（另补发总结评论）。
+
+**合并流程细节**：merge 首次尝试报 "Head branch is out of date"，但 `gh pr view --json mergeStateStatus` 显示 `CLEAN`——`git ls-remote` 直接查询确认远程分支 ref 其实已经是最新 commit，是 GitHub REST API 的 `pulls/{n}.head.sha` 缓存滞后于实际 git 状态（约 1-2 分钟），并非真实冲突。用 Bash `run_in_background` 跑一个轮询 `head.sha` 匹配后退出的 until 循环等到缓存追上，再重试 merge 成功。
+
+---
+
 ## 当前系统状态（2026-07-21，issue #38 / PR #52）
 
 **社交舆情字段消毒，issue #38 关闭**。`_polymarket_brief()`/`_adanos_x_sentiment()`/`_reddit_sentiment_brief()`（`scripts/intel_sources.py`）此前把第三方返回字段（Polymarket question/outcome、Adanos buzz/bullish/mentions/trend、Apify ticker/signal/mentions_24h/rank_change）未经消毒直接拼进 markdown 注入 Pass 1/2 prompt——第三方响应里的换行符可伪造出假的 `##` 小节边界，误导 LLM 对 prompt 结构的解读。新增 `_sanitize_field()`（折叠空白+剔除控制字符+长度截断）和 `_sanitize_ticker()`（`^[A-Z]{1,5}$` 白名单 + 可选 `allowed` 参数做请求集合成员校验），三处注入点全部套用；Adanos/Polymarket 的 ticker 本就是调用方自己传入（可信），只有 Apify Reddit 的 `ticker` 是第三方在响应里回传（不可信），因此只有这一处需要白名单校验。
@@ -616,6 +630,7 @@ _Tavily: N/10_
 3. **OR flex fallback 首次实战验证**：观察 DeepSeek 再次不可达时日志是否出现 `OR flex fallback succeeded` 且报告正常生成；关注 flex 延迟是否在可接受范围（预期 <30s 单次调用）
 4. **追问流水线多 query 效果验证**：Step 1 新增 `search_queries` 双 query（事件角度 + 量化/技术角度），观察 Parallel.ai 是否能拿到期权 IV、历史财报模式等深层数据；对比单 query 和双 query 的内容质量差异
 5. **watchlist 调整**：根据实际报告质量增减 ticker 或地缘政治主题
+6. **gemma-4-31b-it 生产观察**（issue #53/PR #54，2026-07-23 起）：确认 `/tmp/daily_intelligence.log` 中 `Semantic filter tokens:` 行的 `reasoning=` 字段持续为 0（或至少不再吃满 `max_tokens`），`Semantic filter failed` 不再出现；观察新的 usage/finish_reason 日志是否足以在下次异常时免去外部付费调用排查
 
 ---
 
