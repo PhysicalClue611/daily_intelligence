@@ -132,10 +132,9 @@ OR_BASE_URL         = "https://openrouter.ai/api/v1/chat/completions"
 OR_ATTRIBUTION_HEADERS = {"HTTP-Referer": "https://github.com/PhysicalClue611/daily_intelligence", "X-OpenRouter-Title": "DailyIntel"}
 LLM_MODEL           = "deepseek/deepseek-v4-flash"
 LLM_MODEL_PASS2     = "deepseek/deepseek-v4-pro"
-SEMANTIC_FILTER_MODEL = "deepseek/deepseek-v4-flash"
+SEMANTIC_FILTER_MODEL = "google/gemma-4-31b-it"
 LLM_FALLBACK_FLASH  = "google/gemini-3.1-flash-lite"  # OR flex fallback for v4-flash
 LLM_FALLBACK_PRO    = "google/gemini-3.5-flash"       # OR flex fallback for v4-pro
-DS_OR_PROVIDERS     = {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": True}
 SONAR_MODEL         = "perplexity/sonar"             # Macro brief (real-time search)
 EXA_API_KEY         = os.getenv("EXA_API_KEY", "")
 EXA_BASE_URL        = "https://api.exa.ai/chat/completions"
@@ -493,22 +492,38 @@ def score_and_filter(
     return top
 
 
-def _haiku_relevance_filter(
+def _semantic_relevance_filter(
     results: list[dict],
     anomaly_tickers: list[str],
     geo_topics: list[str],
     portfolio_tickers: list[str] | None = None,
     top_n: int = 10,
-) -> list[dict]:
-    """Semantically rank pre-screened search results using DeepSeek V4 Flash direct.
+) -> tuple[list[dict], dict]:
+    """Semantically rank pre-screened search results using google/gemma-4-31b-it.
 
     Considers upstream/downstream supply chains, sector-wide regulatory impacts,
     and macro drivers — not just direct ticker name mentions.
     Fail-open: returns script-scored top_n on any error.
-    Cost: ~$0.000035 per call (DeepSeek direct, ~22x cheaper than Haiku/Bedrock).
+    Cost: ~$0.0001-0.00014 per call (verified 2026-07-22 against real prompt shape).
+
+    Returns (filtered_results, meta). meta mirrors call_llm()'s _llm_meta shape
+    ({"provider", "fallback", ...}) for status-line reporting via build_status_message().
+    meta is {"skipped": "no_results" | "no_api_key"} when the LLM was never called
+    (nothing to rank / no key configured), and {} only when both primary and
+    OR-flex fallback were actually attempted and both failed — the two cases
+    read very differently in the TG status line and must not be conflated.
+
+    Switched from deepseek-v4-flash 2026-07-22 after a live production crash
+    ('NoneType' object has no attribute 'strip') traced to that model silently
+    burning its max_tokens budget on hidden reasoning tokens despite no
+    thinking/reasoning key being sent. gemma-4-31b-it validated clean
+    (reasoning_tokens=0, finish_reason=stop) against this exact prompt template
+    before switching, not just against a synthetic eval case set — see issue #53.
     """
-    if not results or not OPENROUTER_API_KEY:
-        return results[:top_n]
+    if not results:
+        return results[:top_n], {"skipped": "no_results"}
+    if not OPENROUTER_API_KEY:
+        return results[:top_n], {"skipped": "no_api_key"}
 
     ptickers = ", ".join(portfolio_tickers[:15]) if portfolio_tickers else "INTC NVDA QCOM TSLA AMKR"
     items_text = []
@@ -551,24 +566,35 @@ Return ONLY a JSON array of exactly {top_n} indices (or fewer if less than {top_
             },
             json={
                 "model": SEMANTIC_FILTER_MODEL,
-                "provider": DS_OR_PROVIDERS,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 80,
+                "max_tokens": 200,
                 "temperature": 0,
             },
             timeout=20,
         )
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip()
+        data = resp.json()
+        choice = data["choices"][0]
+        msg = choice["message"]
+        content = (msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+        provider = data.get("provider", "n/a")
+        usage = data.get("usage", {})
+        logger.info(f"Semantic filter tokens: prompt={usage.get('prompt_tokens')} "
+                    f"completion={usage.get('completion_tokens')} "
+                    f"reasoning={usage.get('completion_tokens_details', {}).get('reasoning_tokens')} "
+                    f"finish_reason={choice.get('finish_reason')} provider={provider}")
         m = re.search(r'\[[\d,\s]+\]', content)
         if m:
             indices = json.loads(m.group())
             filtered = [results[i] for i in indices if isinstance(i, int) and 0 <= i < len(results)]
             if filtered:
                 logger.info(f"Semantic filter: {len(results)} → {len(filtered)} results "
-                            f"(supply-chain + semantic ranking, OR/DigitalOcean)")
-                return filtered
-        logger.warning(f"Semantic filter: unexpected output: {content[:80]}")
+                            f"(supply-chain + semantic ranking, OR/{provider})")
+                return filtered, {"provider": provider, "fallback": False}
+        if not content and choice.get("finish_reason") == "length":
+            logger.warning("Semantic filter: budget exhausted before any content (finish_reason=length, empty content)")
+        else:
+            logger.warning(f"Semantic filter: unexpected output: {content[:80]}")
     except Exception as e:
         logger.warning(f"Semantic filter failed ({e}), trying OR flex fallback...")
 
@@ -582,24 +608,32 @@ Return ONLY a JSON array of exactly {top_n} indices (or fewer if less than {top_
                 "model": LLM_FALLBACK_FLASH,
                 "service_tier": "flex",
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 80,
+                "max_tokens": 200,
                 "temperature": 0,
             },
             timeout=60,
         )
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip()
+        data = resp.json()
+        choice = data["choices"][0]
+        msg = choice["message"]
+        content = (msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+        provider = data.get("provider", "n/a")
+        usage = data.get("usage", {})
+        logger.info(f"Semantic filter OR flex tokens: prompt={usage.get('prompt_tokens')} "
+                    f"completion={usage.get('completion_tokens')} "
+                    f"finish_reason={choice.get('finish_reason')} provider={provider}")
         m = re.search(r'\[[\d,\s]+\]', content)
         if m:
             indices = json.loads(m.group())
             filtered = [results[i] for i in indices if isinstance(i, int) and 0 <= i < len(results)]
             if filtered:
                 logger.info(f"Semantic filter OR flex: {len(results)} → {len(filtered)} results")
-                return filtered
+                return filtered, {"provider": provider, "fallback": True, "model": LLM_FALLBACK_FLASH}
     except Exception as e:
         logger.warning(f"Semantic filter OR flex also failed: {e}")
 
-    return results[:top_n]
+    return results[:top_n], {}
 
 
 def format_tavily_results(results: list[dict]) -> str:
@@ -1033,10 +1067,10 @@ def build_status_message(
     tavily_section: str,
     llm_meta_p1: dict,
     llm_meta_p2: dict,
+    sem_filter_meta: dict,
 ) -> str:
     """Build a separate status report (Tavily/SerpApi usage, intel sources, LLM/Provider list)
     sent to TG only — kept out of the email/Obsidian report body."""
-    providers = "/".join(DS_OR_PROVIDERS["order"])
     tavily_used_run = budget["used"] - tavily_used_before
     serpapi_used_run = serpapi_budget["used"] - serpapi_used_before
 
@@ -1086,7 +1120,18 @@ def build_status_message(
     lines += ["", "LLM/Provider:"]
     lines.append(f"- Pass 1（{LLM_MODEL}）: {_fmt_llm_meta(llm_meta_p1)}")
     if raw_results:
-        lines.append(f"- 语义过滤（{SEMANTIC_FILTER_MODEL}）: OR/{providers}")
+        skipped = sem_filter_meta.get("skipped")
+        if skipped == "no_results":
+            sem_line = "跳过（打分后无候选，未调用 LLM）"
+        elif skipped == "no_api_key":
+            sem_line = "跳过（未配置 OPENROUTER_API_KEY）"
+        elif not sem_filter_meta:
+            sem_line = "脚本打分兜底（LLM 主+备均失败，未发送独立告警）"
+        elif sem_filter_meta.get("fallback"):
+            sem_line = f"OR flex fallback → {sem_filter_meta.get('model', '?')} via {sem_filter_meta.get('provider', 'n/a')}"
+        else:
+            sem_line = f"OR/{sem_filter_meta.get('provider', 'n/a')}"
+        lines.append(f"- 语义过滤（{SEMANTIC_FILTER_MODEL}）: {sem_line}")
     if sonar_macro_section:
         lines.append(f"- 宏观快照（{SONAR_MODEL}）: OR")
     if tavily_section:
@@ -1463,6 +1508,7 @@ def _main_body():
     filtered: list[dict] = []        # populated in Layer 2b; needed for archive writer
     extract_results: list[dict] = [] # populated in Layer 3; needed for archive writer
     corroboration_keywords: list[str] = []  # populated below; needed for archive writer
+    sem_filter_meta: dict = {}       # populated in Layer 2b; needed for status message
     for job in all_search_jobs:
         if budget_remaining(budget) < 1:
             logger.info("Tavily budget exhausted, stopping search")
@@ -1486,9 +1532,9 @@ def _main_body():
             top_n=15,
         )
 
-        # Layer 2b — Haiku semantic ranking: supply-chain aware → top 10
+        # Layer 2b — semantic ranking: supply-chain aware → top 10
         # Considers upstream/downstream/macro, not just direct ticker mentions
-        filtered = _haiku_relevance_filter(
+        filtered, sem_filter_meta = _semantic_relevance_filter(
             prescreened,
             anomaly_ticker_syms,
             list(wl["geo_keywords"].keys()),
@@ -1614,7 +1660,7 @@ def _main_body():
         sonar_macro_section, polymarket_section, adanos_section, adanos_budget,
         reddit_section, apify_budget,
         all_search_jobs, raw_results, filtered, extract_results,
-        tavily_section, llm_meta_p1, llm_meta_p2,
+        tavily_section, llm_meta_p1, llm_meta_p2, sem_filter_meta,
     )
     send_telegram_report(status_md, "")
 
