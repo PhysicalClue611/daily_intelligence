@@ -32,6 +32,20 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-23 晚，issue #55，留观中）
+
+**Sonar 可观测性补齐 + BYOK 修正 issue #53 因果表述**。用户回看当天 AM 报告真实日志和 OR 活动面板带出两个独立问题，直接在 `main` 上修复（`ba1954b`，未开 feature branch/PR——用户认为改动范围小，走完整分支流程是不必要开销，本次按此简化，不代表流程惯例变更）。
+
+**问题一**：`_sonar_macro_brief()`（`scripts/intel_sources.py`）此前 `max_tokens=800`，OR 面板显示调用 `finish_reason=length`（被截断），但代码侧无任何 `finish_reason`/`usage` 日志——同 issue #53/PR #54 刚给语义过滤补上的可观测性模式未同步到 Sonar。修复：`max_tokens` 800→1500；成功响应后记录 `prompt_tokens`/`completion_tokens`/`finish_reason`/`provider`；`finish_reason=="length"` 单独告警。新增 `scripts/test_intel_sources_sonar.py`（3/3 通过）。**留观**：下次 AM/PM 报告运行后查 `/tmp/daily_intelligence.log` 里 `Sonar macro brief` 行的 `finish_reason` 是否稳定为 `stop`，观察窗口 3-5 个交易日，issue #55 暂不关闭。
+
+**问题二**：用户确认账号在 OpenRouter 为 DeepSeek 配置了 BYOK（DeepSeek 官方 API token）。这修正了 issue #53 排查时"`DS_OR_PROVIDERS` pin 到 `["DigitalOcean","Venice"]` 仍路由到 `Alibaba` = OR provider pin 机制不可靠"的归因——更准确的解释是 BYOK 容量/限流耗尽时 `allow_fallbacks:True` 触发的预期降级，不是 pin 失效。已在 issue #53 补发澄清评论，设计文档第 8.1 节"OR provider 实测结论"追加说明。此项已定论，不需要继续观察。
+
+**顺带核实**：用户提供的 OR management/provisioning key 查证后确认对此类排查没有用——它只管理 API key 本身（`/api/v1/keys` 增删改查/限额），不能调用 completion 端点；连需要它鉴权的 Analytics 端点也只返回按天/endpoint 聚合统计，不含单次调用 finish_reason/provider 明细（真正的明细在每次调用响应体里，已直接记日志）。未接入代码、未写入 `.env`。
+
+**踩坑**：本次排查中 `obsidian_read_note` 对超大文件降级为文本转储时，转储内容是 JSON 转义字符串（字面 `\n`/`\"`），不能直接当原文用于 `search_replace`，需先 `json.loads` 还原。见 `docs/PITFALLS.md#85`。
+
+---
+
 ## 当前系统状态（2026-07-23，issue #53 / PR #54）
 
 **语义过滤模型从 deepseek-v4-flash 切换至 google/gemma-4-31b-it，issue #53 关闭**。背景：2026-07-22 生产环境真实崩溃（`_haiku_relevance_filter()` 报 `'NoneType' object has no attribute 'strip'`）——`deepseek-v4-flash` 即使不发 `thinking`/`reasoning` key，在当前 OR 路由下仍会隐式产生 reasoning token，把 `max_tokens=80` 的预算烧在看不见的思考上，导致 `content` 返回 `null`；同批还确认 `DS_OR_PROVIDERS` 的 provider pin（`DigitalOcean`/`Venice`）并未被 OpenRouter 可靠遵守（实际路由到了 Alibaba）。issue #53 用真实付费调用对姊妹项目 LLM-eval 框架（`PC611-homepage`）测出的唯一 100% 通过模型 `google/gemma-4-31b-it` 做验证，两档 `max_tokens`（80/150）均确认 `completion_tokens_details.reasoning_tokens=0`、`finish_reason=stop`，成本反而更低，验证通过。
@@ -633,6 +647,7 @@ _Tavily: N/10_
 82. `parse_llm_json()` 可能返回非dict（外层对象损坏但内部数组能独立解析），消费方未判空导致静默丢弃/daemon崩溃 → 详见 `docs/PITFALLS.md#82`
 83. 回复别人未submit的PENDING GitHub review会422（同账号只能有一个pending review）→ 详见 `docs/PITFALLS.md#83`
 84. 消毒函数"先str()再判断类型"，导致None/bool绕过自己刚建的白名单（str(None).upper()=="NONE"合法匹配ticker正则）→ 详见 `docs/PITFALLS.md#84`
+85. `obsidian_read_note`大文件降级为文本转储时是JSON转义字符串（\n/\"未还原），直接当原文用于search_replace会静默不匹配 → 详见 `docs/PITFALLS.md#85`
 
 ---
 
