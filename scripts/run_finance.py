@@ -507,8 +507,11 @@ def _semantic_relevance_filter(
     Cost: ~$0.0001-0.00014 per call (verified 2026-07-22 against real prompt shape).
 
     Returns (filtered_results, meta). meta mirrors call_llm()'s _llm_meta shape
-    ({"provider", "fallback", ...}) for status-line reporting via build_status_message();
-    meta is {} when both primary and OR-flex fallback failed (script-score fail-open).
+    ({"provider", "fallback", ...}) for status-line reporting via build_status_message().
+    meta is {"skipped": "no_results" | "no_api_key"} when the LLM was never called
+    (nothing to rank / no key configured), and {} only when both primary and
+    OR-flex fallback were actually attempted and both failed — the two cases
+    read very differently in the TG status line and must not be conflated.
 
     Switched from deepseek-v4-flash 2026-07-22 after a live production crash
     ('NoneType' object has no attribute 'strip') traced to that model silently
@@ -517,8 +520,10 @@ def _semantic_relevance_filter(
     (reasoning_tokens=0, finish_reason=stop) against this exact prompt template
     before switching, not just against a synthetic eval case set — see issue #53.
     """
-    if not results or not OPENROUTER_API_KEY:
-        return results[:top_n], {}
+    if not results:
+        return results[:top_n], {"skipped": "no_results"}
+    if not OPENROUTER_API_KEY:
+        return results[:top_n], {"skipped": "no_api_key"}
 
     ptickers = ", ".join(portfolio_tickers[:15]) if portfolio_tickers else "INTC NVDA QCOM TSLA AMKR"
     items_text = []
@@ -562,16 +567,22 @@ Return ONLY a JSON array of exactly {top_n} indices (or fewer if less than {top_
             json={
                 "model": SEMANTIC_FILTER_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 80,
+                "max_tokens": 200,
                 "temperature": 0,
             },
             timeout=20,
         )
         resp.raise_for_status()
         data = resp.json()
-        msg = data["choices"][0]["message"]
+        choice = data["choices"][0]
+        msg = choice["message"]
         content = (msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
         provider = data.get("provider", "n/a")
+        usage = data.get("usage", {})
+        logger.info(f"Semantic filter tokens: prompt={usage.get('prompt_tokens')} "
+                    f"completion={usage.get('completion_tokens')} "
+                    f"reasoning={usage.get('completion_tokens_details', {}).get('reasoning_tokens')} "
+                    f"finish_reason={choice.get('finish_reason')} provider={provider}")
         m = re.search(r'\[[\d,\s]+\]', content)
         if m:
             indices = json.loads(m.group())
@@ -580,7 +591,10 @@ Return ONLY a JSON array of exactly {top_n} indices (or fewer if less than {top_
                 logger.info(f"Semantic filter: {len(results)} → {len(filtered)} results "
                             f"(supply-chain + semantic ranking, OR/{provider})")
                 return filtered, {"provider": provider, "fallback": False}
-        logger.warning(f"Semantic filter: unexpected output: {content[:80]}")
+        if not content and choice.get("finish_reason") == "length":
+            logger.warning("Semantic filter: budget exhausted before any content (finish_reason=length, empty content)")
+        else:
+            logger.warning(f"Semantic filter: unexpected output: {content[:80]}")
     except Exception as e:
         logger.warning(f"Semantic filter failed ({e}), trying OR flex fallback...")
 
@@ -594,16 +608,21 @@ Return ONLY a JSON array of exactly {top_n} indices (or fewer if less than {top_
                 "model": LLM_FALLBACK_FLASH,
                 "service_tier": "flex",
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 80,
+                "max_tokens": 200,
                 "temperature": 0,
             },
             timeout=60,
         )
         resp.raise_for_status()
         data = resp.json()
-        msg = data["choices"][0]["message"]
+        choice = data["choices"][0]
+        msg = choice["message"]
         content = (msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
         provider = data.get("provider", "n/a")
+        usage = data.get("usage", {})
+        logger.info(f"Semantic filter OR flex tokens: prompt={usage.get('prompt_tokens')} "
+                    f"completion={usage.get('completion_tokens')} "
+                    f"finish_reason={choice.get('finish_reason')} provider={provider}")
         m = re.search(r'\[[\d,\s]+\]', content)
         if m:
             indices = json.loads(m.group())
@@ -1101,7 +1120,12 @@ def build_status_message(
     lines += ["", "LLM/Provider:"]
     lines.append(f"- Pass 1（{LLM_MODEL}）: {_fmt_llm_meta(llm_meta_p1)}")
     if raw_results:
-        if not sem_filter_meta:
+        skipped = sem_filter_meta.get("skipped")
+        if skipped == "no_results":
+            sem_line = "跳过（打分后无候选，未调用 LLM）"
+        elif skipped == "no_api_key":
+            sem_line = "跳过（未配置 OPENROUTER_API_KEY）"
+        elif not sem_filter_meta:
             sem_line = "脚本打分兜底（LLM 主+备均失败，未发送独立告警）"
         elif sem_filter_meta.get("fallback"):
             sem_line = f"OR flex fallback → {sem_filter_meta.get('model', '?')} via {sem_filter_meta.get('provider', 'n/a')}"
