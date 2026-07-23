@@ -19,6 +19,19 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## [强制] "打扫战场"必须包含设计文档更新
+
+**背景（2026-07-23 教训）**：全局 `~/.claude/CLAUDE.md` 的"打扫战场"清单第 4 项写的是"Obsidian 设计文档/开发日志"合并为一条，但本项目此前多次收尾只更新了`Daily Intelligence 开发部署日志.md`（叙事型日志），没有同步更新`Daily_Intel设计文档.md`（架构权威参考）——两者分别更新责任被"日志更新了"顺带带过，导致设计文档"最后更新"停留在 2026-07-09，而代码早已新增 Brave News、Polymarket/Adanos/Apify Reddit 三路社交舆情、字段消毒、quota_store 参数化重构、llm_json_utils 迁移、语义过滤模型切换等六个未记录的重大变更，用户发现后要求专项修复（本次已补齐，见文档内 2026-07-23 变更记录）。
+
+**规则：本项目每次"打扫战场"，第 4 项（Obsidian 文档更新）必须显式拆成两个独立动作，都要做，不能只做一个就视为完成：**
+
+1. 更新 `Daily Intelligence 开发部署日志.md`（叙事型，append 到文件尾部，记录"这次做了什么、踩了什么坑"）
+2. 检查并更新 `Daily_Intel设计文档.md`（架构权威参考）——本次会话若新增/修改了数据源、LLM 选型、流水线步骤、目录结构、prompt 注入槽，必须同步反映到对应章节（第五节数据采集、第八节 LLM 选型表、第十节目录结构等），而不是只在开发日志里提一笔。判断标准：**如果这次改动会让 session 初始化时读到的架构描述、模型选型表、文件清单出现任何一处"与代码不符"，就必须更新设计文档**，哪怕只是一行表格或一个函数名。
+3. 大改动（新数据源、新子系统、模型切换等）额外在文档末尾追加"变更记录追加：YYYY-MM-DD"小节；小改动（如单个函数改名、单个常量调整）直接原地修正对应章节的过时表述，不必单独开变更记录小节。
+4. 更新"最后更新"元信息行（文档顶部），反映本次改动的日期和摘要。
+
+---
+
 ## 当前系统状态（2026-07-23，issue #53 / PR #54）
 
 **语义过滤模型从 deepseek-v4-flash 切换至 google/gemma-4-31b-it，issue #53 关闭**。背景：2026-07-22 生产环境真实崩溃（`_haiku_relevance_filter()` 报 `'NoneType' object has no attribute 'strip'`）——`deepseek-v4-flash` 即使不发 `thinking`/`reasoning` key，在当前 OR 路由下仍会隐式产生 reasoning token，把 `max_tokens=80` 的预算烧在看不见的思考上，导致 `content` 返回 `null`；同批还确认 `DS_OR_PROVIDERS` 的 provider pin（`DigitalOcean`/`Venice`）并未被 OpenRouter 可靠遵守（实际路由到了 Alibaba）。issue #53 用真实付费调用对姊妹项目 LLM-eval 框架（`PC611-homepage`）测出的唯一 100% 通过模型 `google/gemma-4-31b-it` 做验证，两档 `max_tokens`（80/150）均确认 `completion_tokens_details.reasoning_tokens=0`、`finish_reason=stop`，成本反而更低，验证通过。
