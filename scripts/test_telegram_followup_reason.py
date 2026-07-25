@@ -131,6 +131,49 @@ def test_reasoning_content_used_when_content_missing():
     assert answer == "只有思考内容"
 
 
+def test_length_finish_never_promotes_partial_chain_of_thought():
+    # PR #56 review bug: with thinking enabled, the realistic budget-exhaustion
+    # shape is content=null/"" + finish_reason=length + a non-empty
+    # reasoning_content holding the partial CoT. An earlier version of this
+    # code did `content or reasoning_content`, which made that CoT text
+    # truthy and returned it as the "answer" — the user got raw chain-of-
+    # thought, and the budget-exhausted error path never ran. Must raise the
+    # budget message instead, on every attempt (primary and fallback both
+    # return this same shape here, so the final error must still be the
+    # budget message, not a differently-worded generic one).
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _FakeResponse(_ok_payload(
+            content=None, finish="length",
+            message_extra={"reasoning_content": "...partial chain of thought, not an answer..."}))
+
+    try:
+        _run_with(fake_post)
+    except tc._FollowupError as e:
+        assert "思考" not in str(e)
+        assert "token 预算" in str(e), str(e)
+    else:
+        raise AssertionError("must not return partial CoT as if it were the answer")
+
+
+def test_empty_primary_content_falls_back_before_giving_up():
+    # PR #56 review bug: primary returning HTTP 200 with empty/budget-
+    # exhausted content used to raise immediately without trying the
+    # configured fallback — the same failure mode a transport error triggers
+    # fallback for, but this path skipped it entirely.
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(json["model"])
+        if json["model"] == "deepseek/deepseek-v4-flash":
+            return _FakeResponse(_ok_payload(content=None, finish="length"))
+        return _FakeResponse(_ok_payload(content="fallback 给出的正常回答"))
+
+    answer, label = _run_with(fake_post)
+    assert answer == "fallback 给出的正常回答"
+    assert label == "x-ai/grok-4.5"
+    assert calls == ["deepseek/deepseek-v4-flash", "x-ai/grok-4.5"]  # no wasted retries
+
+
 def test_fallback_uses_configured_model_with_reasoning_effort():
     calls = []
 

@@ -38,6 +38,7 @@ have reproduced the issue #53 production crash on the second one: reasoning
 tokens eat the completion budget, `content` comes back null. They are distinct
 stages here precisely so per-stage knobs cannot leak across budgets.
 """
+import copy
 import json
 import logging
 import os
@@ -210,7 +211,17 @@ def _v_providers(v):
     allow = v.get("allow_fallbacks", True)
     if not isinstance(allow, bool):
         return False, v
-    return True, {"order": [x.strip() for x in order], "allow_fallbacks": allow}
+    out = {"order": [x.strip() for x in order], "allow_fallbacks": allow}
+    # Pass through any other OpenRouter provider-routing keys verbatim
+    # (data_collection, ignore, only, quantizations, sort, ...) instead of
+    # silently dropping them. Without this, a hand-edited privacy pin like
+    # {"data_collection": "deny"} would vanish while the load still logs
+    # "override applied" for order/allow_fallbacks — easy to misread as
+    # "the edit took effect" (PR #56 review).
+    for k, val in v.items():
+        if k not in ("order", "allow_fallbacks"):
+            out[k] = val
+    return True, out
 
 
 def _v_thinking(v):
@@ -257,6 +268,34 @@ _VALIDATORS = {
     "temperature": _v_temperature,
 }
 
+# thinking.budget_tokens and max_tokens are independent fields that each
+# pass field-level validation individually, but a hand edit that sets one
+# without the other (e.g. "max_tokens": 500 against the default
+# budget_tokens: 3000) recreates issue #53's starvation for any stage with
+# thinking enabled, with no WARNING from _VALIDATORS since neither field is
+# individually out of range. This is the cross-field check field-level
+# validation can't express (PR #56 review).
+_MIN_THINKING_HEADROOM = 500
+
+
+def _enforce_thinking_budget(stage_name: str, cfg: dict) -> None:
+    thinking = cfg.get("thinking")
+    if not thinking or thinking.get("type") != "enabled":
+        return
+    budget = thinking.get("budget_tokens")
+    if budget is None or cfg["max_tokens"] >= budget + _MIN_THINKING_HEADROOM:
+        return
+    default = DEFAULTS[stage_name]
+    logger.warning(
+        f"LLM config: stage '{stage_name}' has thinking.budget_tokens={budget} "
+        f"leaving < {_MIN_THINKING_HEADROOM} tokens of headroom under "
+        f"max_tokens={cfg['max_tokens']} — reverting both fields to defaults "
+        f"(max_tokens={default['max_tokens']}, thinking={default.get('thinking')!r}) "
+        f"to avoid issue #53-style budget exhaustion")
+    cfg["max_tokens"] = default["max_tokens"]
+    cfg["thinking"] = copy.deepcopy(default.get("thinking"))
+
+
 _UNSET = object()
 _cache: dict = {"key": _UNSET, "stages": None}
 _lock = threading.Lock()
@@ -292,7 +331,13 @@ def _read_raw() -> dict:
 
 def _build() -> dict[str, dict]:
     """Merge validated overrides onto DEFAULTS, logging every effective change."""
-    merged = {name: dict(cfg) for name, cfg in DEFAULTS.items()}
+    # deepcopy, not dict(): several stages' "providers" default points at the
+    # same shared _DS_PROVIDERS object literal. A shallow copy here still
+    # shares that nested dict across every stage that hasn't overridden it —
+    # fine for the read-only call sites that exist today, but a future
+    # in-place mutation (or a careless test) would poison DEFAULTS for the
+    # life of the long-running Telegram bot process (PR #56 review nit).
+    merged = {name: copy.deepcopy(cfg) for name, cfg in DEFAULTS.items()}
     raw = _read_raw()
     for stage_name, override in raw.items():
         if stage_name.startswith("_"):
@@ -322,6 +367,9 @@ def _build() -> dict[str, dict]:
                 logger.info(f"LLM config override: {stage_name}.{field}: "
                             f"{target[field]!r} -> {cleaned!r}")
                 target[field] = cleaned
+
+    for stage_name, cfg in merged.items():
+        _enforce_thinking_budget(stage_name, cfg)
     return merged
 
 
@@ -357,7 +405,7 @@ def stage(name: str) -> dict:
     stages = _stages()
     if name not in stages:
         raise KeyError(f"unknown LLM stage '{name}' (known: {', '.join(sorted(stages))})")
-    return dict(stages[name])
+    return copy.deepcopy(stages[name])
 
 
 def model(name: str) -> str:

@@ -1412,6 +1412,63 @@ class _FollowupError(Exception):
     """Step 4 failure carrying the exact text to reply to the user with."""
 
 
+def _step4_fallback_request(messages: list[dict], fu_cfg: dict):
+    """POST to fu_cfg's fallback model. Raises on failure (caller wraps)."""
+    return _openrouter_post({
+        "model": fu_cfg["fallback_model"],
+        "messages": messages,
+        "max_tokens": fu_cfg.get("fallback_max_tokens") or fu_cfg["max_tokens"],
+        "temperature": fu_cfg["temperature"],
+        # OpenRouter's unified reasoning-effort param (the fallback is a
+        # reasoning model; "medium" is an effort level, not a model slug).
+        **({"reasoning": fu_cfg["fallback_reasoning"]} if fu_cfg.get("fallback_reasoning") else {}),
+    }, timeout=180)
+
+
+def _parse_step4_response(resp, model_label: str) -> tuple[str, str | None]:
+    """Extract (answer, finish_reason) from a Step 4 HTTP response.
+
+    Raises _FollowupError on a malformed response body (can't even read
+    choices[0].message). An empty/unusable answer is returned as "" rather
+    than raised — the caller decides whether that's worth a fallback attempt
+    or a final error, since this function doesn't know which attempt it is.
+    """
+    try:
+        data = resp.json()
+        choice = data["choices"][0]
+        msg = choice["message"]
+        usage = data.get("usage", {})
+        finish_reason = choice.get("finish_reason")
+    except Exception as e:
+        raise _FollowupError(f"（LLM 调用失败：{e}）")
+
+    # Same observability shape as the report pipeline (issue #55): without these
+    # numbers, diagnosing a thinking-budget problem needs extra paid calls after
+    # the fact.
+    logger.info(f"Step 4 tokens [{model_label}]: prompt={usage.get('prompt_tokens')} "
+                f"completion={usage.get('completion_tokens')} "
+                f"reasoning={usage.get('completion_tokens_details', {}).get('reasoning_tokens')} "
+                f"finish_reason={finish_reason} provider={data.get('provider', 'n/a')}")
+
+    content = (msg.get("content") or "").strip()
+    if content:
+        return content, finish_reason
+    if finish_reason == "length":
+        # Budget exhausted on hidden reasoning (issue #53's shape): content is
+        # null/empty but reasoning_content often holds the partial
+        # chain-of-thought. That CoT is not an answer — promoting it here (a
+        # real bug in an earlier version of this function, PR #56 review)
+        # would silently hand the user raw reasoning text and skip the
+        # budget-exhaustion handling below entirely. Never fall back to
+        # reasoning_content in this branch.
+        return "", finish_reason
+    # Not a length-truncation: some providers genuinely put the final answer
+    # under reasoning_content instead of content even without exhausting the
+    # budget (same fallback chain used elsewhere in this project, e.g.
+    # llm_client.py / _semantic_relevance_filter).
+    return (msg.get("reasoning_content") or "").strip(), finish_reason
+
+
 def _followup_reason(messages: list[dict]) -> tuple[str, str]:
     """Step 4: personalised reasoning over the research brief.
 
@@ -1422,9 +1479,16 @@ def _followup_reason(messages: list[dict]) -> tuple[str, str]:
     Thinking is enabled here by default, unlike every other DeepSeek call in
     this project (issue #11): answer quality on open-ended portfolio reasoning
     degrades badly without it. The guard rails that make that safe are the
-    large max_tokens and the empty-content check below — with thinking on,
-    `content` comes back null when reasoning tokens eat the whole budget,
-    which is exactly how issue #53 crashed in production.
+    large max_tokens and the empty-content check in _parse_step4_response —
+    with thinking on, `content` comes back null when reasoning tokens eat the
+    whole budget, which is exactly how issue #53 crashed in production.
+
+    The fallback model is tried once whenever the primary attempt didn't
+    produce a usable answer — whether that's because the transport failed
+    across all 3 retries, or because the primary returned HTTP 200 with an
+    empty/budget-exhausted response (an earlier version of this function only
+    tried the fallback on transport failure, leaving a working fallback
+    unused while the user was told to go edit a config file — PR #56 review).
 
     Returns (answer, model_label). Raises _FollowupError with user-facing text.
     """
@@ -1470,45 +1534,33 @@ def _followup_reason(messages: list[dict]) -> tuple[str, str]:
                 resp = None
                 break
 
-    if resp is None:
-        fallback_model = fu_cfg.get("fallback_model")
-        if not fallback_model:
+    answer = ""
+    finish_reason = None
+    if resp is not None:
+        answer, finish_reason = _parse_step4_response(resp, model_label)
+        if answer:
+            return answer, model_label
+        logger.warning(f"Step 4 primary [{model_label}] returned no usable content "
+                       f"(finish_reason={finish_reason}); trying fallback")
+
+    fallback_model = fu_cfg.get("fallback_model")
+    if not fallback_model:
+        if resp is None:
             raise _FollowupError(f"（LLM 调用失败：{last_err}）")
-        logger.warning(f"Step 4 primary exhausted ({last_err}), trying {fallback_model}")
-        try:
-            resp = _openrouter_post({
-                "model": fallback_model,
-                "messages": messages,
-                "max_tokens": fu_cfg.get("fallback_max_tokens") or fu_cfg["max_tokens"],
-                "temperature": fu_cfg["temperature"],
-                # OpenRouter's unified reasoning-effort param (the fallback is a
-                # reasoning model; "medium" is an effort level, not a model slug).
-                **({"reasoning": fu_cfg["fallback_reasoning"]} if fu_cfg.get("fallback_reasoning") else {}),
-            }, timeout=180)
-            model_label = fallback_model
-        except Exception as e2:
-            raise _FollowupError(f"（LLM 调用失败：{e2}）")
+        if finish_reason == "length":
+            raise _FollowupError(
+                "（推理失败：模型用尽 token 预算仍未产出可见回答，"
+                "可调高 llm_config.json 中 tg_followup.max_tokens 后重试）")
+        raise _FollowupError("（推理失败：模型返回空回答）")
 
+    logger.warning(f"Step 4 primary exhausted/empty ({last_err}), trying {fallback_model}")
     try:
-        data = resp.json()
-        choice = data["choices"][0]
-        msg = choice["message"]
-        usage = data.get("usage", {})
-        finish_reason = choice.get("finish_reason")
-    except Exception as e:
-        raise _FollowupError(f"（LLM 调用失败：{e}）")
+        resp = _step4_fallback_request(messages, fu_cfg)
+    except Exception as e2:
+        raise _FollowupError(f"（LLM 调用失败：{e2}）")
+    model_label = fallback_model
 
-    # Same observability shape as the report pipeline (issue #55): without these
-    # numbers, diagnosing a thinking-budget problem needs extra paid calls after
-    # the fact.
-    logger.info(f"Step 4 tokens [{model_label}]: prompt={usage.get('prompt_tokens')} "
-                f"completion={usage.get('completion_tokens')} "
-                f"reasoning={usage.get('completion_tokens_details', {}).get('reasoning_tokens')} "
-                f"finish_reason={finish_reason} provider={data.get('provider', 'n/a')}")
-
-    # Never .strip() content directly: it is null when reasoning consumed the
-    # whole budget (issue #53's exact production crash).
-    answer = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+    answer, finish_reason = _parse_step4_response(resp, model_label)
     if not answer:
         if finish_reason == "length":
             logger.error(f"Step 4 [{model_label}]: budget exhausted before any visible answer "

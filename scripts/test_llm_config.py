@@ -165,6 +165,60 @@ def test_valid_structural_values_accepted():
     assert llm_config.stage("report_pass1")["providers"] is None
 
 
+def test_thinking_budget_without_headroom_reverts_both_fields():
+    # max_tokens and thinking.budget_tokens each pass field-level validation
+    # independently, but together they recreate issue #53's starvation.
+    # Neither field alone is "invalid", so only a cross-field check catches it.
+    records = _load({"stages": {"tg_followup": {"max_tokens": 3200}}})
+    cfg = llm_config.stage("tg_followup")
+    assert cfg["max_tokens"] == llm_config.DEFAULTS["tg_followup"]["max_tokens"]
+    assert cfg["thinking"] == llm_config.DEFAULTS["tg_followup"]["thinking"]
+    assert any("thinking.budget_tokens" in m and "tg_followup" in m
+               for m in _levels(records, "WARNING"))
+
+
+def test_thinking_budget_with_headroom_is_accepted():
+    _load({"stages": {"tg_followup": {"max_tokens": 20000}}})
+    assert llm_config.stage("tg_followup")["max_tokens"] == 20000
+
+
+def test_thinking_budget_check_skipped_when_thinking_disabled():
+    # report_pass1 has no thinking config — an aggressively small max_tokens
+    # there is a different (legitimate) tuning choice, not a starvation risk.
+    records = _load({"stages": {"report_pass1": {"max_tokens": 50}}})
+    assert llm_config.stage("report_pass1")["max_tokens"] == 50
+    assert not any("thinking.budget_tokens" in m for m in _levels(records, "WARNING"))
+
+
+def test_provider_pass_through_unknown_keys():
+    # Dropping unrecognized OpenRouter provider keys (e.g. a privacy pin like
+    # data_collection) while still logging "override applied" for order/
+    # allow_fallbacks makes an edit look like it took effect when part of it
+    # silently vanished.
+    _load({"stages": {"report_pass1": {
+        "providers": {"order": ["DeepSeek"], "allow_fallbacks": True,
+                      "data_collection": "deny", "quantizations": ["fp16"]}}}})
+    providers = llm_config.stage("report_pass1")["providers"]
+    assert providers["data_collection"] == "deny"
+    assert providers["quantizations"] == ["fp16"]
+    assert providers["order"] == ["DeepSeek"]
+
+
+def test_stage_returns_are_independent_deep_copies():
+    # Multiple stages' "providers" default share the same object literal
+    # (_DS_PROVIDERS) in DEFAULTS. A shallow copy would let mutating one
+    # stage's returned providers dict corrupt every other stage that still
+    # points at the same default — persisting for the life of the
+    # long-running Telegram bot process.
+    _load(None)
+    a = llm_config.stage("report_pass1")
+    a["providers"]["order"].append("Mutated")
+    b = llm_config.stage("tg_followup")  # also defaults to the shared _DS_PROVIDERS
+    assert "Mutated" not in b["providers"]["order"]
+    c = llm_config.stage("report_pass1")
+    assert "Mutated" not in c["providers"]["order"]
+
+
 def test_underscore_keys_ignored_without_warning():
     records = _load({"_note": "a comment", "stages": {
         "tg_followup": {"_why": "note", "model": "x-ai/grok-4.5"}}})
