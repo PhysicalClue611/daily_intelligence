@@ -98,6 +98,7 @@ from calibration import (
 # true leaf modules (imported by both run_finance.py and the modules that
 # need them) removes the assumption entirely.
 from llm_client import call_llm
+import llm_config
 from scoring_utils import (
     _title_tokens_for_dedup, _title_keyword_hits, _token_jaccard,
     _TITLE_DEDUP_THRESHOLD, _TITLE_DEDUP_THRESHOLD_NO_KEYWORD,
@@ -130,12 +131,9 @@ TAVILY_API_KEY      = os.getenv("TAVILY_API_KEY", "")
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 OR_BASE_URL         = "https://openrouter.ai/api/v1/chat/completions"
 OR_ATTRIBUTION_HEADERS = {"HTTP-Referer": "https://github.com/PhysicalClue611/daily_intelligence", "X-OpenRouter-Title": "DailyIntel"}
-LLM_MODEL           = "deepseek/deepseek-v4-flash"
-LLM_MODEL_PASS2     = "deepseek/deepseek-v4-pro"
-SEMANTIC_FILTER_MODEL = "google/gemma-4-31b-it"
-LLM_FALLBACK_FLASH  = "google/gemini-3.1-flash-lite"  # OR flex fallback for v4-flash
-LLM_FALLBACK_PRO    = "google/gemini-3.5-flash"       # OR flex fallback for v4-pro
-SONAR_MODEL         = "perplexity/sonar"             # Macro brief (real-time search)
+# Model/provider selection per pipeline stage now lives in llm_config.py
+# (runtime-overridable via llm_config.json, issue #11) — see llm_config.DEFAULTS
+# for stage names: report_pass1 / report_pass2 / semantic_filter / macro_brief.
 EXA_API_KEY         = os.getenv("EXA_API_KEY", "")
 EXA_BASE_URL        = "https://api.exa.ai/chat/completions"
 
@@ -525,6 +523,8 @@ def _semantic_relevance_filter(
     if not OPENROUTER_API_KEY:
         return results[:top_n], {"skipped": "no_api_key"}
 
+    cfg = llm_config.stage("semantic_filter")
+
     ptickers = ", ".join(portfolio_tickers[:15]) if portfolio_tickers else "INTC NVDA QCOM TSLA AMKR"
     items_text = []
     for i, r in enumerate(results):
@@ -565,10 +565,11 @@ Return ONLY a JSON array of exactly {top_n} indices (or fewer if less than {top_
                 **OR_ATTRIBUTION_HEADERS,
             },
             json={
-                "model": SEMANTIC_FILTER_MODEL,
+                "model": cfg["model"],
+                **({"provider": cfg["providers"]} if cfg["providers"] else {}),
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 200,
-                "temperature": 0,
+                "max_tokens": cfg["max_tokens"],
+                "temperature": cfg["temperature"],
             },
             timeout=20,
         )
@@ -598,18 +599,20 @@ Return ONLY a JSON array of exactly {top_n} indices (or fewer if less than {top_
     except Exception as e:
         logger.warning(f"Semantic filter failed ({e}), trying OR flex fallback...")
 
-    # OR flex fallback for semantic filter
+    # OR flex fallback for semantic filter (skipped when configured off)
+    if not cfg.get("fallback_model"):
+        return results[:top_n], {}
     try:
         resp = httpx.post(
             OR_BASE_URL,
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
                      "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
             json={
-                "model": LLM_FALLBACK_FLASH,
+                "model": cfg["fallback_model"],
                 "service_tier": "flex",
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 200,
-                "temperature": 0,
+                "max_tokens": cfg["max_tokens"],
+                "temperature": cfg["temperature"],
             },
             timeout=60,
         )
@@ -629,7 +632,7 @@ Return ONLY a JSON array of exactly {top_n} indices (or fewer if less than {top_
             filtered = [results[i] for i in indices if isinstance(i, int) and 0 <= i < len(results)]
             if filtered:
                 logger.info(f"Semantic filter OR flex: {len(results)} → {len(filtered)} results")
-                return filtered, {"provider": provider, "fallback": True, "model": LLM_FALLBACK_FLASH}
+                return filtered, {"provider": provider, "fallback": True, "model": cfg["fallback_model"]}
     except Exception as e:
         logger.warning(f"Semantic filter OR flex also failed: {e}")
 
@@ -1118,7 +1121,7 @@ def build_status_message(
         lines.append("- Tavily/SerpApi搜索: 未触发")
 
     lines += ["", "LLM/Provider:"]
-    lines.append(f"- Pass 1（{LLM_MODEL}）: {_fmt_llm_meta(llm_meta_p1)}")
+    lines.append(f"- Pass 1（{llm_config.model('report_pass1')}）: {_fmt_llm_meta(llm_meta_p1)}")
     if raw_results:
         skipped = sem_filter_meta.get("skipped")
         if skipped == "no_results":
@@ -1131,11 +1134,11 @@ def build_status_message(
             sem_line = f"OR flex fallback → {sem_filter_meta.get('model', '?')} via {sem_filter_meta.get('provider', 'n/a')}"
         else:
             sem_line = f"OR/{sem_filter_meta.get('provider', 'n/a')}"
-        lines.append(f"- 语义过滤（{SEMANTIC_FILTER_MODEL}）: {sem_line}")
+        lines.append(f"- 语义过滤（{llm_config.model('semantic_filter')}）: {sem_line}")
     if sonar_macro_section:
-        lines.append(f"- 宏观快照（{SONAR_MODEL}）: OR")
+        lines.append(f"- 宏观快照（{llm_config.model('macro_brief')}）: OR")
     if tavily_section:
-        lines.append(f"- Pass 2（{LLM_MODEL_PASS2}）: {_fmt_llm_meta(llm_meta_p2)}")
+        lines.append(f"- Pass 2（{llm_config.model('report_pass2')}）: {_fmt_llm_meta(llm_meta_p2)}")
 
     return "\n".join(lines)
 
@@ -1599,7 +1602,7 @@ def _main_body():
             personal_context=personal_context,
             verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P2 if run_slot == "am" else "",
         )
-        result2 = call_llm(prompt2, model=LLM_MODEL_PASS2, system_prompt=SYSTEM_PROMPT_P2)
+        result2 = call_llm(prompt2, stage="report_pass2", system_prompt=SYSTEM_PROMPT_P2)
         llm_meta_p2 = result2.get("_llm_meta", {})
         report_md = result2.get("report_md", report_md)
         write_sas_candidate_log(today_et, slot_label, result2.get("sas_candidates", []))

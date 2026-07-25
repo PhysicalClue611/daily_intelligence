@@ -6,7 +6,7 @@ log (issue #31). Extracted from run_finance.py (issue #42, 2026-07-17) to
 shrink that file.
 
 Leaf module: does not import from run_finance.py. _evaluate_am_predictions()
-gets call_llm/LLM_MODEL from llm_client.py, a shared leaf module — not a
+gets call_llm from llm_client.py, a shared leaf module — not a
 deferred `from run_finance import ...` inside the function body (the
 original approach here, before PR #43 review feedback pointed out it
 silently assumed run_finance.py is registered in sys.modules as
@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from report_writers import _monthly_path
-from llm_client import call_llm, LLM_MODEL
+from llm_client import call_llm
 
 _HOME = os.path.expanduser("~")
 _IN_CONTAINER = os.path.exists("/opt/data")
@@ -147,7 +147,7 @@ def _evaluate_am_predictions(signals_text: str, price_table: str, news_context: 
 }}
 """
     try:
-        return call_llm(prompt, model=LLM_MODEL, system_prompt=_CALIBRATION_SYSTEM_PROMPT)
+        return call_llm(prompt, stage="report_pass1", system_prompt=_CALIBRATION_SYSTEM_PROMPT)
     except Exception as e:
         logger.warning(f"AM prediction evaluation failed (non-fatal): {e}")
         return {}

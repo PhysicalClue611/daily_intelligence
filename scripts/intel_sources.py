@@ -33,6 +33,7 @@ from budget_trackers import (
 from scoring_utils import (
     _title_tokens_for_dedup, _token_jaccard, _TITLE_DEDUP_THRESHOLD_NO_KEYWORD,
 )
+import llm_config
 
 _PROJ_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
 ET = ZoneInfo("America/New_York")
@@ -41,7 +42,7 @@ logger = logging.getLogger(__name__)
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 OR_BASE_URL         = "https://openrouter.ai/api/v1/chat/completions"
 OR_ATTRIBUTION_HEADERS = {"HTTP-Referer": "https://github.com/PhysicalClue611/daily_intelligence", "X-OpenRouter-Title": "DailyIntel"}
-SONAR_MODEL         = "perplexity/sonar"
+# Sonar model/provider/token settings: llm_config stage "macro_brief" (issue #11).
 
 POLYMARKET_BASE = "https://gamma-api.polymarket.com"
 ADANOS_API_KEY  = os.getenv("ADANOS_API_KEY", "")
@@ -201,15 +202,16 @@ def _sonar_macro_brief(
         )
     )
 
+    cfg = llm_config.stage("macro_brief")
     or_payload = {
-        "model": SONAR_MODEL,
+        "model": cfg["model"],
         "messages": [
             {"role": "system", "content": system},
             {"role": "user",   "content": query},
         ],
-        "max_tokens": 1500,
-        "temperature": 0.1,
-        "provider": {"order": ["Perplexity"], "allow_fallbacks": False},
+        "max_tokens": cfg["max_tokens"],
+        "temperature": cfg["temperature"],
+        **({"provider": cfg["providers"]} if cfg["providers"] else {}),
         "search_recency_filter": "day",
     }
     slot_label = "开盘前" if slot == "am" else "夜盘"
@@ -225,13 +227,18 @@ def _sonar_macro_brief(
             resp.raise_for_status()
             data = resp.json()
             choice = data["choices"][0]
-            brief = choice["message"]["content"].strip()
             usage = data.get("usage", {})
             finish_reason = choice.get("finish_reason")
-            logger.info(f"Sonar macro brief ({slot_label}): {len(brief)} chars "
+            # Log usage/finish_reason before touching content: a None content
+            # (budget exhausted on hidden reasoning, issue #53's failure mode)
+            # must not raise AttributeError before this diagnostic line runs.
+            logger.info(f"Sonar macro brief ({slot_label}): "
                         f"prompt_tokens={usage.get('prompt_tokens')} "
                         f"completion_tokens={usage.get('completion_tokens')} "
                         f"finish_reason={finish_reason} provider={data.get('provider', 'n/a')}")
+            brief = (choice["message"].get("content") or "").strip()
+            if not brief:
+                raise ValueError(f"empty content, finish_reason={finish_reason}")
             if finish_reason == "length":
                 logger.warning(f"Sonar macro brief ({slot_label}): truncated by max_tokens "
                                 f"(finish_reason=length) — content may be cut off before "

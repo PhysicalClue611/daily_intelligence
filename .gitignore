@@ -19,6 +19,10 @@ sas_tracked_tickers.json
 sas_review.lock
 finance_calibration_log.jsonl
 
+# Runtime LLM selection overrides (issue #11) — edited outside code review;
+# llm_config.example.json in this repo documents the schema and defaults.
+llm_config.json
+
 # IBKR gateway — not distributed (broker-specific, contains platform binaries)
 ibkr/
 

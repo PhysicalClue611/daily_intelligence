@@ -17,6 +17,13 @@ to run_finance.py's SYSTEM_PROMPT constant) — that constant is a
 report-generation-specific prompt template that doesn't belong in a
 generic LLM-calling leaf module. All 3 call sites already pass it
 explicitly or were updated to.
+
+Model/provider/thinking/token choices are no longer literals here: they come
+from llm_config.py stages ("report_pass1"/"report_pass2"), which are runtime
+-overridable via llm_config.json (issue #11). This also retires the old
+`is_pass2 = (model == LLM_MODEL_PASS2)` inference, which coupled "which
+thinking config do I use" to string equality against a constant — that would
+have broken the moment pass 2's model was reconfigured to anything else.
 """
 import json
 import logging
@@ -25,6 +32,8 @@ import sys
 import time
 
 import httpx
+
+import llm_config
 
 # Cross-repo: canonical LLM-JSON-parsing helper lives in ~/Homepage (host-only
 # path). See CLAUDE.md "JSON 解析健壮性" note for why this isn't duplicated
@@ -37,20 +46,19 @@ logger = logging.getLogger(__name__)
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 OR_BASE_URL         = "https://openrouter.ai/api/v1/chat/completions"
 OR_ATTRIBUTION_HEADERS = {"HTTP-Referer": "https://github.com/PhysicalClue611/daily_intelligence", "X-OpenRouter-Title": "DailyIntel"}
-LLM_MODEL           = "deepseek/deepseek-v4-flash"
-LLM_MODEL_PASS2     = "deepseek/deepseek-v4-pro"
-LLM_FALLBACK_FLASH  = "google/gemini-3.1-flash-lite"  # OR flex fallback for v4-flash
-LLM_FALLBACK_PRO    = "google/gemini-3.5-flash"       # OR flex fallback for v4-pro
-DS_OR_PROVIDERS     = {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": True}
 
 def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
-             model: str = LLM_MODEL) -> dict:
-    """Call DeepSeek via OpenRouter, return parsed JSON dict. Retries on network errors.
-    Pass 2 (deepseek-v4-pro) uses thinking:enabled — required by Together/Fireworks to emit content.
-    Pass 1 (deepseek-v4-flash) sends NO thinking param — thinking:disabled breaks StreamLake fallback."""
-    is_pass2 = (model == LLM_MODEL_PASS2)
-    thinking_cfg = {"type": "enabled", "budget_tokens": 3000} if is_pass2 else None
-    max_tokens = 8000 if is_pass2 else 4000
+             stage: str = "report_pass1") -> dict:
+    """Call the configured model for `stage` via OpenRouter, return parsed JSON dict.
+
+    Retries on network/5xx/429 errors, then falls back to the stage's
+    fallback_model on OpenRouter flex. See llm_config.DEFAULTS for the
+    per-stage model, provider routing, thinking budget and token limits."""
+    cfg = llm_config.stage(stage)
+    model = cfg["model"]
+    thinking_cfg = cfg.get("thinking")
+    max_tokens = cfg["max_tokens"]
+    providers = cfg.get("providers")
     last_error = None
     for attempt in range(max_retries + 1):
         try:
@@ -67,13 +75,13 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                 },
                 json={
                     "model": model,
-                    "provider": DS_OR_PROVIDERS,
+                    **({"provider": providers} if providers else {}),
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt},
                     ],
                     "max_tokens": max_tokens,
-                    "temperature": 0.2,
+                    "temperature": cfg["temperature"],
                     **({"thinking": thinking_cfg} if thinking_cfg else {}),
                 },
                 timeout=180,
@@ -88,11 +96,17 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                 logger.warning(f"LLM attempt {attempt+1}: malformed HTTP JSON body: {e}")
                 continue
             usage = data.get("usage", {})
-            logger.info(f"LLM tokens: prompt={usage.get('prompt_tokens')} "
+            choice = data["choices"][0]
+            logger.info(f"LLM tokens [{stage}/{model}]: prompt={usage.get('prompt_tokens')} "
                         f"completion={usage.get('completion_tokens')} "
+                        f"reasoning={usage.get('completion_tokens_details', {}).get('reasoning_tokens')} "
+                        f"finish_reason={choice.get('finish_reason')} "
                         f"provider={data.get('provider', 'n/a')}")
+            if choice.get("finish_reason") == "length":
+                logger.warning(f"LLM [{stage}]: hit max_tokens={max_tokens} (finish_reason=length) — "
+                               f"output truncated; raise max_tokens in llm_config.json if this recurs")
 
-            msg = data["choices"][0]["message"]
+            msg = choice["message"]
             content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
             result = parse_llm_json(content, logger=logger)
             if not isinstance(result, dict):
@@ -133,7 +147,10 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
     logger.error(f"LLM exhausted {max_retries+1} attempts, last error: {last_error}")
 
     # OR flex fallback (gemini via OpenRouter, service_tier=flex)
-    fallback_model = LLM_FALLBACK_PRO if is_pass2 else LLM_FALLBACK_FLASH
+    fallback_model = cfg.get("fallback_model")
+    if not fallback_model:
+        logger.error(f"LLM [{stage}]: no fallback_model configured, giving up")
+        return {}
     logger.warning(f"OR primary unavailable, trying OR flex fallback: {fallback_model}")
     try:
         resp = httpx.post(
@@ -148,7 +165,7 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                     {"role": "user", "content": prompt},
                 ],
                 "max_tokens": max_tokens,
-                "temperature": 0.2,
+                "temperature": cfg["temperature"],
             },
             timeout=180,
         )

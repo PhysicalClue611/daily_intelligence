@@ -109,7 +109,8 @@ def test_none_content_primary_but_flex_succeeds():
         rf.httpx.post = orig_post
 
     assert [r["url"] for r in filtered] == [SAMPLE_RESULTS[0]["url"], SAMPLE_RESULTS[1]["url"]]
-    assert meta == {"provider": "FlexProvider", "fallback": True, "model": rf.LLM_FALLBACK_FLASH}
+    assert meta == {"provider": "FlexProvider", "fallback": True,
+                    "model": rf.llm_config.stage("semantic_filter")["fallback_model"]}
 
 
 def test_reasoning_content_key_used_when_content_missing():

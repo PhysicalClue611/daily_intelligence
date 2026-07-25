@@ -131,6 +131,38 @@ def test_max_tokens_bumped_to_1500():
     assert captured_payload["max_tokens"] == 1500
 
 
+def test_null_content_logs_before_raising_and_fails_open():
+    # issue #11 follow-up: content=None (budget exhausted on hidden reasoning,
+    # issue #53's failure mode) previously hit `.strip()` on a None before the
+    # finish_reason logging line ever ran — silently losing the one signal
+    # that would explain why the brief is empty. Must log first, then degrade
+    # to "" via the existing retry-then-fail-open path, not raise unlogged.
+    _patch_key()
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _FakeResponse({
+            "provider": "Perplexity",
+            "usage": {"prompt_tokens": 300, "completion_tokens": 60,
+                      "completion_tokens_details": {"reasoning_tokens": 60}},
+            "choices": [{"finish_reason": "length", "message": {"content": None}}],
+        })
+
+    orig_post = isrc.httpx.post
+    isrc.httpx.post = fake_post
+    orig_sleep = isrc.time.sleep
+    isrc.time.sleep = lambda *_: None  # skip the real 5s retry pause
+    try:
+        (section,), records = _with_capture(lambda: (
+            isrc._sonar_macro_brief("am", ["INTC"], [], [], [], NOW_ET),
+        ))
+    finally:
+        isrc.httpx.post = orig_post
+        isrc.time.sleep = orig_sleep
+
+    assert section == ""  # fail-open after both attempts exhausted
+    assert any("finish_reason=length" in r for r in records)  # logged, not lost
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = []

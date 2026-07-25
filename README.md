@@ -296,6 +296,7 @@ MemPalace is a separate project. If you have it running, the bridge endpoint is 
 Daily_Intelligence/
 ├── scripts/
 │   ├── run_finance.py          main report pipeline
+│   ├── llm_config.py           per-stage LLM selection + runtime override loader
 │   ├── fetch_prices.py         yfinance + Finnhub price fetching
 │   ├── fetch_news.py           RSS aggregation (14 feeds) + Guardian API
 │   ├── finance_email.py        Resend email client
@@ -312,6 +313,8 @@ Daily_Intelligence/
 │   ├── investment_operating_manual.example.md   starting point for Finance/Investment Operating Manual v1.0.md
 │   └── layer_a_prompt.example.md                starting point for Hermes/Daily Intelligence/Layer_A_Prompt.md
 ├── .env                        API keys (gitignored)
+├── llm_config.example.json     LLM selection schema + defaults (copy to llm_config.json to override)
+├── llm_config.json             runtime LLM selection overrides (optional, gitignored)
 ├── finance_tavily_budget.json  Tavily daily usage counter (auto-reset, gitignored)
 ├── finance_serpapi_budget.json SerpApi monthly counter (auto-reset, gitignored)
 ├── finance_parallel_budget.json Parallel estimated monthly spend counter (auto-reset, gitignored)

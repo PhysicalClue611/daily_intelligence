@@ -1,0 +1,94 @@
+{
+  "_note": [
+    "Runtime LLM selection overrides (issue #11). Copy to llm_config.json in this",
+    "same directory to activate; llm_config.json is gitignored so edits take effect",
+    "without a code change, PR or review.",
+    "",
+    "Anything omitted falls back to the built-in defaults in scripts/llm_config.py,",
+    "which are also what this file reproduces verbatim. Invalid values fall back",
+    "per field, not per file. Every effective override is logged at INFO on load",
+    "('LLM config override: <stage>.<field>: old -> new'), so grep the run log to",
+    "confirm a change took effect: /tmp/daily_intelligence.log (reports) or",
+    "/tmp/finance_telegram.log (bot).",
+    "",
+    "Report scripts re-read this file on every launchd run. The Telegram bot",
+    "re-reads it when its mtime changes, so no restart is needed for config-only",
+    "edits (code changes still require one, see docs/PITFALLS.md#32).",
+    "",
+    "Field notes: 'model'/'fallback_model' must be OpenRouter slugs ('vendor/model',",
+    "optionally '~vendor/model-latest'). 'providers' is OpenRouter's provider",
+    "routing object, or null for no pin. 'thinking' applies to the primary model;",
+    "'fallback_reasoning' is OpenRouter's unified reasoning-effort param applied to",
+    "the fallback model. Keys starting with '_' are ignored (JSON has no comments)."
+  ],
+  "stages": {
+    "report_pass1": {
+      "gateway": "openrouter",
+      "model": "deepseek/deepseek-v4-flash",
+      "providers": {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": true},
+      "thinking": null,
+      "max_tokens": 4000,
+      "temperature": 0.2,
+      "fallback_model": "google/gemini-3.1-flash-lite"
+    },
+    "report_pass2": {
+      "gateway": "openrouter",
+      "model": "deepseek/deepseek-v4-pro",
+      "providers": {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": true},
+      "thinking": {"type": "enabled", "budget_tokens": 3000},
+      "max_tokens": 8000,
+      "temperature": 0.2,
+      "fallback_model": "google/gemini-3.5-flash"
+    },
+    "semantic_filter": {
+      "gateway": "openrouter",
+      "model": "google/gemma-4-31b-it",
+      "providers": null,
+      "max_tokens": 200,
+      "temperature": 0.0,
+      "fallback_model": "google/gemini-3.1-flash-lite"
+    },
+    "macro_brief": {
+      "gateway": "openrouter",
+      "model": "perplexity/sonar",
+      "providers": {"order": ["Perplexity"], "allow_fallbacks": false},
+      "max_tokens": 1500,
+      "temperature": 0.1
+    },
+    "tg_preprocess": {
+      "_note": "Not deepseek-v4-flash: at temperature=0, 3 real reps of the identical simple command produced 3 different broken outcomes (hallucinated action, full truncation, mid-JSON truncation) — see llm_config.py DEFAULTS comment for the full writeup. gemma-4-31b-it reproduced clean on every rep across 5 command types.",
+      "gateway": "openrouter",
+      "model": "google/gemma-4-31b-it",
+      "providers": null,
+      "max_tokens": 600,
+      "temperature": 0.0,
+      "fallback_model": "google/gemini-3.1-flash-lite"
+    },
+    "tg_gap_detect": {
+      "_note": "Throwaway yes/no judgement on a 60-token budget — not deepseek-v4-flash, it burns the whole budget on hidden reasoning here even with no thinking key sent (verified live, issue #53/#11); gemma-4-31b-it reproduces clean.",
+      "gateway": "openrouter",
+      "model": "google/gemma-4-31b-it",
+      "providers": null,
+      "max_tokens": 60,
+      "temperature": 0.1,
+      "fallback_model": null
+    },
+    "tg_research": {
+      "gateway": "openrouter",
+      "model": "perplexity/sonar",
+      "max_tokens": 1500,
+      "temperature": 0.1
+    },
+    "tg_followup": {
+      "gateway": "openrouter",
+      "model": "deepseek/deepseek-v4-flash",
+      "providers": {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": true},
+      "thinking": {"type": "enabled", "budget_tokens": 3000},
+      "max_tokens": 12000,
+      "temperature": 0.3,
+      "fallback_model": "x-ai/grok-4.5",
+      "fallback_reasoning": {"effort": "medium"},
+      "fallback_max_tokens": 8000
+    }
+  }
+}

@@ -545,8 +545,12 @@ if f"## {today_et} {slot_label}" in monthly_file_content:
 ### 6.3 追问四步流水线
 
 ```
-Step 1  V4 Flash 统一预处理（~$0.0001）
+Step 1  google/gemma-4-31b-it 统一预处理（~$0.0001，stage `tg_preprocess`，issue #11）
         → 意图分类 + 精准英文搜索词 + relevant_tickers + 框架考量
+        注：非 deepseek-v4-flash——2026-07-25 用本 stage 真实 prompt 实测，temperature=0
+            下同一条简单指令（"删关键词 US-Iran blockade"）连续3次调用给出3种不同的错误结果
+            （枚举外的幻觉 action 值 / 预算耗尽 content 全空 / JSON 从中间截断），gemma 在5种
+            指令类型上全部正确复现，零 reasoning token
 
 Step 2  实时行情（三层路由）+ yfinance.news（免费，无配额）
         → _fetch_realtime_prices()：按 ET 时段路由数据源
@@ -588,17 +592,20 @@ Step 3  Parallel.ai search + extract（主，~$0.007-$0.012）
         → 失败 fallback：Sonar（重试1次→Exa model="exa"）
         进度提示："情报检索（N条查询）..."
 
-Step 4  DeepSeek V4 Flash via OR/Novita（主，~$0.002）
+Step 4  DeepSeek V4 Flash via OR（主，~$0.003，stage `tg_followup`）
         System: 投资框架（module-level cache）+ NYSE 时区推理要求
                 + 禁止对话体开场白（直接进入分析）
         User:   当前时刻(EDT/EST) + yfinance实时行情（价格基准） + yfinance.news
                 + Parallel.ai原文情报 + 持仓快照（均价，非现价）+ MemPalace
                 + question_intent
                 + 推理规则：以yfinance为价格唯一基准；无新催化剂直接声明动量延续
-        max_tokens=8000；thinking=disabled；自管3次重试；fallback: x-ai/grok-4.3（via OR）
+        max_tokens=12000；thinking=enabled（budget=3000，issue #11）；自管3次重试（timeout 180s）
+        fallback: x-ai/grok-4.5（via OR，reasoning.effort=medium，max_tokens 8000）
+        content 为空且 finish_reason=length 时报"预算耗尽"而非崩溃（issue #53 的崩溃形态）
         输出：自由展开分析（不设字数上限，参考维度：驱动力/持仓含义/待验证信号/信息缺口）
         注：Step 4 绕过 _deepseek_post()，自管重试确保 model_label 精确、Grok fallback 正确触发
-        注：DS_OR_PROVIDERS={"order":["Novita"],"allow_fallbacks":True}，隐私驱动（OR/Novita 不用于训练）
+        注：provider 路由与全部模型参数取自 llm_config stage `tg_followup`（issue #11），
+            可由 llm_config.json 运行时覆盖；bot 按文件 mtime 自动重载，无需重启
 
 总成本：~$0.010/次追问（无 P1 触发）；P1 触发时 ~$0.015（+$0.005 额外 Parallel）
 ```
@@ -671,29 +678,35 @@ IB美股持仓（成本价为均价，浮盈%为报告日数据供参考，实�
 
 ### 8.1 各环节选型
 
-所有 LLM 调用统一走 **OpenRouter**（`https://openrouter.ai/api/v1/chat/completions`）。DeepSeek 调用通过 `DS_OR_PROVIDERS={“order”:[“Novita”],”allow_fallbacks”:True}` 路由至 OR/Novita（fp8 量化版，隐私驱动——OR/Novita 不将用户数据用于训练）。不再有任何 DeepSeek 直连。
+所有 LLM 调用统一走 **OpenRouter**（`https://openrouter.ai/api/v1/chat/completions`）。不再有任何 DeepSeek 直连。
+
+**选型不再硬编码在各脚本里（issue #11，2026-07-25）**：下表的模型、provider 路由、thinking 预算、max_tokens、temperature 全部来自 `scripts/llm_config.py` 的 stage 定义，可由项目根目录的 `llm_config.json`（gitignored）在运行时覆盖，无需改代码/走 PR。`llm_config.py` 内置的 DEFAULTS 即下表内容，也是唯一的最终兜底：配置文件缺失、JSON 损坏、字段类型/取值非法时逐字段回退到默认值并记日志，不会让流水线崩掉。每一处生效的覆盖在加载时记 INFO 日志（`LLM config override: <stage>.<field>: old -> new`），因为该文件不在 git 里、事后无 diff 可查。仓库内 `llm_config.example.json` 是 schema 与默认值的说明性副本（有测试断言它与 DEFAULTS 完全一致）。
+
+stage 名与调用点对应：`report_pass1` / `report_pass2` / `semantic_filter` / `macro_brief` / `tg_preprocess` / `tg_gap_detect` / `tg_research` / `tg_followup`。
 
 | #   | 调用位置 | 用途 | 主力模型 | Fallback | max_tokens | 成本估算 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1   | `run_finance.py` Pass 1 | 报告草稿 + 生成 tavily_queries | `deepseek/deepseek-v4-flash` via OR/DigitalOcean→Venice | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.001 |
 | 2   | `run_finance.py` Pass 2 | 整合 Tavily 结果生成最终报告 | `deepseek/deepseek-v4-pro` via OR（thinking=enabled，budget=3000，Together/Fireworks 服务） | `google/gemini-3.5-flash` OR flex | 8000 | ~$0.01 |
-| 3   | `run_finance.py` Layer 2b | 语义过滤 15→10 条搜索结果 | `deepseek/deepseek-v4-flash` via OR/DigitalOcean→Venice | `google/gemini-3.1-flash-lite` OR flex | 80 | ~$0.000035 |
-| 4   | `run_finance.py` step 6c | Sonar 宏观快照（AM/PM 各一次） | `perplexity/sonar`（OR，`search_recency_filter="day"`，2026-07-02 加，见 issue #24） | 重试1次(5s) → `””` 空节 | 800 | ~$0.005（含固定搜索费） |
-| 5   | `telegram_commands.py` Step 1 | 统一预处理：意图分类 + 2条 query 生成 | `deepseek/deepseek-v4-flash` via OR/DigitalOcean→Venice | `google/gemini-3.1-flash-lite` OR flex | 250 | ~$0.0001 |
+| 3   | `run_finance.py` Layer 2b（stage `semantic_filter`） | 语义过滤 15→10 条搜索结果 | `google/gemma-4-31b-it`（OR，无 provider pin，issue #53/PR #54） | `google/gemini-3.1-flash-lite` OR flex | 200 | ~$0.0001 |
+| 4   | `intel_sources.py` step 6c（stage `macro_brief`） | Sonar 宏观快照（AM/PM 各一次） | `perplexity/sonar`（OR，`search_recency_filter="day"`，2026-07-02 加，见 issue #24） | 重试1次(5s) → `””` 空节 | 1500（issue #55 由 800 提高） | ~$0.005（含固定搜索费） |
+| 5   | `telegram_commands.py` Step 1（stage `tg_preprocess`） | 统一预处理：意图分类 + 2条 query 生成 | `google/gemma-4-31b-it`（OR，无 provider pin，issue #11） | `google/gemini-3.1-flash-lite` OR flex | 600 | ~$0.0001 |
 | 6   | `telegram_commands.py` Step 3 | 追问原文情报（2条 query + P1 可选第3条 + 3 URL extract，P2 聚合 URL 优先） | Parallel.ai SDK `parallel-web==0.4.2` | Sonar（重试1次→Exa） | — | ~$0.007（无P1）/ ~$0.012（P1触发） |
-| 6b  | `telegram_commands.py` Step 3 P1 | gap detection：是否需要第3条 query | `deepseek/deepseek-v4-flash` via OR/DigitalOcean→Venice | fail-open（不触发即跳过） | 60 | ~$0.0001 |
-| 7   | `telegram_commands.py` Step 4 | 个人化推理 | `deepseek/deepseek-v4-flash` via OR/DigitalOcean→Venice（自管重试） | `x-ai/grok-4.3`（OR） | 8000 | ~$0.002 |
+| 6b  | `telegram_commands.py` Step 3 P1（stage `tg_gap_detect`） | gap detection：是否需要第3条 query | `google/gemma-4-31b-it`（OR，无 provider pin，issue #11——原 deepseek-v4-flash 在此 prompt 上实测烧光60-token预算于隐藏推理，功能实际从未跑成功过） | fail-open（不触发即跳过） | 60 | ~$0.0001 |
+| 7   | `telegram_commands.py` Step 4（stage `tg_followup`） | 个人化推理 | `deepseek/deepseek-v4-flash` via OR/DigitalOcean→Venice（自管重试，**thinking=enabled，budget=3000**，issue #11） | `x-ai/grok-4.5`（OR，`reasoning={"effort":"medium"}`，max_tokens 8000） | 12000 | ~$0.003 |
 | 8   | `sas_review.py`（季度手动/自动触发，issue #32） | 直接打 SAS 四维度分（Strategic Space/Execution/Expectation Gap/Alpha Potential） | `~anthropic/claude-sonnet-latest`（OR） | 无（v1 故意不接，观察实际效果后再评估） | 4000 | ~$0.05（OR `usage.cost` 实际读取，无硬编码价格表） |
 
 **OR provider 实测结论（2026-06-02）：**
 - **V4 Flash**：DigitalOcean（FP16，高精度）、Venice（US 机房，全精度，实测可用）、StreamLake（OR 默认路由，精度未知，已在 OR 账户排除）可用。NovitaAI 不再服务 V4 Flash。
 - **V4 Pro**：Together、Fireworks 可用，必须传 `thinking:enabled+budget_tokens`，否则 content=None。DigitalOcean 不服务 V4 Pro。
 - **thinking 参数兼容性**：Flash 不得传 `thinking:disabled`（StreamLake fallback 时会导致 content=None）；Pro 必须传 `thinking:enabled`。
+- **Flash 开 thinking 的适用边界（issue #11，2026-07-25）**：TG 追问 Step 4 显式开 `thinking:enabled`（budget 3000）——不开时开放式持仓推理的答案质量明显更差。但这只对"输出预算充裕"的调用成立：issue #53 的生产崩溃正是 `max_tokens=80` 的判别式小任务被 reasoning token 吃光预算、`content` 返回 null。因此 Step 4（12000）与 gap detection（60）在 `llm_config.py` 中是两个独立 stage，互不共享 thinking 设置；Step 4 的响应解析也不再直接 `.strip()` content，`content` 为空且 `finish_reason=length` 时给出明确的"预算耗尽"提示而非抛异常。
+- **判别式/分类式小任务优先用天生无 reasoning 开关的模型，而非"关掉 thinking 的 DeepSeek"（issue #11，2026-07-25，参考 Obsidian `Hermes/Homepage/LLM-No-Reasoning-eval设计与实现.md`）**：`deepseek-v4-flash` 未显式传 `thinking` key 时，OpenRouter 侧默认值是否为 enabled 不可控，且同一 prompt 反复调用的隐藏推理量本身不稳定——`tg_gap_detect`（60-token 预算）和 `tg_preprocess`（意图分类+字段抽取）两处实测均复现出真实故障（前者预算耗尽返回 null content；后者 temperature=0 下同一条指令 3 次调用给出 3 种不同错误结果，含枚举外的幻觉 action 值）。`google/gemma-4-31b-it` 在同一 prompt 上零 reasoning token、输出稳定，已在跨项目题库（`LLM-No-Reasoning-eval`，21 case × n=10 全量测试 100% 通过）验证为这类"精确抽取/分类/格式服从"任务的默认推荐，不需要每个项目各自重新测。已知代价：`tg_preprocess` 的 `relevant_tickers` 字段在跨标的关联问题上比 deepseek 曾经给出的结果更保守（如"高通被制裁"只标 QCOM，不主动带出 INTC/NVDA），但 deepseek 自己在同一测试里也未能稳定给出这个"更丰富"的结果，不能算可靠优势。
 
 **注：**
 - #6 Parallel.ai SDK `parallel-web==0.4.2`（Hermes 容器版本），DI 宿主机使用同一版本；search 返回 WebSearchResult，extract 返回 ExtractResult；dedup → P2 聚合 URL 排序 → extract top 3；每篇正文截 4000 字
 - #6 fallback 链：Parallel.ai 失败 → Sonar（重试1次5s）→ Exa model=”exa”
-- #7 历经 Claude Sonnet → Gemini 3.5 Flash（格式过于机械否决）→ DeepSeek V4 Flash via OR/DigitalOcean（当前）；决策依据：Hermes/DI 对比验证”数据质量 > 模型档次”原则
+- #7 历经 Claude Sonnet → Gemini 3.5 Flash（格式过于机械否决）→ DeepSeek V4 Flash via OR/DigitalOcean（当前，2026-07-25 起开 thinking）；决策依据：Hermes/DI 对比验证”数据质量 > 模型档次”原则。fallback 由 `x-ai/grok-4.3` 升级为 `x-ai/grok-4.5`（2026-07-25 用真实调用验证 slug 与 `reasoning.effort` 参数均被 OR 接受，provider=xAI）
 - #4 step 6c Sonar 失败：重试1次 → `””` 空节（RSS 14源 + Sonar Extract 已覆盖宏观面，不走 Exa）
 - OR flex 延迟实测约 12-15s，作为应急路径可接受；gemini 模型不接受 `thinking` 参数，fallback 调用自动去掉
 
