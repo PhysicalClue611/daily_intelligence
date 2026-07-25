@@ -605,7 +605,7 @@ Step 4  DeepSeek V4 Flash via OR（主，~$0.003，stage `tg_followup`）
         输出：自由展开分析（不设字数上限，参考维度：驱动力/持仓含义/待验证信号/信息缺口）
         注：Step 4 绕过 _deepseek_post()，自管重试确保 model_label 精确、Grok fallback 正确触发
         注：provider 路由与全部模型参数取自 llm_config stage `tg_followup`（issue #11），
-            可由 llm_config.json 运行时覆盖；bot 按文件 mtime 自动重载，无需重启
+            可由 llm_config.json（git 追踪）运行时覆盖；bot 按文件 mtime 自动重载，无需重启
 
 总成本：~$0.010/次追问（无 P1 触发）；P1 触发时 ~$0.015（+$0.005 额外 Parallel）
 ```
@@ -680,7 +680,7 @@ IB美股持仓（成本价为均价，浮盈%为报告日数据供参考，实�
 
 所有 LLM 调用统一走 **OpenRouter**（`https://openrouter.ai/api/v1/chat/completions`）。不再有任何 DeepSeek 直连。
 
-**选型不再硬编码在各脚本里（issue #11，2026-07-25）**：下表的模型、provider 路由、thinking 预算、max_tokens、temperature 全部来自 `scripts/llm_config.py` 的 stage 定义，可由项目根目录的 `llm_config.json`（gitignored）在运行时覆盖，无需改代码/走 PR。`llm_config.py` 内置的 DEFAULTS 即下表内容，也是唯一的最终兜底：配置文件缺失、JSON 损坏、字段类型/取值非法时逐字段回退到默认值并记日志，不会让流水线崩掉。每一处生效的覆盖在加载时记 INFO 日志（`LLM config override: <stage>.<field>: old -> new`），因为该文件不在 git 里、事后无 diff 可查。仓库内 `llm_config.example.json` 是 schema 与默认值的说明性副本（有测试断言它与 DEFAULTS 完全一致）。
+**选型不再硬编码在各脚本里（issue #11，2026-07-25）**：下表的模型、provider 路由、thinking 预算、max_tokens、temperature 全部来自 `scripts/llm_config.py` 的 stage 定义，可由项目根目录的 `llm_config.json`（**git 追踪，非 gitignore**——最初照搬 `tg_offset.json` 那类运行时状态文件的套路做成了 gitignore，后来意识到这是人手改的、有意图的配置决策，跟 `watchlist.md` 是同一类东西而非机器写的临时状态，且不含任何敏感信息，没理由不入库；追踪进 git 不影响"改了立即生效不用走 PR"这条特性——那是 loader 每次读文件决定的，git 只是白得一份可追溯的修改历史）在运行时覆盖，无需改代码/走 PR。`llm_config.py` 内置的 DEFAULTS 即下表内容，也是唯一的最终兜底：配置文件缺失、JSON 损坏、字段类型/取值非法时逐字段回退到默认值并记日志，不会让流水线崩掉。每一处生效的覆盖在加载时记 INFO 日志（`LLM config override: <stage>.<field>: old -> new`）——git log 能看出改了什么、什么时候提交，但看不出某个具体进程运行时是否真的读到了这次改动，INFO 日志补的是这一层。仓库内 `llm_config.example.json` 是 schema 与默认值的说明性模板（有测试断言它与 DEFAULTS 完全一致）。
 
 stage 名与调用点对应：`report_pass1` / `report_pass2` / `semantic_filter` / `macro_brief` / `tg_preprocess` / `tg_gap_detect` / `tg_research` / `tg_followup`。
 

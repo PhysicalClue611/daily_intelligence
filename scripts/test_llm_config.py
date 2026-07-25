@@ -42,9 +42,10 @@ class _CaptureHandler(logging.Handler):
 def _load(payload, *, raw_text=None):
     """Write a config file (or delete it when payload is None) and reload.
 
-    Returns captured log records so tests can assert on the audit trail, which
-    is the only way an operator can tell an edit took effect (the file is
-    gitignored, so there is no diff to inspect).
+    Returns captured log records so tests can assert on the audit trail — the
+    log is what tells you whether a given process picked up an edit; git
+    history (the file is tracked) tells you what changed and when, but not
+    whether any particular run actually saw it.
     """
     if payload is None and raw_text is None:
         if CONFIG.exists():

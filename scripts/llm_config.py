@@ -8,11 +8,25 @@ PR -> review -> merge, which is disproportionate for what is really a tuning
 knob (see issue #11).
 
 This module centralises those choices into named *stages* whose values can be
-overridden at runtime by an optional JSON file (llm_config.json, gitignored)
-without touching code. The in-code DEFAULTS below remain the source of truth:
-a missing, unreadable, malformed or partially-invalid config file degrades to
-the defaults rather than breaking the pipeline, because these call sites sit in
-the AM/PM report path that runs unattended twice a trading day.
+overridden at runtime by an optional JSON file (llm_config.json, tracked in
+git — see the note below on why) without touching code. The in-code DEFAULTS
+below remain the source of truth: a missing, unreadable, malformed or
+partially-invalid config file degrades to the defaults rather than breaking
+the pipeline, because these call sites sit in the AM/PM report path that runs
+unattended twice a trading day.
+
+Why llm_config.json is git-tracked, not gitignored: it was gitignored in an
+earlier version of this PR, copying the pattern used for tg_offset.json and
+the budget-tracker counters — but those are machine-written ephemeral state
+(losing one just resets a counter to 0), and this is a hand-edited,
+deliberate configuration decision (which model, which fallback), the same
+category as watchlist.md, not tg_offset.json. Unlike watchlist.md it holds no
+personal/sensitive data, so there's no reason to keep it out of git. Tracking
+it costs nothing — "edit it and it takes effect without a PR" is a property
+of the loader re-reading the file at runtime, not of whether git happens to
+track it — and it buys a real audit trail (`git log llm_config.json`) plus
+protection against silently losing a deliberate choice back to DEFAULTS if
+the file is ever deleted.
 
 Design notes
 ------------
@@ -20,8 +34,11 @@ Design notes
   default model and logs a warning; it does not invalidate the whole file or
   the other stages.
 - Every effective override is logged at INFO on load ("stage.field: A -> B").
-  Without this, a later "why did output quality/cost change?" investigation has
-  no way to tell whether the config was edited, since the file is not in git.
+  This is still worth having even though the file is git-tracked: git log
+  tells you *what* changed and *when it was committed*, not whether a given
+  process actually picked it up on a given run (a stale in-memory cache, or
+  an edit made after the process last read the file, wouldn't show up any
+  other way).
 - Stage schemas are closed: a stage only accepts the keys present in its own
   DEFAULTS entry. Unknown stages and unknown keys are warned about and ignored,
   which catches typos (`"modle"`) that would otherwise silently do nothing.

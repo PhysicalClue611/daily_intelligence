@@ -313,8 +313,8 @@ Daily_Intelligence/
 │   ├── investment_operating_manual.example.md   starting point for Finance/Investment Operating Manual v1.0.md
 │   └── layer_a_prompt.example.md                starting point for Hermes/Daily Intelligence/Layer_A_Prompt.md
 ├── .env                        API keys (gitignored)
-├── llm_config.example.json     LLM selection schema + defaults (copy to llm_config.json to override)
-├── llm_config.json             runtime LLM selection overrides (optional, gitignored)
+├── llm_config.example.json     LLM selection schema + defaults (documented template)
+├── llm_config.json             active LLM selection config (git-tracked; edit directly, no PR needed for it to take effect)
 ├── finance_tavily_budget.json  Tavily daily usage counter (auto-reset, gitignored)
 ├── finance_serpapi_budget.json SerpApi monthly counter (auto-reset, gitignored)
 ├── finance_parallel_budget.json Parallel estimated monthly spend counter (auto-reset, gitignored)
