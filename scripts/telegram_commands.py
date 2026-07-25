@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 
 from telegram_utils import call_telegram
 from calibration import format_calibration_metrics_report
+import llm_config
 from quota_store import save_quota
 from budget_trackers import (
     load_budget, load_serpapi_budget, TAVILY_DAILY_LIMIT, SERPAPI_MONTHLY_LIMIT,
@@ -68,9 +69,10 @@ PARALLEL_API_KEY   = os.getenv("PARALLEL_API_KEY", "")
 OR_BASE_URL        = "https://openrouter.ai/api/v1/chat/completions"
 OR_ATTRIBUTION_HEADERS = {"HTTP-Referer": "https://github.com/PhysicalClue611/daily_intelligence", "X-OpenRouter-Title": "DailyIntel"}
 EXA_BASE_URL       = "https://api.exa.ai/chat/completions"
-LLM_MODEL          = "deepseek/deepseek-v4-flash"
-LLM_FALLBACK_FLASH = "google/gemini-3.1-flash-lite"   # OR flex fallback for v4-flash
-DS_OR_PROVIDERS    = {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": True}
+# Model/provider/thinking/token selection per pipeline step lives in
+# llm_config.py and is runtime-overridable via llm_config.json (issue #11).
+# Stages used here: tg_preprocess (step 1) / tg_research (step 3 Sonar
+# fallback) / tg_gap_detect (P1 gap probe) / tg_followup (step 4 reasoning).
 
 _PROJ_DIR = Path(__file__).parent.parent
 OFFSET_FILE = _PROJ_DIR / "tg_offset.json"
@@ -462,9 +464,9 @@ def _build_status() -> str:
         f"报告任务（5:30/20:59 PT）：{html.escape(report_task)}\n"
         f"Telegram bot（常驻）：{html.escape(tg_task)}\n\n"
         f"<b>推理流水线</b>\n"
-        f"预处理+指令分类：{html.escape(LLM_MODEL)}\n"
-        f"搜索+事件合成：Parallel.ai主路径，{html.escape(SEARCH_MODEL)} fallback\n"
-        f"个人化推理：{html.escape(REASONING_MODEL)}（Azure）"
+        f"预处理+指令分类：{html.escape(llm_config.describe('tg_preprocess'))}\n"
+        f"搜索+事件合成：Parallel.ai主路径，{html.escape(llm_config.model('tg_research'))} fallback\n"
+        f"个人化推理：{html.escape(llm_config.describe('tg_followup'))}"
     )
 
 
@@ -501,10 +503,14 @@ def _openrouter_post(payload: dict, timeout: int = 30, max_retries: int = 2):
     raise last_error
 
 
-def _deepseek_post(payload: dict, timeout: int = 30, max_retries: int = 2):
-    """POST to DeepSeek V4 Flash via OpenRouter with retry on network/5xx errors. Raises on terminal failure.
-    No thinking param — thinking:disabled breaks StreamLake; Flash defaults to no-thinking without it."""
-    payload = {**payload, "provider": DS_OR_PROVIDERS}
+def _deepseek_post(payload: dict, timeout: int = 30, max_retries: int = 2,
+                   stage: str = "tg_preprocess"):
+    """POST to the configured model for `stage` via OpenRouter, retrying on network/5xx errors.
+    Raises on terminal failure. Provider routing and the OR-flex fallback model come from
+    llm_config; `payload` still carries model/messages/max_tokens from the call site."""
+    cfg = llm_config.stage(stage)
+    providers = cfg.get("providers")
+    payload = {**payload, **({"provider": providers} if providers else {})}
     last_error = None
     for attempt in range(max_retries + 1):
         try:
@@ -532,10 +538,13 @@ def _deepseek_post(payload: dict, timeout: int = 30, max_retries: int = 2):
             last_error = e
             logger.warning(f"DS attempt {attempt+1}: {e}")
 
-    # OR flex fallback (gemini-3.1-flash-lite via OpenRouter, service_tier=flex)
-    logger.warning(f"OR/Novita unavailable, trying OR flex fallback: {LLM_FALLBACK_FLASH}")
+    # OR flex fallback (service_tier=flex) on the stage's configured fallback model
+    fallback_model = cfg.get("fallback_model")
+    if not fallback_model:
+        raise last_error
+    logger.warning(f"OR primary unavailable, trying OR flex fallback: {fallback_model}")
     or_payload = {k: v for k, v in payload.items() if k not in ("thinking", "provider")}
-    or_payload["model"] = LLM_FALLBACK_FLASH
+    or_payload["model"] = fallback_model
     or_payload["service_tier"] = "flex"
     try:
         resp = httpx.post(
@@ -546,7 +555,7 @@ def _deepseek_post(payload: dict, timeout: int = 30, max_retries: int = 2):
             timeout=120,
         )
         resp.raise_for_status()
-        logger.info(f"OR flex fallback succeeded: {LLM_FALLBACK_FLASH}")
+        logger.info(f"OR flex fallback succeeded: {fallback_model}")
         return resp
     except Exception as e:
         logger.warning(f"OR flex fallback also failed: {e}")
@@ -603,12 +612,13 @@ followup类必填（action == followup）：
 日期映射：今天={today} 昨天={yesterday} 盘后=after-hours"""
 
     try:
+        pre_cfg = llm_config.stage("tg_preprocess")
         resp = _deepseek_post({
-            "model": LLM_MODEL,
+            "model": pre_cfg["model"],
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 600,
-            "temperature": 0,
-        }, timeout=20)
+            "max_tokens": pre_cfg["max_tokens"],
+            "temperature": pre_cfg["temperature"],
+        }, timeout=20, stage="tg_preprocess")
         msg = resp.json()["choices"][0]["message"]
         result = parse_llm_json(msg.get("content") or msg.get("reasoning_content") or "", logger=logger)
         if not isinstance(result, dict):
@@ -624,10 +634,6 @@ followup类必填（action == followup）：
         logger.warning(f"Unified preprocess failed: {e}")
         return {"action": "unknown"}
 
-
-SEARCH_MODEL       = "perplexity/sonar"                 # step 3: sonar fallback
-REASONING_MODEL    = "deepseek/deepseek-v4-flash"       # step 4: primary (OR/Novita)
-REASONING_FALLBACK = "x-ai/grok-4.3"                   # step 4: fallback on any failure
 
 # ── Follow-up context builders ────────────────────────────────────────────────
 
@@ -897,15 +903,16 @@ def _detect_research_gap(question_intent: str, queries: list[str], brief: str) -
             "If coverage is sufficient, output exactly: null\n"
             "Output only the query or null, nothing else."
         )
+        gap_cfg = llm_config.stage("tg_gap_detect")
         resp = httpx.post(
             OR_BASE_URL,
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
             json={
-                "model": REASONING_MODEL,
-                "provider": DS_OR_PROVIDERS,
+                "model": gap_cfg["model"],
+                **({"provider": gap_cfg["providers"]} if gap_cfg["providers"] else {}),
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 60,
-                "temperature": 0.1,
+                "max_tokens": gap_cfg["max_tokens"],
+                "temperature": gap_cfg["temperature"],
             },
             timeout=15,
         )
@@ -962,14 +969,15 @@ def _sonar_research(query: str, price_context: str = "") -> str:
             "If you cannot find a new catalyst for today specifically, say so explicitly — "
             "do NOT infer today's price move from historical articles."
         )
+    research_cfg = llm_config.stage("tg_research")
     payload = {
-        "model": SEARCH_MODEL,
+        "model": research_cfg["model"],
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": query},
         ],
-        "max_tokens": 1500,
-        "temperature": 0.1,
+        "max_tokens": research_cfg["max_tokens"],
+        "temperature": research_cfg["temperature"],
         # Restricts Perplexity's underlying search to sources published in the
         # last 24h — confirmed passed through by OpenRouter, not silently
         # dropped. See run_finance.py's _sonar_macro_brief for the incident
@@ -1363,37 +1371,86 @@ def _llm_followup(question: str, pre: dict) -> str:
         {"role": "user", "content": "\n\n".join(user_parts)},
     ]
 
-    # Step 4: DeepSeek V4 Flash via OR/Novita (own retry, bypasses _deepseek_post OR-flex fallback)
-    # → Grok 4.3 via OR on total failure. model_label reflects actual model used.
-    model_label = "V4 Flash"
+    try:
+        answer, model_label = _followup_reason(messages)
+    except _FollowupError as e:
+        return str(e)
+
+    # Kept inside a catch-all, as before the Step 4 extraction: run()'s polling
+    # loop calls execute() without any try/except, so anything escaping here
+    # kills the daemon (KeepAlive restarts it, and the same message would
+    # re-trigger the crash — see docs/PITFALLS.md#82).
+    try:
+        _append_followup(question, search_query, research_brief, answer, now_str,
+                         research_source=research_source)
+        otc_note = " · 本回答未纳入场外OTC/隔夜报价" if _off_hours_no_otc else ""
+        pre_label = llm_config.model("tg_preprocess")
+        final_html = (f"{html.escape(answer)}\n\n<i>{html.escape(now_str)} · "
+                      f"{html.escape(pre_label)} + {html.escape(research_source)} + "
+                      f"{html.escape(model_label)}{html.escape(otc_note)}</i>")
+        reply_html(final_html)
+        return ""
+    except Exception as e:
+        logger.error(f"Followup reply failed after successful reasoning: {e}")
+        return f"（回复发送失败：{e}）"
+
+
+class _FollowupError(Exception):
+    """Step 4 failure carrying the exact text to reply to the user with."""
+
+
+def _followup_reason(messages: list[dict]) -> tuple[str, str]:
+    """Step 4: personalised reasoning over the research brief.
+
+    Uses llm_config stage "tg_followup" with its own retry loop, deliberately
+    bypassing _deepseek_post's OR-flex fallback so the returned model label
+    reflects the model that actually answered.
+
+    Thinking is enabled here by default, unlike every other DeepSeek call in
+    this project (issue #11): answer quality on open-ended portfolio reasoning
+    degrades badly without it. The guard rails that make that safe are the
+    large max_tokens and the empty-content check below — with thinking on,
+    `content` comes back null when reasoning tokens eat the whole budget,
+    which is exactly how issue #53 crashed in production.
+
+    Returns (answer, model_label). Raises _FollowupError with user-facing text.
+    """
+    fu_cfg = llm_config.stage("tg_followup")
+    model_label = fu_cfg["model"]
     resp = None
     last_err = None
     for attempt in range(3):
         try:
             if attempt > 0:
                 wait = 2 ** attempt
-                logger.info(f"Step 4 DS retry {attempt}/2 after {wait}s...")
+                logger.info(f"Step 4 primary retry {attempt}/2 after {wait}s...")
                 time.sleep(wait)
             resp = httpx.post(
                 OR_BASE_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
                          "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
-                json={"model": REASONING_MODEL, "provider": DS_OR_PROVIDERS,
+                json={"model": fu_cfg["model"],
+                      **({"provider": fu_cfg["providers"]} if fu_cfg["providers"] else {}),
                       "messages": messages,
-                      "max_tokens": 8000, "temperature": 0.3},
-                timeout=120,
+                      "max_tokens": fu_cfg["max_tokens"],
+                      "temperature": fu_cfg["temperature"],
+                      **({"thinking": fu_cfg["thinking"]} if fu_cfg["thinking"] else {})},
+                # 180s, not the pre-thinking 120s: reasoning tokens are generated
+                # before the first visible token, so a timeout tuned for
+                # no-thinking latency would push every call to the fallback.
+                timeout=180,
             )
             resp.raise_for_status()
             break
         except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError,
                 httpx.ConnectTimeout, httpx.ReadTimeout) as e:
             last_err = e
-            logger.warning(f"Step 4 DS attempt {attempt+1}: {e}")
+            logger.warning(f"Step 4 primary attempt {attempt+1}: {e}")
             resp = None
         except httpx.HTTPStatusError as e:
             if e.response.status_code >= 500:
                 last_err = e
-                logger.warning(f"Step 4 DS attempt {attempt+1}: HTTP {e.response.status_code}")
+                logger.warning(f"Step 4 primary attempt {attempt+1}: HTTP {e.response.status_code}")
                 resp = None
             else:
                 last_err = e
@@ -1401,29 +1458,55 @@ def _llm_followup(question: str, pre: dict) -> str:
                 break
 
     if resp is None:
-        logger.warning(f"Step 4 DeepSeek exhausted, trying {REASONING_FALLBACK}")
+        fallback_model = fu_cfg.get("fallback_model")
+        if not fallback_model:
+            raise _FollowupError(f"（LLM 调用失败：{last_err}）")
+        logger.warning(f"Step 4 primary exhausted ({last_err}), trying {fallback_model}")
         try:
             resp = _openrouter_post({
-                "model": REASONING_FALLBACK,
+                "model": fallback_model,
                 "messages": messages,
-                "max_tokens": 8000,
-                "temperature": 0.3,
-            }, timeout=120)
-            model_label = "Grok 4.3"
+                "max_tokens": fu_cfg.get("fallback_max_tokens") or fu_cfg["max_tokens"],
+                "temperature": fu_cfg["temperature"],
+                # OpenRouter's unified reasoning-effort param (the fallback is a
+                # reasoning model; "medium" is an effort level, not a model slug).
+                **({"reasoning": fu_cfg["fallback_reasoning"]} if fu_cfg.get("fallback_reasoning") else {}),
+            }, timeout=180)
+            model_label = fallback_model
         except Exception as e2:
-            return f"（LLM 调用失败：{e2}）"
+            raise _FollowupError(f"（LLM 调用失败：{e2}）")
 
     try:
-        raw_content = resp.json()["choices"][0]["message"]["content"].strip()
-        answer = raw_content
-        _append_followup(question, search_query, research_brief, answer, now_str,
-                         research_source=research_source)
-        otc_note = " · 本回答未纳入场外OTC/隔夜报价" if _off_hours_no_otc else ""
-        final_html = f"{html.escape(answer)}\n\n<i>{html.escape(now_str)} · V4 Flash + {html.escape(research_source)} + {html.escape(model_label)}{html.escape(otc_note)}</i>"
-        reply_html(final_html)
-        return ""
+        data = resp.json()
+        choice = data["choices"][0]
+        msg = choice["message"]
+        usage = data.get("usage", {})
+        finish_reason = choice.get("finish_reason")
     except Exception as e:
-        return f"（LLM 调用失败：{e}）"
+        raise _FollowupError(f"（LLM 调用失败：{e}）")
+
+    # Same observability shape as the report pipeline (issue #55): without these
+    # numbers, diagnosing a thinking-budget problem needs extra paid calls after
+    # the fact.
+    logger.info(f"Step 4 tokens [{model_label}]: prompt={usage.get('prompt_tokens')} "
+                f"completion={usage.get('completion_tokens')} "
+                f"reasoning={usage.get('completion_tokens_details', {}).get('reasoning_tokens')} "
+                f"finish_reason={finish_reason} provider={data.get('provider', 'n/a')}")
+
+    # Never .strip() content directly: it is null when reasoning consumed the
+    # whole budget (issue #53's exact production crash).
+    answer = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+    if not answer:
+        if finish_reason == "length":
+            logger.error(f"Step 4 [{model_label}]: budget exhausted before any visible answer "
+                         f"(finish_reason=length, empty content) — raise tg_followup.max_tokens "
+                         f"or lower thinking.budget_tokens in llm_config.json")
+            raise _FollowupError(
+                "（推理失败：模型用尽 token 预算仍未产出可见回答，"
+                "可调高 llm_config.json 中 tg_followup.max_tokens 后重试）")
+        logger.error(f"Step 4 [{model_label}]: empty answer, finish_reason={finish_reason}")
+        raise _FollowupError("（推理失败：模型返回空回答）")
+    return answer, model_label
 
 
 def _append_followup(question: str, search_query: str,
