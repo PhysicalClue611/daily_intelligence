@@ -187,6 +187,70 @@ def test_config_override_changes_the_call():
         llm_config.reload()
 
 
+def test_gap_detect_defaults_to_gemma_not_deepseek():
+    # Live-verified 2026-07-25: deepseek-v4-flash burns the whole 60-token
+    # budget on hidden reasoning on this exact prompt shape (finish_reason=
+    # length, reasoning_tokens=60, content=None) even with no thinking key
+    # sent — issue #53's failure mode, previously masked here because this
+    # function's own except swallows it silently and returns None (treated
+    # as "no gap"), meaning gap detection never actually worked, only
+    # appeared to fail open cleanly.
+    assert llm_config.model("tg_gap_detect") == "google/gemma-4-31b-it"
+
+
+def test_gap_detect_null_content_is_logged_not_raised():
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _FakeResponse({
+            "provider": "DeepSeek",
+            "usage": {"prompt_tokens": 200, "completion_tokens": 60,
+                      "completion_tokens_details": {"reasoning_tokens": 60}},
+            "choices": [{"finish_reason": "length", "message": {"content": None}}],
+        })
+
+    orig = tc.httpx.post
+    tc.httpx.post = fake_post
+    try:
+        result = tc._detect_research_gap("why is INTC up", ["INTC catalyst"], "some brief")
+    finally:
+        tc.httpx.post = orig
+    assert result is None  # fails open; the point is it doesn't raise
+
+
+def test_gap_detect_returns_query_on_gap_found():
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _FakeResponse({
+            "provider": "OpenInference",
+            "usage": {"prompt_tokens": 200, "completion_tokens": 12},
+            "choices": [{"finish_reason": "stop",
+                        "message": {"content": '"INTC foundry customer confirmation"'}}],
+        })
+
+    orig = tc.httpx.post
+    tc.httpx.post = fake_post
+    try:
+        result = tc._detect_research_gap("why is INTC up", ["INTC catalyst"], "some brief")
+    finally:
+        tc.httpx.post = orig
+    assert result == "INTC foundry customer confirmation"
+
+
+def test_gap_detect_null_returns_none():
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _FakeResponse({
+            "provider": "OpenInference",
+            "usage": {"prompt_tokens": 200, "completion_tokens": 2},
+            "choices": [{"finish_reason": "stop", "message": {"content": "null"}}],
+        })
+
+    orig = tc.httpx.post
+    tc.httpx.post = fake_post
+    try:
+        result = tc._detect_research_gap("why is INTC up", ["INTC catalyst"], "some brief")
+    finally:
+        tc.httpx.post = orig
+    assert result is None
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

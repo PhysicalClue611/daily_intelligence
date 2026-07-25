@@ -917,7 +917,16 @@ def _detect_research_gap(question_intent: str, queries: list[str], brief: str) -
             timeout=15,
         )
         resp.raise_for_status()
-        result = resp.json()["choices"][0]["message"]["content"].strip().strip('"\'')
+        data = resp.json()
+        choice = data["choices"][0]
+        msg = choice["message"]
+        # content is None when the model burns the whole budget on hidden
+        # reasoning (issue #53's failure mode) — never .strip() it directly.
+        if not (msg.get("content") or msg.get("reasoning_content")):
+            logger.debug(f"Gap detection: empty content, finish_reason="
+                        f"{choice.get('finish_reason')} model={gap_cfg['model']}")
+            return None
+        result = (msg.get("content") or msg.get("reasoning_content") or "").strip().strip('"\'')
         if result.lower() in ("null", "none", "no", ""):
             return None
         return result if len(result) < 150 else None  # sanity-cap
@@ -944,7 +953,8 @@ def _exa_search(query: str) -> str:
             timeout=30,
         )
         resp.raise_for_status()
-        brief = resp.json()["choices"][0]["message"]["content"].strip()
+        msg = resp.json()["choices"][0]["message"]
+        brief = (msg.get("content") or "").strip()
         logger.info(f"Exa fallback brief: {len(brief)} chars")
         return brief
     except Exception as e:
@@ -987,7 +997,10 @@ def _sonar_research(query: str, price_context: str = "") -> str:
     for attempt in range(2):
         try:
             resp = _openrouter_post(payload, timeout=30)
-            brief = resp.json()["choices"][0]["message"]["content"].strip()
+            msg = resp.json()["choices"][0]["message"]
+            brief = (msg.get("content") or "").strip()
+            if not brief:
+                raise ValueError("Sonar returned empty content")
             logger.info(f"Sonar brief: {len(brief)} chars")
             return brief
         except Exception as e:

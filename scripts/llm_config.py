@@ -111,11 +111,21 @@ DEFAULTS: dict[str, dict] = {
     },
     "tg_gap_detect": {
         "gateway": "openrouter",
-        "model": "deepseek/deepseek-v4-flash",
-        "providers": _DS_PROVIDERS,
-        # Deliberately no thinking: 60 output tokens is the entire budget.
+        # Not deepseek-v4-flash: verified live (2026-07-25) that it burns the
+        # entire 60-token budget on hidden reasoning on this exact prompt shape
+        # even with no thinking key sent — finish_reason=length,
+        # reasoning_tokens=60, content=None. That is issue #53's failure mode,
+        # here caught by this function's own try/except so it fails open
+        # silently instead of crashing the bot, but the practical effect was
+        # that gap detection never actually ran; every call returned None.
+        # google/gemma-4-31b-it (already validated for the structurally
+        # identical semantic_filter judgement call, PR #54) reproduces clean
+        # on this prompt: finish_reason=stop, reasoning_tokens=0.
+        "model": "google/gemma-4-31b-it",
+        "providers": None,
         "max_tokens": 60,
         "temperature": 0.1,
+        "fallback_model": None,
     },
     "tg_research": {
         "gateway": "openrouter",

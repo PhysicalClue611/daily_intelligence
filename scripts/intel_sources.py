@@ -227,13 +227,18 @@ def _sonar_macro_brief(
             resp.raise_for_status()
             data = resp.json()
             choice = data["choices"][0]
-            brief = choice["message"]["content"].strip()
             usage = data.get("usage", {})
             finish_reason = choice.get("finish_reason")
-            logger.info(f"Sonar macro brief ({slot_label}): {len(brief)} chars "
+            # Log usage/finish_reason before touching content: a None content
+            # (budget exhausted on hidden reasoning, issue #53's failure mode)
+            # must not raise AttributeError before this diagnostic line runs.
+            logger.info(f"Sonar macro brief ({slot_label}): "
                         f"prompt_tokens={usage.get('prompt_tokens')} "
                         f"completion_tokens={usage.get('completion_tokens')} "
                         f"finish_reason={finish_reason} provider={data.get('provider', 'n/a')}")
+            brief = (choice["message"].get("content") or "").strip()
+            if not brief:
+                raise ValueError(f"empty content, finish_reason={finish_reason}")
             if finish_reason == "length":
                 logger.warning(f"Sonar macro brief ({slot_label}): truncated by max_tokens "
                                 f"(finish_reason=length) — content may be cut off before "

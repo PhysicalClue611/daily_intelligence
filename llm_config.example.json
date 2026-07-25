@@ -64,12 +64,13 @@
       "fallback_model": "google/gemini-3.1-flash-lite"
     },
     "tg_gap_detect": {
-      "_note": "Throwaway yes/no judgement on a 60-token budget — do not enable thinking here (issue #53).",
+      "_note": "Throwaway yes/no judgement on a 60-token budget — not deepseek-v4-flash, it burns the whole budget on hidden reasoning here even with no thinking key sent (verified live, issue #53/#11); gemma-4-31b-it reproduces clean.",
       "gateway": "openrouter",
-      "model": "deepseek/deepseek-v4-flash",
-      "providers": {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": true},
+      "model": "google/gemma-4-31b-it",
+      "providers": null,
       "max_tokens": 60,
-      "temperature": 0.1
+      "temperature": 0.1,
+      "fallback_model": null
     },
     "tg_research": {
       "gateway": "openrouter",
