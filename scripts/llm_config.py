@@ -100,11 +100,36 @@ DEFAULTS: dict[str, dict] = {
     },
     # ── Telegram pipeline (telegram_commands.py) ──
     "tg_preprocess": {
+        # Not deepseek-v4-flash: at temperature=0 on this stage's actual
+        # prompt, 3 back-to-back real calls for the identical simple command
+        # ("删关键词 US-Iran blockade") produced 3 different outcomes — a
+        # hallucinated action value outside the enum ("remove_keyword"),
+        # complete truncation (finish_reason=length, reasoning=600/600,
+        # content=""), and a mid-JSON truncation landing on the "unknown"
+        # fallback — none of them the correct "remove_geo". A separate case
+        # ("如果高通被制裁我该怎么办") got the schema's "query" field replaced
+        # with a rambling Chinese reply instead of an English search string in
+        # one of two reps. docs/PITFALLS.md#55 already raised max_tokens once
+        # for this exact truncation shape; the fix didn't hold because
+        # deepseek-v4-flash's implicit reasoning volume on this prompt is
+        # itself unstable, not because the budget was too tight one time.
+        # google/gemma-4-31b-it reproduced correct, schema-compliant,
+        # zero-reasoning-token output on every rep across 5 distinct command
+        # types (2026-07-25) — consistent with its 210/210 result across the
+        # full no-reasoning eval suite (Obsidian "LLM-No-Reasoning-eval设计与
+        # 实现" §15). One observed trade-off: on a cross-ticker risk question,
+        # gemma's relevant_tickers stayed narrower (QCOM only) where deepseek
+        # sometimes (not consistently — see above) pulled in correlated
+        # holdings (QCOM, INTC, NVDA). Judged an acceptable trade against
+        # correctly executing basic add/remove commands, which is this
+        # stage's primary job.
         "gateway": "openrouter",
-        "model": "deepseek/deepseek-v4-flash",
-        "providers": _DS_PROVIDERS,
+        "model": "google/gemma-4-31b-it",
+        "providers": None,
         # 600 is deliberate headroom over the JSON schema this stage emits;
         # it was raised once already after truncation (docs/PITFALLS.md#55).
+        # With gemma's reasoning_tokens=0 there is no longer a variable
+        # consuming that headroom before the JSON itself.
         "max_tokens": 600,
         "temperature": 0.0,
         "fallback_model": "google/gemini-3.1-flash-lite",

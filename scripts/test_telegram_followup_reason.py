@@ -187,6 +187,38 @@ def test_config_override_changes_the_call():
         llm_config.reload()
 
 
+def test_preprocess_defaults_to_gemma_not_deepseek():
+    # Live-verified 2026-07-25 on this stage's actual prompt: deepseek-v4-flash
+    # at temperature=0 gave 3 different broken outcomes across 3 reps of the
+    # identical simple command ("删关键词 US-Iran blockade") — a hallucinated
+    # action value outside the enum, full truncation (content=""), and a
+    # mid-JSON truncation landing on "unknown". gemma-4-31b-it reproduced
+    # correct, schema-compliant output on every rep across 5 command types.
+    assert llm_config.model("tg_preprocess") == "google/gemma-4-31b-it"
+
+
+def test_preprocess_handles_markdown_fenced_json():
+    # gemma wraps its output in ```json fences even when told not to
+    # (observed on every real call) — parse_llm_json must strip them; this
+    # guards against a future regression silently breaking every command.
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _FakeResponse({
+            "provider": "OpenInference",
+            "usage": {"prompt_tokens": 300, "completion_tokens": 30},
+            "choices": [{"finish_reason": "stop", "message": {
+                "content": '```json\n{"action": "add_ticker", "section": "个股与基金", "item": "MSFT"}\n```'
+            }}],
+        })
+
+    orig = tc.httpx.post
+    tc.httpx.post = fake_post
+    try:
+        result = tc._unified_preprocess("加 MSFT")
+    finally:
+        tc.httpx.post = orig
+    assert result == {"action": "add_ticker", "section": "个股与基金", "item": "MSFT"}
+
+
 def test_gap_detect_defaults_to_gemma_not_deepseek():
     # Live-verified 2026-07-25: deepseek-v4-flash burns the whole 60-token
     # budget on hidden reasoning on this exact prompt shape (finish_reason=
