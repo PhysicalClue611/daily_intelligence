@@ -32,6 +32,26 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-07-25，issue #11 / PR #56）
+
+**LLM 选型集中到 `scripts/llm_config.py` + `llm_config.json`（git 追踪，可运行时改，不需要 PR）**。issue #11 原始范围是"评估用 Grok 替换 DeepSeek 做 TG 追问 Step4 主力"，实现中范围扩大为：① 全项目 8 个 LLM 调用点（`report_pass1`/`report_pass2`/`semantic_filter`/`macro_brief`/`tg_preprocess`/`tg_gap_detect`/`tg_research`/`tg_followup`）集中为 `llm_config.py` 里的 named stage，可由项目根目录 `llm_config.json` 逐字段覆盖；② 加载器 fail-safe：文件缺失/损坏/字段非法逐字段回退默认值并记 WARNING，不让流水线崩；③ 新增跨字段校验 `_enforce_thinking_budget()`——`max_tokens` 必须比 `thinking.budget_tokens` 多至少 500，否则两个字段一起回退（防止手改配置复现 issue #53 的预算耗尽）；④ `_v_providers` 透传未知 provider key（如 `data_collection`）而非静默丢弃；⑤ `_build()`/`stage()` 用 `copy.deepcopy`，避免多个 stage 共享的 provider 默认对象被跨 stage 污染。
+
+**`tg_followup`（Step4）**：开启 `thinking`（budget=3000, max_tokens 8000→12000），fallback `grok-4.3`→`grok-4.5`（`reasoning={"effort":"medium"}`，已用真实调用验证 slug 和参数）。
+
+**实现过程中额外发现并修复两处真实生产 bug（不在原计划内）**：`tg_gap_detect`（Step3 P1 补搜判断）和 `tg_preprocess`（Step1 意图分类）此前都用 `deepseek-v4-flash`，用真实 prompt 实测后发现——`tg_gap_detect` 在未开 thinking 的情况下把 60-token 预算全烧在隐藏推理上，`content=None`，自身 `try/except` 静默吞掉异常返回 `None`，跟"正确判断无需补搜"完全无法区分，功能自 2026-05-23 上线起大概率就没真正生效过；`tg_preprocess` 更严重——`temperature=0` 下同一条简单指令连续 3 次调用给出 3 种不同错误结果（幻觉 action 值/预算耗尽 content 全空/JSON 中途截断），是 bot 的指令路由入口，出错等于用户"加/删指令没反应"。两处均切换为 `google/gemma-4-31b-it`（参考跨项目题库 Obsidian `Hermes/Homepage/LLM-No-Reasoning-eval设计与实现.md`，210/210 全量验证），实测零 reasoning token、输出稳定。
+
+**PR #56 review（`blacktomb42`）修复 2 个真实 bug**：① `answer = content or reasoning_content` 在 thinking 耗尽预算时（`content=null`+`finish_reason=length`+`reasoning_content`含部分思维链）会把思维链原文当答案返回给用户，budget-exhausted 分支完全不触发——改为按 `finish_reason` 消歧，`length` 时绝不提升 `reasoning_content`；② 主力 HTTP 200 但内容为空时此前直接报错，不会尝试已配置的 fallback——改为空内容也走一次 fallback，跟传输失败同等对待。
+
+**Review 之后又出现一条 P1 claim（"model-only 覆盖会残留不兼容的 provider pin，导致换模型失效"），实测证伪**：真实调用 `model=x-ai/grok-4.5` + 遗留的 `provider={order:[DigitalOcean,Venice], allow_fallbacks:true}`，结果 HTTP 200、`provider:xAI`、正常返回——`allow_fallbacks:true` 语义本身就会在 order 列表不支持目标模型时自动路由到支持的 provider，不会报错。对照测了 `allow_fallbacks:false`，确认这种情况下才会真 404——但那不是默认值也不是 review 给出的复现配置会继承到的值。教训与本项目一贯做法一致：**评价/验证 review claim 要拿真实调用核实，不能只看是否读起来有道理**（同 `feedback_verify_llm_review_claims`）。
+
+**`llm_config.json` 一度被误设为 gitignore，用户当场指出没有站得住的理由，已改正**：最初照搬 `tg_offset.json`/budget 计数器那类"运行时状态"的 gitignore 套路，没意识到这个文件的性质完全不同——它是人手改的、有意图的配置决策（跟 `watchlist.md` 同类），不是机器写的临时状态；gitignore 掉之后代价是没有审计记录（`git log` 看不到改过什么）、文件丢了会静默退回 DEFAULTS没人知道、而且这个决定本身让"配置文件"从未被创建出来（功能等于没做）。已取消 gitignore、把文件（当前内容与 DEFAULTS 完全一致，零覆盖）入库，代码注释/README/设计文档里所有"gitignored"表述一并修正（`fc7b91f`，直接提交 main，因为是纯配置修正无功能改动）。
+
+**已用真实 PM 报告验证端到端生效**（2026-07-25，周六用 `FINANCE_FORCE_RUN=1 FINANCE_FORCE_SLOT=pm` 手动跑，非交易日不影响真实定时任务）：日志显示 `LLM tokens [report_pass1/deepseek/deepseek-v4-flash]`、`[report_pass2/deepseek/deepseek-v4-pro]` 标签正确、语义过滤 `reasoning=0`（provider=Crusoe）——`llm_config` 的 stage 标签和默认值在真实流水线里生效，邮件/TG/Obsidian 全部正常发出。**踩坑**：手动跑 PM 报告用 Bash 工具默认 2 分钟超时会被杀（历史实测完整跑一次约 2m20s），需要显式加长 timeout；被杀的进程来不及执行 `finally` 清理 `run_finance.lock`，但 `fcntl.flock` 跟着进程走，进程一死锁自动释放，下次运行不受阻，锁文件里的旧 PID 只是无害的过期内容。
+
+`telegram_commands.py` 改动已按坑32重启 `com.daily-intel.finance.telegram` 并确认加载新代码。PR #56 squash-merge（`f351dd5`），远程分支已删，issue #11 随 `Closes #11` 自动关闭。
+
+---
+
 ## 当前系统状态（2026-07-23 晚，issue #55，留观中）
 
 **Sonar 可观测性补齐 + BYOK 修正 issue #53 因果表述**。用户回看当天 AM 报告真实日志和 OR 活动面板带出两个独立问题，直接在 `main` 上修复（`ba1954b`，未开 feature branch/PR——用户认为改动范围小，走完整分支流程是不必要开销，本次按此简化，不代表流程惯例变更）。
@@ -648,6 +668,7 @@ _Tavily: N/10_
 83. 回复别人未submit的PENDING GitHub review会422（同账号只能有一个pending review）→ 详见 `docs/PITFALLS.md#83`
 84. 消毒函数"先str()再判断类型"，导致None/bool绕过自己刚建的白名单（str(None).upper()=="NONE"合法匹配ticker正则）→ 详见 `docs/PITFALLS.md#84`
 85. `obsidian_read_note`大文件降级为文本转储时是JSON转义字符串（\n/\"未还原），直接当原文用于search_replace会静默不匹配 → 详见 `docs/PITFALLS.md#85`
+86. 手动跑`run_finance.py`被Bash工具默认2分钟超时杀掉，残留stale lock文件但fcntl.flock跟进程走不阻塞下次运行 → 详见 `docs/PITFALLS.md#86`
 
 ---
 
@@ -659,6 +680,8 @@ _Tavily: N/10_
 4. **追问流水线多 query 效果验证**：Step 1 新增 `search_queries` 双 query（事件角度 + 量化/技术角度），观察 Parallel.ai 是否能拿到期权 IV、历史财报模式等深层数据；对比单 query 和双 query 的内容质量差异
 5. **watchlist 调整**：根据实际报告质量增减 ticker 或地缘政治主题
 6. **gemma-4-31b-it 生产观察**（issue #53/PR #54，2026-07-23 起）：确认 `/tmp/daily_intelligence.log` 中 `Semantic filter tokens:` 行的 `reasoning=` 字段持续为 0（或至少不再吃满 `max_tokens`），`Semantic filter failed` 不再出现；观察新的 usage/finish_reason 日志是否足以在下次异常时免去外部付费调用排查
+7. **`tg_gap_detect`/`tg_preprocess` 切换 gemma-4-31b-it 后的真实使用观察**（issue #11，2026-07-25 起）：`tg_gap_detect` 此前疑似从未真正生效过（deepseek 隐藏推理烧光60-token预算），观察 TG 追问日志里 `Step 4 tokens` 前是否开始出现真实的"补搜第3条 query"命中；`tg_preprocess` 观察日常加/删 ticker、地缘关键词等指令是否不再出现分类错误或截断（此前 deepseek 在简单指令上出现过 3 次调用 3 种错误结果）
+8. **`llm_config.json` 实际使用观察**（issue #11，2026-07-25 起）：目前该文件内容与 DEFAULTS 完全一致（零覆盖），观察是否有实际调整需求（如某 stage 换模型、调预算）；每次编辑后确认 `/tmp/daily_intelligence.log` 或 `/tmp/finance_telegram.log` 出现对应的 `LLM config override:` 日志，验证改动真的生效
 
 ---
 

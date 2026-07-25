@@ -361,6 +361,9 @@ LLM 始终写「开盘前简报」，需在写文件前 `re.sub` 替换为「夜
 ### 85. `obsidian_read_note` 大文件降级为文本转储时，转储内容是 JSON 转义字符串，直接当原文用会静默不匹配（issue #55 排查）
 （2026-07-23 发现）设计文档/开发日志超过 MCP 结果 token 上限时，`obsidian_read_note` 会报错并把结果存成本地临时文件（"exceeds maximum allowed tokens... saved to ..."）。这个临时文件不是原始 markdown——它是整个 MCP 返回对象（`{"content": "...", ...}`）被序列化成文本后落盘的结果，文件里的换行是字面的 `\n` 两个字符、引号是字面的 `\"`，不是真实换行/引号。`wc -l` 只报 2 行就是这个特征的直接证据。如果直接从这个转储文件里 `grep`/裁剪片段当成"从 Obsidian 复制的原文"去喂 `obsidian_search_replace`，字符串里的 `\n`/`\"` 和目标文件里的真实换行/引号对不上，替换会静默返回 0 处匹配（该工具对不匹配不报错）——这正是全局 CLAUDE.md"写 search/replace 搜索字符串前，从文件中复制原文，不手写"这条规则要防的失败模式，只是这次的"手写"陷阱更隐蔽：看起来是复制的，实际上复制的是转义后的版本。**修复方法**：`python3 -c "import json; content = json.loads(open(path).read())['content']"` 先把转储文件当 JSON 解析、取出 `content` 字段还原成真实文本，再从这份真实文本里截取要用作 search_replace 字面量的片段。
 
+### 86. 手动跑 `run_finance.py` 被 Bash 工具默认 2 分钟超时杀掉，残留 stale lock 文件但不阻塞下次运行（issue #11 后验证）
+（2026-07-25 发现）手动触发一次完整 PM 报告（`FINANCE_FORCE_RUN=1 FINANCE_FORCE_SLOT=pm`）验证 issue #11 改动，用 Claude Code 的 Bash 工具默认超时（120000ms）直接跑，被在中途 SIGTERM 杀掉（历史实测完整跑一次约 2m20s-2m24s，含 Pass1/Pass2 两次 LLM 调用+多个搜索源，超过 2 分钟很常见，不是异常）。进程被杀时来不及走到 `main()` 里 `finally: _lock_fd.close(); LOCK_FILE.unlink()` 这段清理逻辑，`run_finance.lock` 文件残留、内容是已死进程的 PID。**核实结果：不影响下次运行**——`_acquire_lock()` 用的是 `fcntl.flock(fd, LOCK_EX | LOCK_NB)`，这是进程级 advisory lock，跟着持有它的文件描述符走，进程一死（无论是否正常退出）操作系统会自动释放，不依赖 Python 的 `finally` 块执行与否；下一次调用 `_acquire_lock()` 打开同一文件、尝试加锁会直接成功，只是会用新 PID 覆盖旧内容。**教训**：手动跑这类多阶段财经流水线（含多次真实 LLM/搜索 API 调用）时，Bash 工具超时要显式设到比历史实测耗时更宽裕（如 400000ms），不要用默认 120000ms；如果确实被超时杀掉，`run_finance.lock` 里的旧 PID 是无害的过期内容，不需要手动删除或诊断，直接重跑即可。
+
 ---
 
 ## 十、凭据与日志卫生
