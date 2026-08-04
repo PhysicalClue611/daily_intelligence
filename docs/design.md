@@ -2,7 +2,7 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-07-09（季度 SAS 深度复盘系统上线 + 每日情报层认知提升信号补齐 + 移除 Manual/prompt 中的条件代号引用改自然语言自解释，issue #30-34；详见第五、七节、第十二节和文末变更记录）
+> **最后更新**：2026-08-04（`report_pass1`/新增 `am_calibration` stage 切换至 `google/gemma-4-31b-it`，issue #59/PR #61；详见第五、八节和文末变更记录）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -492,7 +492,7 @@ if f"## {today_et} {slot_label}" in monthly_file_content:
 **PM 校验步骤**：新函数 `evaluate_am_calibration()`，插在报告标题修正后、`write_report()` 之前，仅 PM slot 执行：
 1. `_extract_report_section()` 定位当天 AM 报告 section——以下一个日期戳 `## YYYY-MM-DD` 为边界，不被报告内部的 `## 子标题`/`---`分隔符误判（复用 2026-05-04 修复 KG section 截断 bug 时确立的模式，见踩坑记录#25）
 2. `_extract_verifiable_signals()` 提取"可验证信号"小节内容
-3. `_evaluate_am_predictions()`：一次 DeepSeek V4 Flash 调用（~$0.0005），对照当日实际价格表+新闻上下文（Finnhub+Sonar），逐条判定 hit/miss/inconclusive，提炼一段"知识条目"（不是罗列对错，是可迁移的教训或验证），并判断是否值得展示
+3. `_evaluate_am_predictions()`：一次 LLM 调用（`llm_config.py` stage `am_calibration`，默认 `google/gemma-4-31b-it`，~$0.0005；issue #59 前曾复用 `report_pass1` stage 的 DeepSeek V4 Flash，2026-08-03 实测该模型隐式推理吃满预算导致 3/3 真实调用失败，PR #61 拆成独立 stage 并换模型），对照当日实际价格表+新闻上下文（Finnhub+Sonar），逐条判定 hit/miss/inconclusive，提炼一段"知识条目"（不是罗列对错，是可迁移的教训或验证），并判断是否值得展示
 4. 若当天 AM 报告没有该小节（历史报告、或该步骤本身失败），静默跳过，不影响主流程——整个函数 fail-open
 
 **知识沉淀与备份（2026-07-02 修正：Obsidian 为主，不依赖 MemPalace）**：`_write_calibration_knowledge()` 写三份：
@@ -682,11 +682,12 @@ IB美股持仓（成本价为均价，浮盈%为报告日数据供参考，实�
 
 **选型不再硬编码在各脚本里（issue #11，2026-07-25）**：下表的模型、provider 路由、thinking 预算、max_tokens、temperature 全部来自 `scripts/llm_config.py` 的 stage 定义，可由项目根目录的 `llm_config.json`（**git 追踪，非 gitignore**——最初照搬 `tg_offset.json` 那类运行时状态文件的套路做成了 gitignore，后来意识到这是人手改的、有意图的配置决策，跟 `watchlist.md` 是同一类东西而非机器写的临时状态，且不含任何敏感信息，没理由不入库；追踪进 git 不影响"改了立即生效不用走 PR"这条特性——那是 loader 每次读文件决定的，git 只是白得一份可追溯的修改历史）在运行时覆盖，无需改代码/走 PR。`llm_config.py` 内置的 DEFAULTS 即下表内容，也是唯一的最终兜底：配置文件缺失、JSON 损坏、字段类型/取值非法时逐字段回退到默认值并记日志，不会让流水线崩掉。每一处生效的覆盖在加载时记 INFO 日志（`LLM config override: <stage>.<field>: old -> new`）——git log 能看出改了什么、什么时候提交，但看不出某个具体进程运行时是否真的读到了这次改动，INFO 日志补的是这一层。仓库内 `llm_config.example.json` 是 schema 与默认值的说明性模板（有测试断言它与 DEFAULTS 完全一致）。
 
-stage 名与调用点对应：`report_pass1` / `report_pass2` / `semantic_filter` / `macro_brief` / `tg_preprocess` / `tg_gap_detect` / `tg_research` / `tg_followup`。
+stage 名与调用点对应：`report_pass1` / `am_calibration` / `report_pass2` / `semantic_filter` / `macro_brief` / `tg_preprocess` / `tg_gap_detect` / `tg_research` / `tg_followup`。
 
 | #   | 调用位置 | 用途 | 主力模型 | Fallback | max_tokens | 成本估算 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1   | `run_finance.py` Pass 1 | 报告草稿 + 生成 tavily_queries | `deepseek/deepseek-v4-flash` via OR/DigitalOcean→Venice | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.001 |
+| 1   | `run_finance.py` Pass 1（stage `report_pass1`） | 报告草稿 + 生成 tavily_queries | `google/gemma-4-31b-it`（OR，无 provider pin，issue #59——原 `deepseek-v4-flash` 在 2026-08-03 真实生产两次故障，reasoning 隐式吃满预算导致 `finish_reason=length`） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.001 |
+| 1b  | `calibration.py::_evaluate_am_predictions()`（stage `am_calibration`） | PM slot：对照实际数据核验 AM「可验证信号」，产出知识条目 | `google/gemma-4-31b-it`（OR，无 provider pin，issue #59——从 `report_pass1` stage 拆分为独立 stage，避免未来调 report_pass1 预算/模型时静默影响这个无关的判断） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.0005 |
 | 2   | `run_finance.py` Pass 2 | 整合 Tavily 结果生成最终报告 | `deepseek/deepseek-v4-pro` via OR（thinking=enabled，budget=3000，Together/Fireworks 服务） | `google/gemini-3.5-flash` OR flex | 8000 | ~$0.01 |
 | 3   | `run_finance.py` Layer 2b（stage `semantic_filter`） | 语义过滤 15→10 条搜索结果 | `google/gemma-4-31b-it`（OR，无 provider pin，issue #53/PR #54） | `google/gemini-3.1-flash-lite` OR flex | 200 | ~$0.0001 |
 | 4   | `intel_sources.py` step 6c（stage `macro_brief`） | Sonar 宏观快照（AM/PM 各一次） | `perplexity/sonar`（OR，`search_recency_filter="day"`，2026-07-02 加，见 issue #24） | 重试1次(5s) → `””` 空节 | 1500（issue #55 由 800 提高） | ~$0.005（含固定搜索费） |
@@ -702,6 +703,7 @@ stage 名与调用点对应：`report_pass1` / `report_pass2` / `semantic_filter
 - **thinking 参数兼容性**：Flash 不得传 `thinking:disabled`（StreamLake fallback 时会导致 content=None）；Pro 必须传 `thinking:enabled`。
 - **Flash 开 thinking 的适用边界（issue #11，2026-07-25）**：TG 追问 Step 4 显式开 `thinking:enabled`（budget 3000）——不开时开放式持仓推理的答案质量明显更差。但这只对"输出预算充裕"的调用成立：issue #53 的生产崩溃正是 `max_tokens=80` 的判别式小任务被 reasoning token 吃光预算、`content` 返回 null。因此 Step 4（12000）与 gap detection（60）在 `llm_config.py` 中是两个独立 stage，互不共享 thinking 设置；Step 4 的响应解析也不再直接 `.strip()` content，`content` 为空且 `finish_reason=length` 时给出明确的"预算耗尽"提示而非抛异常。
 - **判别式/分类式小任务优先用天生无 reasoning 开关的模型，而非"关掉 thinking 的 DeepSeek"（issue #11，2026-07-25，参考 Obsidian `Hermes/Homepage/LLM-No-Reasoning-eval设计与实现.md`）**：`deepseek-v4-flash` 未显式传 `thinking` key 时，OpenRouter 侧默认值是否为 enabled 不可控，且同一 prompt 反复调用的隐藏推理量本身不稳定——`tg_gap_detect`（60-token 预算）和 `tg_preprocess`（意图分类+字段抽取）两处实测均复现出真实故障（前者预算耗尽返回 null content；后者 temperature=0 下同一条指令 3 次调用给出 3 种不同错误结果，含枚举外的幻觉 action 值）。`google/gemma-4-31b-it` 在同一 prompt 上零 reasoning token、输出稳定，已在跨项目题库（`LLM-No-Reasoning-eval`，21 case × n=10 全量测试 100% 通过）验证为这类"精确抽取/分类/格式服从"任务的默认推荐，不需要每个项目各自重新测。已知代价：`tg_preprocess` 的 `relevant_tickers` 字段在跨标的关联问题上比 deepseek 曾经给出的结果更保守（如"高通被制裁"只标 QCOM，不主动带出 INTC/NVDA），但 deepseek 自己在同一测试里也未能稳定给出这个"更丰富"的结果，不能算可靠优势。
+- **`report_pass1`/`am_calibration` 同样属于该模式，只是发现得晚（issue #59，2026-08-03/04）**：两个 stage 均是"结构化生成+判断"任务而非开放式推理，此前误以为"不传 thinking key 就默认不推理"，2026-08-03 两次真实生产故障（AM 主报告、PM 校准分别 2/3、3/3 调用被 reasoning 吃满 `max_tokens`）证伪了这个假设。切至 `google/gemma-4-31b-it` 后用同日真实数据重建两种 prompt 形状验证 6/6 通过（`deepseek-v4-flash` 对照组同条件下 4/4 复现故障），PR #61 实现。同批核查发现 `tg_followup`（唯一保留 `deepseek-v4-flash` 的 stage，因需要真实开放式推理）在压力测试下也会无视 `thinking.budget_tokens` 软上限（1/3 次烧穿 `max_tokens`），因已有 fallback 兜底且真实生产 0 次失败，未与 report_pass1 同批处理，另开 issue #60 跟踪；候选 `openai/gpt-5.6-luna`（非pro）+`reasoning.effort=high` 已验证 7/7 可行但未实施（需要代码改动，非纯配置切换）。
 
 **注：**
 - #6 Parallel.ai SDK `parallel-web==0.4.2`（Hermes 容器版本），DI 宿主机使用同一版本；search 返回 WebSearchResult，extract 返回 ExtractResult；dedup → P2 聚合 URL 排序 → extract top 3；每篇正文截 4000 字
@@ -1215,3 +1217,18 @@ LLM 调用层的容错设计一直是"网络错误/5xx 重试，4xx 不重试"�
 **设计原则（已存跨项目 memory `feedback_no_coded_references`）**：任何面向人或 LLM 反复解读的规则性文档/prompt，凡涉及边界条件、决策规则的引用，一律在引用处直接自然语言复述内容，不用字母/数字代号引用同文档内其他位置的定义——手工维护的编号会随内容增删静默腐化，且代号本身不承载语义，读者（或未来的自己）需要额外一次跳转才能理解。
 
 **验证**：`py_compile` 通过；`_load_framework()` 实测输出确认 Manual 抽取内容不再含字母代号；`USER_PROMPT_TEMPLATE_P2.format(...)` mock 参数渲染无异常。issue #34（已关闭），commit `0db1759`。
+
+---
+
+## 变更记录追加：2026-08-04 — `report_pass1`/`am_calibration` 切换 gemma-4-31b-it（issue #59，PR #61）
+
+**背景**：`report_pass1`（`deepseek/deepseek-v4-flash`，未显式传 `thinking` key）2026-08-03 出现两次真实生产故障——AM 主报告调用 2/3 次被隐式推理吃满 `max_tokens=4000` 预算（`finish_reason=length`）；`calibration.py::evaluate_am_calibration()` 当时复用同一 `report_pass1` stage 做 PM 校验，3/3 次全部失败，靠 `fallback_model` 兜底才拿到结果。根因与 issue #53 当年修过的"隐式推理吃光判别式小任务预算"是同一模式，只是 `report_pass1` 从未被纳入那次修复范围。
+
+**改动**（第8.1节表格、第5.5节已同步更新）：
+1. `llm_config.py` DEFAULTS：`report_pass1.model` → `google/gemma-4-31b-it`，`providers` → `None`（不再走 DeepSeek 专属的 DigitalOcean/Venice pin）
+2. 新增独立 stage `am_calibration`（同样默认 `google/gemma-4-31b-it`），`calibration.py::_evaluate_am_predictions()` 改用该 stage 而非复用 `report_pass1`——理由与 `tg_gap_detect`/`tg_followup` 拆分为独立 stage 一致，避免未来调 report_pass1 预算/模型时静默影响这个无关的 PM 判断
+3. `llm_config.json`/`llm_config.example.json` 同步更新；新增回归测试 `test_calibration_uses_its_own_stage_not_report_pass1`
+
+**验证**：用 2026-08-03 当天真实生产故障数据（真实价格表、RSS、Sonar宏观快照、AM可验证信号清单）重建两种 prompt 形状直接调用 OpenRouter 对比——`deepseek-v4-flash` 同条件下 4/4 复现真实故障（确认测试 prompt 忠实复现生产条件）；`google/gemma-4-31b-it` 6/6 全部 `reasoning_tokens=0`、`finish_reason=stop`，completion 仅占预算16-20%，路由到3个不同 OR provider 均稳定；内容质量核查（非仅结构校验）确认输出正确。另用真实生产 `call_llm(stage="report_pass1")`/`calibration._evaluate_am_predictions()` 端到端冒烟测试确认代码路径正确接入。`test_llm_config.py` 21/21 通过。
+
+**同批核查（issue #60，未在本 PR 实施）**：按用户要求核查项目内剩余 `deepseek-v4-flash` 调用点，仅剩 `tg_followup`（Telegram Step 4，刻意保留以维持开放式持仓推理质量，issue #11 已验证取消 thinking 会明显降质）。压力测试发现该 stage 同样会无视 `thinking.budget_tokens=3000` 软上限（1/3 次烧穿 `max_tokens=12000`），但已有 fallback 兜底且真实生产 0 次失败，判定为低优先级、非阻断，未并入本 PR。候选 `openai/gpt-5.6-luna`（非pro）+`reasoning.effort=high` 已用同一真实数据验证 7/7 可行（`max_tokens=16000` 档更稳），但实施需要代码改动（OpenAI 系模型走 OpenRouter 统一 `reasoning` 参数而非 DeepSeek 的 `thinking` 字段）而非纯配置切换，建议单独排期。issue #59/PR #61 review（协作者 `blacktomb42`）额外指出 CLAUDE.md 状态记录和本文档未同步，均已修正。
