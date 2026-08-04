@@ -26,10 +26,19 @@
   ],
   "stages": {
     "report_pass1": {
+      "_note": "google/gemma-4-31b-it, not deepseek-v4-flash (issue #59) — two real 2026-08-03 production failures showed Flash burns the full max_tokens budget on hidden reasoning even with no thinking key sent; gemma verified 6/6 clean (reasoning_tokens=0, finish_reason=stop) on the real prompt shape.",
       "gateway": "openrouter",
-      "model": "deepseek/deepseek-v4-flash",
-      "providers": {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": true},
-      "thinking": null,
+      "model": "google/gemma-4-31b-it",
+      "providers": null,
+      "max_tokens": 4000,
+      "temperature": 0.2,
+      "fallback_model": "google/gemini-3.1-flash-lite"
+    },
+    "am_calibration": {
+      "_note": "Split from report_pass1 (issue #59) so tuning the main report stage can't silently change this unrelated PM calibration judgement call's budget/model. Defaults mirror report_pass1 for now — same real-data validation.",
+      "gateway": "openrouter",
+      "model": "google/gemma-4-31b-it",
+      "providers": null,
       "max_tokens": 4000,
       "temperature": 0.2,
       "fallback_model": "google/gemini-3.1-flash-lite"

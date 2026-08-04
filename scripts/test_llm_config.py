@@ -70,7 +70,8 @@ def _levels(records, level):
 
 def test_defaults_when_file_missing():
     _load(None)
-    assert llm_config.model("report_pass1") == "deepseek/deepseek-v4-flash"
+    assert llm_config.model("report_pass1") == "google/gemma-4-31b-it"
+    assert llm_config.model("am_calibration") == "google/gemma-4-31b-it"
     assert llm_config.model("report_pass2") == "deepseek/deepseek-v4-pro"
     assert llm_config.model("semantic_filter") == "google/gemma-4-31b-it"
     assert llm_config.stage("tg_followup")["fallback_model"] == "x-ai/grok-4.5"
@@ -211,12 +212,14 @@ def test_stage_returns_are_independent_deep_copies():
     # stage's returned providers dict corrupt every other stage that still
     # points at the same default — persisting for the life of the
     # long-running Telegram bot process.
+    # report_pass1 no longer defaults to _DS_PROVIDERS (issue #59 — it's
+    # gemma now, providers is null); report_pass2 and tg_followup still do.
     _load(None)
-    a = llm_config.stage("report_pass1")
+    a = llm_config.stage("report_pass2")
     a["providers"]["order"].append("Mutated")
     b = llm_config.stage("tg_followup")  # also defaults to the shared _DS_PROVIDERS
     assert "Mutated" not in b["providers"]["order"]
-    c = llm_config.stage("report_pass1")
+    c = llm_config.stage("report_pass2")
     assert "Mutated" not in c["providers"]["order"]
 
 
@@ -298,6 +301,48 @@ def test_llm_client_reads_stage_config():
     assert captured["model"] == "x-ai/grok-4.5"
     assert captured["thinking"] == {"type": "enabled", "budget_tokens": 3000}
     assert captured["max_tokens"] == 8000
+
+
+def test_calibration_uses_its_own_stage_not_report_pass1():
+    # issue #59: calibration.py used to hardcode stage="report_pass1" (its
+    # justification was "same model/budget as the main report", but that
+    # coupling meant a future report_pass1 tuning change would silently also
+    # change this unrelated judgement call). Verify it now resolves against
+    # its own "am_calibration" stage — overriding report_pass1 alone must not
+    # affect it, and overriding am_calibration must.
+    import llm_client
+    import calibration
+    importlib.reload(llm_client)
+    importlib.reload(calibration)
+    calibration.OPENROUTER_API_KEY = "test-key"
+    _load({"stages": {
+        "report_pass1": {"model": "x-ai/grok-4.5"},
+        "am_calibration": {"model": "google/gemini-3.5-flash"},
+    }})
+    captured = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": "stop", "message": {"content": json.dumps({
+                        "verdicts": [], "knowledge_entry": "", "worth_surfacing": False, "surface_blurb": "",
+                    })}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured.update(json)
+        return _Resp()
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        out = calibration._evaluate_am_predictions("- some signal", "price table", "news", "2026-08-04")
+    finally:
+        llm_client.httpx.post = orig
+    assert out.get("worth_surfacing") is False
+    assert captured["model"] == "google/gemini-3.5-flash", captured.get("model")
 
 
 if __name__ == "__main__":
