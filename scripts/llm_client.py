@@ -28,6 +28,7 @@ have broken the moment pass 2's model was reconfigured to anything else.
 import json
 import logging
 import os
+import re
 import sys
 import time
 
@@ -47,13 +48,35 @@ OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 OR_BASE_URL         = "https://openrouter.ai/api/v1/chat/completions"
 OR_ATTRIBUTION_HEADERS = {"HTTP-Referer": "https://github.com/PhysicalClue611/daily_intelligence", "X-OpenRouter-Title": "DailyIntel"}
 
+def _strip_code_fence(text: str) -> str:
+    """Strip a leading/trailing ``` fence if present, else return unchanged.
+
+    parse_json=False callers ask the model for raw markdown with no fence and
+    no JSON wrapper, but nothing stops a model from adding one anyway (it's
+    common training-data behavior) — this is the same unwrapping
+    parse_llm_json already does for the JSON path, kept minimal here since
+    there's no JSON structure to repair, just a possible fence to peel off."""
+    stripped = text.strip()
+    m = re.match(r"^```(?:\w+)?\n(.*)\n```$", stripped, re.DOTALL)
+    return m.group(1).strip() if m else stripped
+
+
 def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
-             stage: str = "report_pass1") -> dict:
-    """Call the configured model for `stage` via OpenRouter, return parsed JSON dict.
+             stage: str = "report_pass1", parse_json: bool = True) -> dict:
+    """Call the configured model for `stage` via OpenRouter, return a result dict.
 
     Retries on network/5xx/429 errors, then falls back to the stage's
     fallback_model on OpenRouter flex. See llm_config.DEFAULTS for the
-    per-stage model, provider routing, thinking budget and token limits."""
+    per-stage model, provider routing, thinking budget and token limits.
+
+    When parse_json is True (default), the completion is parsed as JSON
+    (repair-on-failure via parse_llm_json) and returned as that dict. When
+    False, the raw completion text is returned under result["text"] with no
+    JSON parsing attempted — for stages (report_pass2) whose payload is
+    free-form markdown that would otherwise have to be escaped into, and
+    survive being truncated inside, a JSON string (issue #60): a truncation
+    mid-string when JSON-wrapped destroys the whole payload, the same
+    truncation in plain text only loses the tail."""
     cfg = llm_config.stage(stage)
     model = cfg["model"]
     thinking_cfg = cfg.get("thinking")
@@ -108,15 +131,24 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
 
             msg = choice["message"]
             content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
-            result = parse_llm_json(content, logger=logger)
-            if not isinstance(result, dict):
-                # A malformed outer object whose only cleanly-parsing substring is a
-                # nested array (e.g. tavily_queries) makes parse_llm_json return that
-                # array instead of the dict — treat as unparseable JSON, same as a
-                # JSONDecodeError, so it's retried rather than crashing on result[...].
-                raise json.JSONDecodeError(
-                    f"parse_llm_json returned {type(result).__name__}, expected dict",
-                    content, 0)
+            if parse_json:
+                result = parse_llm_json(content, logger=logger)
+                if not isinstance(result, dict):
+                    # A malformed outer object whose only cleanly-parsing substring is a
+                    # nested array (e.g. tavily_queries) makes parse_llm_json return that
+                    # array instead of the dict — treat as unparseable JSON, same as a
+                    # JSONDecodeError, so it's retried rather than crashing on result[...].
+                    raise json.JSONDecodeError(
+                        f"parse_llm_json returned {type(result).__name__}, expected dict",
+                        content, 0)
+            else:
+                text = _strip_code_fence(content)
+                if not text:
+                    # Empty text is the free-form-payload equivalent of an
+                    # unparseable JSON body — retry the same way, rather than
+                    # returning an empty report_md as if it were a success.
+                    raise json.JSONDecodeError("empty completion text", content, 0)
+                result = {"text": text}
             result["_llm_meta"] = {
                 "model": model,
                 "provider": data.get("provider", "n/a"),
@@ -177,11 +209,17 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                     f"provider={data.get('provider', 'n/a')}")
         msg = data["choices"][0]["message"]
         content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
-        result = parse_llm_json(content, logger=logger)
-        if not isinstance(result, dict):
-            raise json.JSONDecodeError(
-                f"parse_llm_json returned {type(result).__name__}, expected dict",
-                content, 0)
+        if parse_json:
+            result = parse_llm_json(content, logger=logger)
+            if not isinstance(result, dict):
+                raise json.JSONDecodeError(
+                    f"parse_llm_json returned {type(result).__name__}, expected dict",
+                    content, 0)
+        else:
+            text = _strip_code_fence(content)
+            if not text:
+                raise json.JSONDecodeError("empty completion text", content, 0)
+            result = {"text": text}
         logger.info(f"OR flex fallback succeeded: {fallback_model}")
         result["_llm_meta"] = {
             "model": fallback_model,

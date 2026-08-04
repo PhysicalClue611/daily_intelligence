@@ -20,9 +20,10 @@
     "",
     "Field notes: 'model'/'fallback_model' must be OpenRouter slugs ('vendor/model',",
     "optionally '~vendor/model-latest'). 'providers' is OpenRouter's provider",
-    "routing object, or null for no pin. 'thinking' applies to the primary model;",
-    "'fallback_reasoning' is OpenRouter's unified reasoning-effort param applied to",
-    "the fallback model. Keys starting with '_' are ignored (JSON has no comments)."
+    "routing object, or null for no pin. 'thinking' (DeepSeek) and 'reasoning'",
+    "(OpenAI-style {\"effort\": ...}) both apply to the primary model, whichever the",
+    "model expects. 'fallback_reasoning' is the same reasoning-effort param applied",
+    "to the fallback model. Keys starting with '_' are ignored (JSON has no comments)."
   ],
   "stages": {
     "report_pass1": {
@@ -92,15 +93,26 @@
       "temperature": 0.1
     },
     "tg_followup": {
+      "_note": "openai/gpt-5.6-luna (non-pro) + reasoning.effort=high, not deepseek-v4-flash+thinking (issue #60) — a real reconstructed prompt reproduced 1/3 reps burning straight through max_tokens on hidden reasoning (thinking.budget_tokens is a soft hint, not an enforced ceiling). gpt-5.6-luna verified 7/7 finish_reason=stop on the real prompt; provider pinned to OpenAI only, matching the same model's validated config in the sister project (clip_processor.py Stage 2).",
       "gateway": "openrouter",
-      "model": "deepseek/deepseek-v4-flash",
-      "providers": {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": true},
-      "thinking": {"type": "enabled", "budget_tokens": 3000},
-      "max_tokens": 12000,
+      "model": "openai/gpt-5.6-luna",
+      "providers": {"order": ["OpenAI"], "allow_fallbacks": false},
+      "thinking": null,
+      "reasoning": {"effort": "high"},
+      "max_tokens": 16000,
       "temperature": 0.3,
       "fallback_model": "x-ai/grok-4.5",
       "fallback_reasoning": {"effort": "medium"},
       "fallback_max_tokens": 8000
+    },
+    "sas_candidate_extract": {
+      "_note": "Split out of report_pass2 (issue #60) so report_pass2's report_md — the largest payload in this project — no longer has to be escaped into a JSON string that a truncation mid-string would destroy wholesale. google/gemma-4-31b-it verified 9/9 across 3 real adversarial test batches (exact reproduction of the real 2026-08-03 PM SAS候选证据日志.md ground truth, correct holdings-only gating, correct rejection of generic-beat/scheduled-sale traps).",
+      "gateway": "openrouter",
+      "model": "google/gemma-4-31b-it",
+      "providers": null,
+      "max_tokens": 800,
+      "temperature": 0.0,
+      "fallback_model": "google/gemini-3.1-flash-lite"
     }
   }
 }

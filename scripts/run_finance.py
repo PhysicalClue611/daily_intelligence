@@ -1016,26 +1016,55 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
      这个占比数字直接读取下方【持仓计算信号】里代码算好的值，不要自己从持仓文本估算
    上面"驱动因素归类"里讨论的战略含义仅作理解背景，不能替代这里的逐条核对结果
 
-**SAS候选证据标注**（不写入 report_md 正文，只填 JSON 字段，与前面的仓位建议判断相互独立）：若某条
-   新闻/事件命中以下五类内部信号之一——内部人在公开市场的自主买入、资本配置方向的持续性（R&D/Capex
-   占收入比在下跌期是否维持或提升）、生态位置的第三方验证（其他公司/客户选择在其平台上构建）、监管
-   文件语言的季度间变化、公司自身"市场曾怀疑后被证实"的历史先例——或命中上面"持仓异动核对"里认知
-   提升的三条标准之一，且涉及"IB美股持仓"中实际持有的标的，则在 sas_candidates 数组追加一条记录，
-   含 ticker/category/fact 三个字段；category 只能取以下字符串之一："内部人增持"/"资本配置持续性"/
-   "生态位验证"/"监管语言变化"/"历史先例"/"认知提升-战略节点解锁"/"认知提升-竞争格局变化"/
-   "认知提升-管理层兑现承诺"。fact 为一句话事实摘要（含关键数字/来源，不超过80字）。无命中则留空
-   数组。这只是记录候选证据供未来复审，本身不代表应该操作，不影响上面仓位建议的判断
 {verifiable_signals_rule}
 
 可选覆盖：其他值得关注的市场要闻（无实质内容可省略）
 
-格式要求：价格数据已在上方表格，正文自由展开，有话则长，无话则短，省略废话
+格式要求：价格数据已在上方表格，正文自由展开，有话则长，无话则短，省略废话。直接输出报告正文
+（以 "# [Daily_Intel] {date} 开盘前简报" 开头的 Markdown），不要用 JSON 包裹，不要用代码围栏
+（```）包裹，不要在正文前后附加任何其他文字。
+"""
+
+# SAS候选证据提取：独立于 Pass 2 report_md 的第二次调用（issue #60）。原先与 report_md 共享
+# 同一个 JSON 信封——report_md 是全项目里最大的单次 payload，也是两个真实撞过 finish_reason=
+# length 的 stage 之一（issue #59），JSON 包裹意味着截断发生在字符串中途会把已经写好的大半份
+# 报告一并作废。拆开后 report_md 直接输出纯文本（见上方模板），sas_candidates 改为单独一次
+# gemma-4-31b-it 调用（llm_config "sas_candidate_extract" stage），复用 Pass 2 已经组装好的
+# 同一份上下文（价格表/新闻/持仓），零额外抓取成本。
+SAS_CANDIDATE_PROMPT_TEMPLATE = """今日日期（ET）：{date}
+{pm_afterhours_note}
+## 价格数据（{price_data_label}）
+{price_table}
+{price_missing_note}
+## 过去24小时新闻（RSS）
+{news_text}
+
+{finnhub_news_section}{brave_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}
+== 持仓 ==
+{personal_context}
+
+## 任务
+你是 SAS 候选证据提取器：识别命中以下信号类别、且必须涉及"IB美股持仓"中实际持有标的的条目，
+不涉及实际持仓的标的（哪怕新闻本身很重大，如仅为 watchlist 观察标的）一律不输出：
+- 内部人在公开市场的自主买入（注意区分主动买入 vs 预设计划卖出/税务规划性质的交易）
+- 资本配置方向的持续性（R&D/Capex占收入比在下跌期是否维持或提升）
+- 生态位置的第三方验证（其他公司/客户选择在其平台上构建）
+- 监管文件语言的季度间变化
+- 公司自身"市场曾怀疑后被证实"的历史先例
+- 企业解锁了一个之前不确定的战略节点（如产品从内测进入商业化、新市场首次产生可计量收入）
+- 竞争格局出现了有利于企业的结构性变化（如主要竞争对手退出、监管为企业构建护城河）
+- 管理层兑现了此前市场明确怀疑的具体承诺（仅"超预期"不够，必须是此前被质疑的具体目标/节点
+  被证实）
+
+命中的追加一条记录，含 ticker/category/fact 三个字段；category 只能取以下字符串之一：
+"内部人增持"/"资本配置持续性"/"生态位验证"/"监管语言变化"/"历史先例"/
+"认知提升-战略节点解锁"/"认知提升-竞争格局变化"/"认知提升-管理层兑现承诺"。
+fact 为一句话事实摘要（含关键数字/来源，不超过80字）。宁可漏判也不要把"普通业绩超预期/
+普通上涨"当成命中——这只是记录候选证据供未来复审，本身不代表应该操作。
 
 请输出以下JSON（不要附加任何其他文字）：
-{{
-  "report_md": "# [Daily_Intel] {date} 开盘前简报\\n\\n...",
-  "sas_candidates": [{{"ticker": "...", "category": "...", "fact": "..."}}]
-}}
+{{"sas_candidates": [{{"ticker": "...", "category": "...", "fact": "..."}}]}}
+无命中则输出空数组。
 """
 
 
@@ -1602,10 +1631,37 @@ def _main_body():
             personal_context=personal_context,
             verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P2 if run_slot == "am" else "",
         )
-        result2 = call_llm(prompt2, stage="report_pass2", system_prompt=SYSTEM_PROMPT_P2)
+        # parse_json=False (issue #60): report_md is plain markdown now, not a
+        # JSON-wrapped string — a truncation mid-payload loses only the tail,
+        # not the whole report (this stage has hit finish_reason=length in
+        # production before, issue #59).
+        result2 = call_llm(prompt2, stage="report_pass2", system_prompt=SYSTEM_PROMPT_P2,
+                            parse_json=False)
         llm_meta_p2 = result2.get("_llm_meta", {})
-        report_md = result2.get("report_md", report_md)
-        write_sas_candidate_log(today_et, slot_label, result2.get("sas_candidates", []))
+        report_md = result2.get("text") or report_md
+
+        # SAS candidate extraction (issue #32) is now a fully independent call
+        # (issue #60), not sharing report_md's JSON envelope — its own model/
+        # budget, and its failure can no longer take report_md down with it.
+        sas_prompt = SAS_CANDIDATE_PROMPT_TEMPLATE.format(
+            date=today_et,
+            pm_afterhours_note=pm_afterhours_note,
+            price_data_label=price_data_label,
+            price_table=price_table,
+            price_missing_note=price_missing_note,
+            news_text=news_text,
+            finnhub_news_section=finnhub_news_section,
+            brave_news_section=brave_news_section,
+            sonar_macro_section=sonar_macro_section,
+            social_sentiment_section=social_sentiment_section,
+            tavily_section=tavily_section,
+            personal_context=personal_context,
+        )
+        sas_result = call_llm(
+            sas_prompt, stage="sas_candidate_extract",
+            system_prompt="你是一名严格遵循规则的候选证据提取器，只输出JSON，不输出任何其他文字。",
+        )
+        write_sas_candidate_log(today_et, slot_label, sas_result.get("sas_candidates", []))
 
     if not report_md:
         logger.warning("Empty report_md, skipping")

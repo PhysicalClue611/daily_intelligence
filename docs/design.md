@@ -2,7 +2,7 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-08-04（`report_pass1`/新增 `am_calibration` stage 切换至 `google/gemma-4-31b-it`，issue #59/PR #61；详见第五、八节和文末变更记录）
+> **最后更新**：2026-08-04（issue #60：`tg_followup` 切换至 `openai/gpt-5.6-luna`+`reasoning.effort=high`；`report_pass2` 的 `report_md` 脱离 JSON 包裹；`sas_candidates` 拆成独立 stage `sas_candidate_extract`；详见第八节和文末变更记录。另含 2026-08-04 之前的 `report_pass1`/`am_calibration` 切换至 `google/gemma-4-31b-it`，issue #59/PR #61）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -592,14 +592,16 @@ Step 3  Parallel.ai search + extract（主，~$0.007-$0.012）
         → 失败 fallback：Sonar（重试1次→Exa model="exa"）
         进度提示："情报检索（N条查询）..."
 
-Step 4  DeepSeek V4 Flash via OR（主，~$0.003，stage `tg_followup`）
+Step 4  openai/gpt-5.6-luna（非pro）via OR（主，stage `tg_followup`，issue #60）
         System: 投资框架（module-level cache）+ NYSE 时区推理要求
                 + 禁止对话体开场白（直接进入分析）
         User:   当前时刻(EDT/EST) + yfinance实时行情（价格基准） + yfinance.news
                 + Parallel.ai原文情报 + 持仓快照（均价，非现价）+ MemPalace
                 + question_intent
                 + 推理规则：以yfinance为价格唯一基准；无新催化剂直接声明动量延续
-        max_tokens=12000；thinking=enabled（budget=3000，issue #11）；自管3次重试（timeout 180s）
+        max_tokens=16000；reasoning={"effort":"high"}（OpenAI统一参数，issue #60，取代
+        DeepSeek的thinking.budget_tokens——后者实测是软上限而非强制上限，见下方issue #60记录）；
+        provider锁定{"order":["OpenAI"],"allow_fallbacks":false}；自管3次重试（timeout 180s）
         fallback: x-ai/grok-4.5（via OR，reasoning.effort=medium，max_tokens 8000）
         content 为空且 finish_reason=length 时报"预算耗尽"而非崩溃（issue #53 的崩溃形态）
         输出：自由展开分析（不设字数上限，参考维度：驱动力/持仓含义/待验证信号/信息缺口）
@@ -642,7 +644,7 @@ Step 4  DeepSeek V4 Flash via OR（主，~$0.003，stage `tg_followup`）
 
 **TG 追问流水线**（`telegram_commands.py::_load_framework()`）：从 `Finance/金融资产信息.md` 提取：总体构架（目标配置比例）+ Dream Bucket 逻辑（高弹性标的选择标准）。注入 Claude 的 system message，跨调用复用。
 
-**AM/PM 日报**（`run_finance.py::_load_framework()`，2026-07-08 起，issue #30）：改从 `Finance/Investment Operating Manual v1.0.md` 提取三段运行性规则——第2节能力边界、第6节 Portfolio Construction（含认知提升标准/减仓触发情形，2026-07-09 issue #34 起不再用字母代号标注）、第7.4节 Expectation Gap 内部信号清单——按标题正则定位，Manual 编辑后自动同步无需改代码。与 `_get_portfolio_snapshot()` 一同注入 **user message**（Layer B，非 system message）。Pass 2 prompt 同步新增以下分析要求（均为描述性小标题，不用编号，issue #34 一并把互相引用改为内联复述）：能力圈内外标注（圈外驱动因素须显式标注“不构成操作依据”），持仓异动核对（唯一允许给出加减仓建议的依据来源，对照认知提升/减仓具体标准逐条核对，不满足则明确声明不构成依据），SAS候选证据标注（命中7.4内部信号/认知提升标准时输出 `sas_candidates` 字段，见 issue #31）。不自动计算 SAS 分数（仍为人工季度任务，见 issue #32）。
+**AM/PM 日报**（`run_finance.py::_load_framework()`，2026-07-08 起，issue #30）：改从 `Finance/Investment Operating Manual v1.0.md` 提取三段运行性规则——第2节能力边界、第6节 Portfolio Construction（含认知提升标准/减仓触发情形，2026-07-09 issue #34 起不再用字母代号标注）、第7.4节 Expectation Gap 内部信号清单——按标题正则定位，Manual 编辑后自动同步无需改代码。与 `_get_portfolio_snapshot()` 一同注入 **user message**（Layer B，非 system message）。Pass 2 prompt 同步新增以下分析要求（均为描述性小标题，不用编号，issue #34 一并把互相引用改为内联复述）：能力圈内外标注（圈外驱动因素须显式标注“不构成操作依据”），持仓异动核对（唯一允许给出加减仓建议的依据来源，对照认知提升/减仓具体标准逐条核对，不满足则明确声明不构成依据）。SAS候选证据标注（命中7.4内部信号/认知提升标准，见 issue #31）自 issue #60 起不再是 Pass 2 prompt 里的一条规则，而是拆成独立的 `sas_candidate_extract` stage（`google/gemma-4-31b-it`），复用 Pass 2 组装好的同一份价格/新闻/持仓上下文单独调用一次，输出 `sas_candidates` 数组——原因是 report_md 曾与 sas_candidates 共享同一个 JSON 信封，一次截断会把已经写好的整份报告一并作废（report_md 是全项目最大的单次 payload，也是撞过 `finish_reason=length` 的两个 stage 之一，见下方 issue #59/#60 记录），拆开后 report_md 直接输出裸 markdown（不再是 JSON 字段）。不自动计算 SAS 分数（仍为人工季度任务，见 issue #32）。
 
 ### 7.1b 持仓计算信号（user message，纯计算，零LLM/搜索成本，issue #33）
 
@@ -682,19 +684,20 @@ IB美股持仓（成本价为均价，浮盈%为报告日数据供参考，实�
 
 **选型不再硬编码在各脚本里（issue #11，2026-07-25）**：下表的模型、provider 路由、thinking 预算、max_tokens、temperature 全部来自 `scripts/llm_config.py` 的 stage 定义，可由项目根目录的 `llm_config.json`（**git 追踪，非 gitignore**——最初照搬 `tg_offset.json` 那类运行时状态文件的套路做成了 gitignore，后来意识到这是人手改的、有意图的配置决策，跟 `watchlist.md` 是同一类东西而非机器写的临时状态，且不含任何敏感信息，没理由不入库；追踪进 git 不影响"改了立即生效不用走 PR"这条特性——那是 loader 每次读文件决定的，git 只是白得一份可追溯的修改历史）在运行时覆盖，无需改代码/走 PR。`llm_config.py` 内置的 DEFAULTS 即下表内容，也是唯一的最终兜底：配置文件缺失、JSON 损坏、字段类型/取值非法时逐字段回退到默认值并记日志，不会让流水线崩掉。每一处生效的覆盖在加载时记 INFO 日志（`LLM config override: <stage>.<field>: old -> new`）——git log 能看出改了什么、什么时候提交，但看不出某个具体进程运行时是否真的读到了这次改动，INFO 日志补的是这一层。仓库内 `llm_config.example.json` 是 schema 与默认值的说明性模板（有测试断言它与 DEFAULTS 完全一致）。
 
-stage 名与调用点对应：`report_pass1` / `am_calibration` / `report_pass2` / `semantic_filter` / `macro_brief` / `tg_preprocess` / `tg_gap_detect` / `tg_research` / `tg_followup`。
+stage 名与调用点对应：`report_pass1` / `am_calibration` / `report_pass2` / `sas_candidate_extract` / `semantic_filter` / `macro_brief` / `tg_preprocess` / `tg_gap_detect` / `tg_research` / `tg_followup`。
 
 | #   | 调用位置 | 用途 | 主力模型 | Fallback | max_tokens | 成本估算 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1   | `run_finance.py` Pass 1（stage `report_pass1`） | 报告草稿 + 生成 tavily_queries | `google/gemma-4-31b-it`（OR，无 provider pin，issue #59——原 `deepseek-v4-flash` 在 2026-08-03 真实生产两次故障，reasoning 隐式吃满预算导致 `finish_reason=length`） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.001 |
 | 1b  | `calibration.py::_evaluate_am_predictions()`（stage `am_calibration`） | PM slot：对照实际数据核验 AM「可验证信号」，产出知识条目 | `google/gemma-4-31b-it`（OR，无 provider pin，issue #59——从 `report_pass1` stage 拆分为独立 stage，避免未来调 report_pass1 预算/模型时静默影响这个无关的判断） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.0005 |
 | 2   | `run_finance.py` Pass 2 | 整合 Tavily 结果生成最终报告 | `deepseek/deepseek-v4-pro` via OR（thinking=enabled，budget=3000，Together/Fireworks 服务） | `google/gemini-3.5-flash` OR flex | 8000 | ~$0.01 |
+| 2b  | `run_finance.py` Pass 2 后（stage `sas_candidate_extract`，issue #60） | 独立提取 SAS 候选证据（原是 Pass 2 JSON 的一个字段，见上文"SAS候选证据标注"说明） | `google/gemma-4-31b-it`（OR，无 provider pin，9/9 真实对抗测试验证） | `google/gemini-3.1-flash-lite` OR flex | 800 | ~$0.0003 |
 | 3   | `run_finance.py` Layer 2b（stage `semantic_filter`） | 语义过滤 15→10 条搜索结果 | `google/gemma-4-31b-it`（OR，无 provider pin，issue #53/PR #54） | `google/gemini-3.1-flash-lite` OR flex | 200 | ~$0.0001 |
 | 4   | `intel_sources.py` step 6c（stage `macro_brief`） | Sonar 宏观快照（AM/PM 各一次） | `perplexity/sonar`（OR，`search_recency_filter="day"`，2026-07-02 加，见 issue #24） | 重试1次(5s) → `””` 空节 | 1500（issue #55 由 800 提高） | ~$0.005（含固定搜索费） |
 | 5   | `telegram_commands.py` Step 1（stage `tg_preprocess`） | 统一预处理：意图分类 + 2条 query 生成 | `google/gemma-4-31b-it`（OR，无 provider pin，issue #11） | `google/gemini-3.1-flash-lite` OR flex | 600 | ~$0.0001 |
 | 6   | `telegram_commands.py` Step 3 | 追问原文情报（2条 query + P1 可选第3条 + 3 URL extract，P2 聚合 URL 优先） | Parallel.ai SDK `parallel-web==0.4.2` | Sonar（重试1次→Exa） | — | ~$0.007（无P1）/ ~$0.012（P1触发） |
 | 6b  | `telegram_commands.py` Step 3 P1（stage `tg_gap_detect`） | gap detection：是否需要第3条 query | `google/gemma-4-31b-it`（OR，无 provider pin，issue #11——原 deepseek-v4-flash 在此 prompt 上实测烧光60-token预算于隐藏推理，功能实际从未跑成功过） | fail-open（不触发即跳过） | 60 | ~$0.0001 |
-| 7   | `telegram_commands.py` Step 4（stage `tg_followup`） | 个人化推理 | `deepseek/deepseek-v4-flash` via OR/DigitalOcean→Venice（自管重试，**thinking=enabled，budget=3000**，issue #11） | `x-ai/grok-4.5`（OR，`reasoning={"effort":"medium"}`，max_tokens 8000） | 12000 | ~$0.003 |
+| 7   | `telegram_commands.py` Step 4（stage `tg_followup`） | 个人化推理 | `openai/gpt-5.6-luna`（非pro）via OR/OpenAI（provider锁定，不允许fallback到其他provider；`reasoning={"effort":"high"}`，issue #60——原 `deepseek-v4-flash+thinking` 实测同样会无视 `budget_tokens` 软上限烧穿 `max_tokens`，7/7 真实调用验证新配置） | `x-ai/grok-4.5`（OR，`reasoning={"effort":"medium"}`，max_tokens 8000） | 16000 | ~$0.01（模型换成本结构不同，未核实精确单价） |
 | 8   | `sas_review.py`（季度手动/自动触发，issue #32） | 直接打 SAS 四维度分（Strategic Space/Execution/Expectation Gap/Alpha Potential） | `~anthropic/claude-sonnet-latest`（OR） | 无（v1 故意不接，观察实际效果后再评估） | 4000 | ~$0.05（OR `usage.cost` 实际读取，无硬编码价格表） |
 
 **OR provider 实测结论（2026-06-02）：**
@@ -1232,3 +1235,11 @@ LLM 调用层的容错设计一直是"网络错误/5xx 重试，4xx 不重试"�
 **验证**：用 2026-08-03 当天真实生产故障数据（真实价格表、RSS、Sonar宏观快照、AM可验证信号清单）重建两种 prompt 形状直接调用 OpenRouter 对比——`deepseek-v4-flash` 同条件下 4/4 复现真实故障（确认测试 prompt 忠实复现生产条件）；`google/gemma-4-31b-it` 6/6 全部 `reasoning_tokens=0`、`finish_reason=stop`，completion 仅占预算16-20%，路由到3个不同 OR provider 均稳定；内容质量核查（非仅结构校验）确认输出正确。另用真实生产 `call_llm(stage="report_pass1")`/`calibration._evaluate_am_predictions()` 端到端冒烟测试确认代码路径正确接入。`test_llm_config.py` 21/21 通过。
 
 **同批核查（issue #60，未在本 PR 实施）**：按用户要求核查项目内剩余 `deepseek-v4-flash` 调用点，仅剩 `tg_followup`（Telegram Step 4，刻意保留以维持开放式持仓推理质量，issue #11 已验证取消 thinking 会明显降质）。压力测试发现该 stage 同样会无视 `thinking.budget_tokens=3000` 软上限（1/3 次烧穿 `max_tokens=12000`），但已有 fallback 兜底且真实生产 0 次失败，判定为低优先级、非阻断，未并入本 PR。候选 `openai/gpt-5.6-luna`（非pro）+`reasoning.effort=high` 已用同一真实数据验证 7/7 可行（`max_tokens=16000` 档更稳），但实施需要代码改动（OpenAI 系模型走 OpenRouter 统一 `reasoning` 参数而非 DeepSeek 的 `thinking` 字段）而非纯配置切换，建议单独排期。issue #59/PR #61 review（协作者 `blacktomb42`）额外指出 CLAUDE.md 状态记录和本文档未同步，均已修正。
+
+**issue #60 实施（2026-08-04）**：上面记录的候选方案已实现，另加两项在同一轮讨论中一并验证并入的关联改动。
+
+1. **`tg_followup` 切换到 `openai/gpt-5.6-luna`（非pro）+ `reasoning.effort=high`**：`max_tokens` 12000→16000（一并调整，理由与当初 8000→12000 一致——留足余量而非卡着上限）；`providers` 从 DeepSeek 的 `{order:[DigitalOcean,Venice]}` 改为锁定 `{order:[OpenAI],allow_fallbacks:false}`（避免路由到可能不遵守 `reasoning` 参数的 provider，与姊妹项目 `clip_processor.py` Stage 2 的已验证配置一致）；`telegram_commands.py::_followup_reason()` 主模型请求路径新增 `reasoning` 字段透传（此前只有 fallback 分支支持这个字段）。
+2. **`report_pass2` 的 `report_md` 脱离 JSON 包裹**：`llm_client.call_llm()` 新增 `parse_json` 参数（默认 `True`，向后兼容其余 7 个 stage），`parse_json=False` 时跳过 `parse_llm_json`，直接返回 `{"text": <裸文本>, "_llm_meta": {...}}`，仅做防御性代码围栏剥离（模型即使被要求不要包围栏，仍可能习惯性加上）。空文本视为失败走既有重试/fallback 路径，不会把空 report_md 当成功返回。`report_pass2` 模型本身**未换**（仍是 `deepseek/deepseek-v4-pro`）——上一轮真实数据对比虽然发现它在"认知提升 vs 生态位验证"判断上出现过一次自相矛盾（详见 GitHub issue #60 评论），但样本量 n=1，按当时记录的建议暂不换模型，只做架构层的 JSON 解耦。
+3. **`sas_candidates` 拆成独立 stage `sas_candidate_extract`**：不再是 Pass 2 JSON 的一个字段，而是 Pass 2 report_md 调用之后的第二次独立调用，复用同一份已组装好的价格/新闻/持仓上下文（`run_finance.py::SAS_CANDIDATE_PROMPT_TEMPLATE`），模型选 `google/gemma-4-31b-it`（9/9 真实对抗测试验证，见 issue #60 评论）。带来一个此前没有的副作用（正面）：`sas_candidates` 提取失败不再能连累 `report_md`——原先两者共享一个 JSON 信封，一次解析失败两个都丢。
+
+验证：`test_llm_config.py`（24/24）、`test_telegram_followup_reason.py`（16/16，含 `reasoning` 字段透传、`provider` 锁定断言）新增/更新用例覆盖 `parse_json=False` 的正常返回、空文本重试/fallback、`reasoning` 字段校验；另用真实生产 `llm_client.call_llm(stage="report_pass2", parse_json=False)`、`call_llm(stage="sas_candidate_extract")`、`telegram_commands._followup_reason()` 三处端到端冒烟测试确认代码路径正确接入（非仅 mock 测试）。
