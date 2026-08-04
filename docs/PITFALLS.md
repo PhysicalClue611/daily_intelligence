@@ -364,6 +364,23 @@ LLM 始终写「开盘前简报」，需在写文件前 `re.sub` 替换为「夜
 ### 86. 手动跑 `run_finance.py` 被 Bash 工具默认 2 分钟超时杀掉，残留 stale lock 文件但不阻塞下次运行（issue #11 后验证）
 （2026-07-25 发现）手动触发一次完整 PM 报告（`FINANCE_FORCE_RUN=1 FINANCE_FORCE_SLOT=pm`）验证 issue #11 改动，用 Claude Code 的 Bash 工具默认超时（120000ms）直接跑，被在中途 SIGTERM 杀掉（历史实测完整跑一次约 2m20s-2m24s，含 Pass1/Pass2 两次 LLM 调用+多个搜索源，超过 2 分钟很常见，不是异常）。进程被杀时来不及走到 `main()` 里 `finally: _lock_fd.close(); LOCK_FILE.unlink()` 这段清理逻辑，`run_finance.lock` 文件残留、内容是已死进程的 PID。**核实结果：不影响下次运行**——`_acquire_lock()` 用的是 `fcntl.flock(fd, LOCK_EX | LOCK_NB)`，这是进程级 advisory lock，跟着持有它的文件描述符走，进程一死（无论是否正常退出）操作系统会自动释放，不依赖 Python 的 `finally` 块执行与否；下一次调用 `_acquire_lock()` 打开同一文件、尝试加锁会直接成功，只是会用新 PID 覆盖旧内容。**教训**：手动跑这类多阶段财经流水线（含多次真实 LLM/搜索 API 调用）时，Bash 工具超时要显式设到比历史实测耗时更宽裕（如 400000ms），不要用默认 120000ms；如果确实被超时杀掉，`run_finance.lock` 里的旧 PID 是无害的过期内容，不需要手动删除或诊断，直接重跑即可。
 
+### 87. `telegram_utils.py::call_telegram()` 重试只捕获 `httpx.ConnectError`，SSL 握手超时（`httpx.ConnectTimeout`）零重试直接放弃（issue #58）
+（2026-08-03 发现）AM 报告生成、邮件均成功，但 TG 正文+状态消息两条消息均未送达，`/tmp/daily_intelligence.log` 显示两次独立 `sendMessage` 调用各自只失败一次就放弃（无重试痕迹），错误信息是 `_ssl.c:1063: The handshake operation timed out`。`call_telegram()`（坑74/76 修复产物）的重试逻辑：
+
+```python
+except httpx.ConnectError as e:
+    last_err = e
+    continue
+except Exception as e:
+    logger.warning(...)
+    return {}
+```
+
+docstring 明确写着设计意图是"重试瞬时 connect 阶段失败"，用来吸收 api.telegram.org 在 TLS 握手阶段的瞬时抖动（坑74/76 描述的 `ConnectError`）。但 SSL **握手超时**在 httpx 里是 `httpx.ConnectTimeout`，属于 `httpx.TimeoutException` 的子类，与 `httpx.ConnectError` 是并列的兄弟类、不是子类关系——`except httpx.ConnectError` 捕获不到它，直接落进 `except Exception` 分支，零重试放弃。坑74/76 当初的修复只堵了"连接被拒/DNS失败"这一类瞬时故障，没堵"连接建立但握手阶段卡住超时"这一类，两者是同一条网络路径（Shadowrocket TUN 隧道）的瞬时抖动的不同表现形式，被 httpx 归为不同异常类型。已开 issue #58 记录，**尚未修复**（建议方向：`except httpx.ConnectError` 扩大为 `httpx.TransportError` 或显式加 `httpx.ConnectTimeout`），等用户确认后再改代码。**影响面**：`call_telegram()` 是 `send_telegram_report()`/`send_telegram_alert()`/`telegram_commands.py` 长轮询和回复的唯一入口，`send_telegram_alert()` 本身（失败告警机制）也可能被同一根因打掉。
+
+### 88. Bash 工具同步命令超时（"exit 143"）不代表网络请求被取消——本地进程死了，OpenRouter 服务端仍会处理并计费
+（2026-08-03 发现）为对比 `report_pass2` 模型（DeepSeek V4 Pro vs `~deepseek/deepseek-v4-flash-latest`）手写了一个测试脚本，第一次同步调用因为数据采集阶段（价格/RSS/Finnhub/Brave/Sonar 等）耗时超过 Bash 工具默认 2 分钟超时被判定"exit 143"，本地检查 `/tmp` 下预期产出的文件全部不存在，误判为"进程在有实质性副作用之前就被杀了，什么都没发生"，据此在后续披露测试成本时完全没有把这次计入。几天后用户提供的真实 OpenRouter Activity CSV 显示：这次"超时失败"的进程实际上已经完整发出并等到了一次 Sonar 调用（$0.00718）和一次 DeepSeek V4 Pro 调用（$0.00826）的响应——本地 httpx 客户端进程被 SIGTERM 杀死，不会让已经完全发送出去的 HTTP 请求在服务端被取消；OpenRouter 收到完整请求后照常处理、计费，只是响应没有机会被本地脚本读取并写入文件，所以本地检查"文件是否存在"看不出这次调用真的发生过。**教训**：涉及真实付费 API 调用的诊断脚本，凡是可能超过 Bash 默认超时的，必须在第一次尝试时就给足够宽裕的 `timeout` 参数（同坑86），不能"先用默认超时试试，超时了就当没发生"——本地进程被杀和"请求没有产生任何后果"是两回事，尤其是同步阻塞的 HTTP 调用，在被杀之前请求体很可能已经完整发出。事后核对真实成本，唯一可靠的信源是服务端的账单/日志（OpenRouter Activity 面板/CSV），不能只凭本地文件是否落盘来判断某次调用是否发生。
+
 ---
 
 ## 十、凭据与日志卫生
