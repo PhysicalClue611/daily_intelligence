@@ -105,7 +105,8 @@ def _extract_verifiable_signals(am_section_text: str) -> str:
 def _evaluate_am_predictions(signals_text: str, price_table: str, news_context: str, date_str: str) -> dict:
     """Single cheap LLM call: judge each AM 'verifiable signal' against today's
     actual outcome data. Returns {} on any failure or empty input (fail-open).
-    Cost: ~$0.0005 (small prompt, deepseek-v4-flash via OR)."""
+    Cost: ~$0.0005 (small prompt, google/gemma-4-31b-it via OR, "am_calibration"
+    stage — see llm_config.py, split out from report_pass1 in issue #59)."""
     if not OPENROUTER_API_KEY or not signals_text.strip():
         return {}
     prompt = f"""今日日期：{date_str}
@@ -147,7 +148,7 @@ def _evaluate_am_predictions(signals_text: str, price_table: str, news_context: 
 }}
 """
     try:
-        return call_llm(prompt, stage="report_pass1", system_prompt=_CALIBRATION_SYSTEM_PROMPT)
+        return call_llm(prompt, stage="am_calibration", system_prompt=_CALIBRATION_SYSTEM_PROMPT)
     except Exception as e:
         logger.warning(f"AM prediction evaluation failed (non-fatal): {e}")
         return {}
