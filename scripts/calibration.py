@@ -405,12 +405,13 @@ def format_calibration_metrics_report(window_days: int = 10) -> str:
 
 
 # ── SAS candidate evidence log (issue #31) ────────────────────────────────
-# Pass 2 flags news/events matching the Investment Operating Manual's 7.4
-# internal-signal list or Section 6 cognitive-upgrade criteria via the
-# `sas_candidates` JSON field (see USER_PROMPT_TEMPLATE_P2 rule ⑧). This is
-# a pure evidence queue for the semi-annual SAS review (Manual Section 7.1:
-# scoring requires a human-written 100-300-char rationale with no price
-# lookback) — it never drives automated scoring or trading advice.
+# A dedicated "sas_candidate_extract" LLM stage (issue #60; run_finance.py's
+# SAS_CANDIDATE_PROMPT_TEMPLATE) flags news/events matching the Investment
+# Operating Manual's 7.4 internal-signal list or Section 6 cognitive-upgrade
+# criteria, independent of Pass 2's report_md call. This is a pure evidence
+# queue for the semi-annual SAS review (Manual Section 7.1: scoring requires
+# a human-written 100-300-char rationale with no price lookback) — it never
+# drives automated scoring or trading advice.
 
 SAS_CANDIDATE_LOG_PATH = OBSIDIAN / "Hermes/Daily Intelligence/SAS候选证据日志.md"
 

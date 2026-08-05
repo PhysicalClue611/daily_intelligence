@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-Regression tests for telegram_commands._followup_reason() (issue #11).
+Regression tests for telegram_commands._followup_reason() (issue #11, updated
+for the openai/gpt-5.6-luna + reasoning.effort=high switch, issue #60).
 
 No pytest dependency — plain asserts, same style as the other test_*.py here.
 
 What these protect:
-  - Thinking is enabled on the TG follow-up call (the change this PR makes)
-    and, critically, is NOT enabled on tg_gap_detect's 60-token budget — that
-    combination is what crashed production in issue #53.
+  - reasoning.effort=high is sent on the TG follow-up call's primary request
+    (deepseek-v4-flash's thinking.budget_tokens turned out to be a soft hint,
+    not an enforced ceiling — 1/3 real reps burned through max_tokens on
+    hidden reasoning even with it set, issue #60) and, critically, is NOT
+    enabled on tg_gap_detect's 60-token budget — that combination is what
+    crashed production in issue #53.
   - `content: null` (the shape of that crash) degrades to a user-visible
     message instead of raising AttributeError on .strip() and killing the
-    polling loop.
+    polling loop — including when finish_reason=="length" and a non-empty
+    reasoning_content holds a partial chain of thought: that must never be
+    promoted and returned as if it were the answer (PR #56's original fix
+    for this, still enforced here after the model swap).
   - The fallback goes to the configured model with OpenRouter's reasoning
     effort param attached, and the reported model label follows it.
 
@@ -69,7 +76,7 @@ def _run_with(fake_post):
         tc.httpx.post = orig
 
 
-def test_primary_payload_has_thinking_enabled():
+def test_primary_payload_has_reasoning_enabled():
     captured = {}
 
     def fake_post(url, headers=None, json=None, timeout=None):
@@ -79,11 +86,12 @@ def test_primary_payload_has_thinking_enabled():
 
     answer, label = _run_with(fake_post)
     assert answer == "持仓含义分析..."
-    assert label == "deepseek/deepseek-v4-flash"
-    assert captured["thinking"] == {"type": "enabled", "budget_tokens": 3000}
-    assert captured["max_tokens"] == 12000, captured["max_tokens"]
-    assert captured["provider"] == {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": True}
-    # Thinking latency: a 120s timeout would push most calls to the fallback.
+    assert label == "openai/gpt-5.6-luna"
+    assert "thinking" not in captured           # DeepSeek-only param, not sent for this model
+    assert captured["reasoning"] == {"effort": "high"}
+    assert captured["max_tokens"] == 16000, captured["max_tokens"]
+    assert captured["provider"] == {"order": ["OpenAI"], "allow_fallbacks": False}
+    # Reasoning latency: a 120s timeout would push most calls to the fallback.
     assert captured["_timeout"] == 180
 
 
@@ -164,14 +172,14 @@ def test_empty_primary_content_falls_back_before_giving_up():
 
     def fake_post(url, headers=None, json=None, timeout=None):
         calls.append(json["model"])
-        if json["model"] == "deepseek/deepseek-v4-flash":
+        if json["model"] == "openai/gpt-5.6-luna":
             return _FakeResponse(_ok_payload(content=None, finish="length"))
         return _FakeResponse(_ok_payload(content="fallback 给出的正常回答"))
 
     answer, label = _run_with(fake_post)
     assert answer == "fallback 给出的正常回答"
     assert label == "x-ai/grok-4.5"
-    assert calls == ["deepseek/deepseek-v4-flash", "x-ai/grok-4.5"]  # no wasted retries
+    assert calls == ["openai/gpt-5.6-luna", "x-ai/grok-4.5"]  # no wasted retries
 
 
 def test_fallback_uses_configured_model_with_reasoning_effort():
@@ -179,7 +187,7 @@ def test_fallback_uses_configured_model_with_reasoning_effort():
 
     def fake_post(url, headers=None, json=None, timeout=None):
         calls.append(json)
-        if json["model"] == "deepseek/deepseek-v4-flash":
+        if json["model"] == "openai/gpt-5.6-luna":
             raise tc.httpx.ConnectError("primary down")
         return _FakeResponse(_ok_payload(content="grok 的回答"))
 
@@ -189,7 +197,7 @@ def test_fallback_uses_configured_model_with_reasoning_effort():
     fb = calls[-1]
     assert fb["model"] == "x-ai/grok-4.5"
     assert fb["reasoning"] == {"effort": "medium"}
-    assert fb["max_tokens"] == 8000          # fallback_max_tokens, not the primary's 12000
+    assert fb["max_tokens"] == 8000          # fallback_max_tokens, not the primary's 16000
     assert "thinking" not in fb              # thinking is a DeepSeek-side param
     assert "provider" not in fb              # no provider pin on the fallback
     assert len(calls) == 4                   # 3 primary attempts, then fallback

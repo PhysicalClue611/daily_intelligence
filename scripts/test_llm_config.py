@@ -72,9 +72,23 @@ def test_defaults_when_file_missing():
     _load(None)
     assert llm_config.model("report_pass1") == "google/gemma-4-31b-it"
     assert llm_config.model("am_calibration") == "google/gemma-4-31b-it"
-    assert llm_config.model("report_pass2") == "deepseek/deepseek-v4-pro"
+    assert llm_config.model("report_pass2") == "openai/gpt-5.6-luna"
+    assert llm_config.stage("report_pass2")["reasoning"] == {"effort": "high"}
     assert llm_config.model("semantic_filter") == "google/gemma-4-31b-it"
+    assert llm_config.model("tg_followup") == "openai/gpt-5.6-luna"
+    assert llm_config.stage("tg_followup")["reasoning"] == {"effort": "high"}
     assert llm_config.stage("tg_followup")["fallback_model"] == "x-ai/grok-4.5"
+    assert llm_config.model("sas_candidate_extract") == "google/gemma-4-31b-it"
+
+
+def test_reasoning_field_override_and_validation():
+    # tg_followup (issue #60): OpenAI-style reasoning.effort, distinct
+    # validator/field from DeepSeek's thinking.budget_tokens.
+    records = _load({"stages": {"tg_followup": {"reasoning": {"effort": "low"}}}})
+    assert llm_config.stage("tg_followup")["reasoning"] == {"effort": "low"}
+    records = _load({"stages": {"tg_followup": {"reasoning": {"effort": "extreme"}}}})
+    assert llm_config.stage("tg_followup")["reasoning"] == {"effort": "high"}  # reverted
+    assert any("tg_followup.reasoning" in m for m in _levels(records, "WARNING"))
 
 
 def test_valid_override_applies_and_is_logged():
@@ -83,7 +97,7 @@ def test_valid_override_applies_and_is_logged():
     infos = _levels(records, "INFO")
     assert any("tg_followup.model" in m and "grok-4.5" in m for m in infos), infos
     # Untouched fields keep their defaults.
-    assert llm_config.stage("tg_followup")["max_tokens"] == 12000
+    assert llm_config.stage("tg_followup")["max_tokens"] == 16000
 
 
 def test_flat_form_without_stages_wrapper():
@@ -93,13 +107,13 @@ def test_flat_form_without_stages_wrapper():
 
 def test_malformed_json_falls_back_to_defaults():
     records = _load(None, raw_text='{"stages": {"tg_followup": {"model": ')
-    assert llm_config.model("tg_followup") == "deepseek/deepseek-v4-flash"
+    assert llm_config.model("tg_followup") == "openai/gpt-5.6-luna"
     assert any("not valid JSON" in m for m in _levels(records, "ERROR"))
 
 
 def test_non_object_root_falls_back():
     records = _load(None, raw_text='["deepseek/deepseek-v4-flash"]')
-    assert llm_config.model("tg_followup") == "deepseek/deepseek-v4-flash"
+    assert llm_config.model("tg_followup") == "openai/gpt-5.6-luna"
     assert _levels(records, "ERROR")
 
 
@@ -108,7 +122,7 @@ def test_unknown_stage_and_unknown_field_are_ignored():
         "tg_folowup": {"model": "x-ai/grok-4.5"},          # typo'd stage
         "tg_followup": {"modle": "x-ai/grok-4.5"},         # typo'd field
     }})
-    assert llm_config.model("tg_followup") == "deepseek/deepseek-v4-flash"
+    assert llm_config.model("tg_followup") == "openai/gpt-5.6-luna"
     warnings = _levels(records, "WARNING")
     assert any("unknown stage" in m for m in warnings), warnings
     assert any("unknown field" in m for m in warnings), warnings
@@ -120,7 +134,7 @@ def test_invalid_values_fall_back_per_field_not_per_file():
         "max_tokens": 20000,                 # valid -> applied
     }}})
     cfg = llm_config.stage("tg_followup")
-    assert cfg["model"] == "deepseek/deepseek-v4-flash"  # bad field reverted
+    assert cfg["model"] == "openai/gpt-5.6-luna"          # bad field reverted
     assert cfg["max_tokens"] == 20000                    # good field still applied
     assert any("tg_followup.model" in m and "invalid" in m
                for m in _levels(records, "WARNING"))
@@ -171,17 +185,32 @@ def test_thinking_budget_without_headroom_reverts_both_fields():
     # max_tokens and thinking.budget_tokens each pass field-level validation
     # independently, but together they recreate issue #53's starvation.
     # Neither field alone is "invalid", so only a cross-field check catches it.
-    records = _load({"stages": {"tg_followup": {"max_tokens": 3200}}})
-    cfg = llm_config.stage("tg_followup")
-    assert cfg["max_tokens"] == llm_config.DEFAULTS["tg_followup"]["max_tokens"]
-    assert cfg["thinking"] == llm_config.DEFAULTS["tg_followup"]["thinking"]
-    assert any("thinking.budget_tokens" in m and "tg_followup" in m
+    # Issue #60: no stage defaults to thinking-enabled anymore (report_pass2
+    # and tg_followup both switched to OpenAI's reasoning.effort, which has
+    # no token budget to cross-check against max_tokens) — the "thinking"
+    # field is still a known key on report_pass2 (default null), so a
+    # hand-edit can still turn it on via override, which is exactly the
+    # realistic scenario this guard exists for. Exercise it that way.
+    records = _load({"stages": {"report_pass2": {
+        "thinking": {"type": "enabled", "budget_tokens": 3000},
+        "max_tokens": 3200,
+    }}})
+    cfg = llm_config.stage("report_pass2")
+    assert cfg["max_tokens"] == llm_config.DEFAULTS["report_pass2"]["max_tokens"]
+    assert cfg["thinking"] == llm_config.DEFAULTS["report_pass2"]["thinking"]
+    assert any("thinking.budget_tokens" in m and "report_pass2" in m
                for m in _levels(records, "WARNING"))
 
 
 def test_thinking_budget_with_headroom_is_accepted():
-    _load({"stages": {"tg_followup": {"max_tokens": 20000}}})
-    assert llm_config.stage("tg_followup")["max_tokens"] == 20000
+    records = _load({"stages": {"report_pass2": {
+        "thinking": {"type": "enabled", "budget_tokens": 3000},
+        "max_tokens": 20000,
+    }}})
+    cfg = llm_config.stage("report_pass2")
+    assert cfg["max_tokens"] == 20000
+    assert cfg["thinking"] == {"type": "enabled", "budget_tokens": 3000}
+    assert not any("thinking.budget_tokens" in m for m in _levels(records, "WARNING"))
 
 
 def test_thinking_budget_check_skipped_when_thinking_disabled():
@@ -208,18 +237,19 @@ def test_provider_pass_through_unknown_keys():
 
 def test_stage_returns_are_independent_deep_copies():
     # Multiple stages' "providers" default share the same object literal
-    # (_DS_PROVIDERS) in DEFAULTS. A shallow copy would let mutating one
-    # stage's returned providers dict corrupt every other stage that still
-    # points at the same default — persisting for the life of the
+    # (_GEMMA_PROVIDERS, issue #60) in DEFAULTS. A shallow copy would let
+    # mutating one stage's returned providers dict corrupt every other stage
+    # that still points at the same default — persisting for the life of the
     # long-running Telegram bot process.
-    # report_pass1 no longer defaults to _DS_PROVIDERS (issue #59 — it's
-    # gemma now, providers is null); report_pass2 and tg_followup still do.
+    # report_pass1 and semantic_filter both default to the shared
+    # _GEMMA_PROVIDERS object; report_pass2 and tg_followup each have their
+    # own independent OpenAI-pin literal now (issue #60), not a shared one.
     _load(None)
-    a = llm_config.stage("report_pass2")
+    a = llm_config.stage("report_pass1")
     a["providers"]["order"].append("Mutated")
-    b = llm_config.stage("tg_followup")  # also defaults to the shared _DS_PROVIDERS
+    b = llm_config.stage("semantic_filter")  # also defaults to the shared _GEMMA_PROVIDERS
     assert "Mutated" not in b["providers"]["order"]
-    c = llm_config.stage("report_pass2")
+    c = llm_config.stage("report_pass1")
     assert "Mutated" not in c["providers"]["order"]
 
 
@@ -234,7 +264,7 @@ def test_mutation_of_returned_dict_does_not_leak():
     _load(None)
     cfg = llm_config.stage("tg_followup")
     cfg["model"] = "mutated/model"
-    assert llm_config.model("tg_followup") == "deepseek/deepseek-v4-flash"
+    assert llm_config.model("tg_followup") == "openai/gpt-5.6-luna"
 
 
 def test_unknown_stage_name_raises():
@@ -299,8 +329,229 @@ def test_llm_client_reads_stage_config():
         llm_client.httpx.post = orig
     assert out.get("ok") is True
     assert captured["model"] == "x-ai/grok-4.5"
-    assert captured["thinking"] == {"type": "enabled", "budget_tokens": 3000}
-    assert captured["max_tokens"] == 8000
+    assert "thinking" not in captured           # report_pass2 no longer uses DeepSeek's thinking
+    assert captured["reasoning"] == {"effort": "high"}
+    assert captured["max_tokens"] == 16000
+
+
+def test_call_llm_parse_json_false_returns_raw_text():
+    # issue #60: report_pass2's report_md no longer has to survive being
+    # JSON-escaped and re-parsed — parse_json=False skips parse_llm_json
+    # entirely and hands back the completion text as-is (fence stripped).
+    import llm_client
+    importlib.reload(llm_client)
+    _load(None)
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": "stop",
+                                 "message": {"content": "```markdown\n# Report\n\nBody text.\n```"}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _Resp()
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        out = llm_client.call_llm("p", system_prompt="s", stage="report_pass2", parse_json=False)
+    finally:
+        llm_client.httpx.post = orig
+    assert out["text"] == "# Report\n\nBody text.", repr(out["text"])
+    assert "_llm_meta" in out
+
+
+def test_call_llm_parse_json_false_empty_content_falls_back():
+    # Empty completion text under parse_json=False is treated as a failed
+    # attempt (same as unparseable JSON under the default path) — it must
+    # not be returned as a "successful" empty report_md, and must still
+    # reach the stage's fallback_model.
+    import llm_client
+    importlib.reload(llm_client)
+    _load(None)
+    calls = []
+
+    class _Resp:
+        def __init__(self, content):
+            self._content = content
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": "stop", "message": {"content": self._content}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(json["model"])
+        # Primary (report_pass2's gpt-5.6-luna) always returns empty;
+        # the flex-fallback request (google/gemini-3.5-flash) returns text.
+        if json["model"] == llm_config.stage("report_pass2")["fallback_model"]:
+            return _Resp("Fallback report body.")
+        return _Resp("")
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        out = llm_client.call_llm("p", system_prompt="s", stage="report_pass2",
+                                   parse_json=False, max_retries=1)
+    finally:
+        llm_client.httpx.post = orig
+    assert out["text"] == "Fallback report body."
+    assert out["_llm_meta"]["fallback"] is True
+    assert calls.count("openai/gpt-5.6-luna") == 2  # primary + 1 retry, both empty
+
+
+def test_call_llm_parse_json_false_never_promotes_partial_cot_on_length():
+    # PR #62 review bug: finish_reason=="length" + content=null/"" + a
+    # non-empty reasoning_content is the issue #53/#59/#60 reasoning-
+    # exhausted-the-budget shape — reasoning_content there is a partial
+    # chain of thought, not an answer. An earlier version of this code did
+    # `content or reasoning_content or reasoning`, which made that CoT text
+    # truthy and shipped it as result["text"] (the daily report itself, for
+    # report_pass2) with no retry and no fallback. Must instead treat this
+    # exactly like empty content: retry, then reach fallback_model.
+    import llm_client
+    importlib.reload(llm_client)
+    _load(None)
+    calls = []
+
+    class _Resp:
+        def __init__(self, content, reasoning_content=None, finish="stop"):
+            self._content = content
+            self._reasoning_content = reasoning_content
+            self._finish = finish
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            msg = {"content": self._content}
+            if self._reasoning_content is not None:
+                msg["reasoning_content"] = self._reasoning_content
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": self._finish, "message": msg}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(json["model"])
+        if json["model"] == llm_config.stage("report_pass2")["fallback_model"]:
+            return _Resp("Fallback report body.")
+        # Primary: budget exhausted on hidden reasoning — content empty,
+        # finish_reason=length, but reasoning_content holds a partial CoT.
+        return _Resp(None, reasoning_content="...partial chain of thought, not an answer...",
+                     finish="length")
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        out = llm_client.call_llm("p", system_prompt="s", stage="report_pass2",
+                                   parse_json=False, max_retries=1)
+    finally:
+        llm_client.httpx.post = orig
+    assert out["text"] == "Fallback report body."
+    assert "partial chain of thought" not in out["text"]
+    assert out["_llm_meta"]["fallback"] is True
+    assert calls.count("openai/gpt-5.6-luna") == 2  # primary + 1 retry, neither promoted CoT
+
+
+def test_call_llm_parse_json_false_accepts_partial_content_on_length():
+    # Contrast with the case above: finish_reason=="length" does NOT mean
+    # "reject the response" — only an *empty* content under length should be
+    # treated as failure. Genuinely truncated but non-empty visible content
+    # (the model wrote real markdown and then ran out of budget mid-report)
+    # must still be accepted as a (partial) report rather than discarded.
+    import llm_client
+    importlib.reload(llm_client)
+    _load(None)
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": "length",
+                                 "message": {"content": "# Report\n\n价格异动部分正常写完，"
+                                                         "后面被截断了"}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _Resp()
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        out = llm_client.call_llm("p", system_prompt="s", stage="report_pass2", parse_json=False)
+    finally:
+        llm_client.httpx.post = orig
+    assert "价格异动部分正常写完" in out["text"]
+    assert out["_llm_meta"]["fallback"] is False  # accepted on the primary attempt, no fallback needed
+
+
+def test_call_llm_sends_reasoning_param_for_report_pass2_parse_json_false():
+    # PR #62 review: confirm `reasoning` is actually present on the outbound
+    # OpenRouter payload for report_pass2 under parse_json=False, not just
+    # under the default parse_json=True path (test_llm_client_reads_stage_config).
+    import llm_client
+    importlib.reload(llm_client)
+    _load(None)
+    captured = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": "stop", "message": {"content": "# Report\n\nBody."}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured.update(json)
+        return _Resp()
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        llm_client.call_llm("p", system_prompt="s", stage="report_pass2", parse_json=False)
+    finally:
+        llm_client.httpx.post = orig
+    assert captured["model"] == "openai/gpt-5.6-luna"
+    assert captured["reasoning"] == {"effort": "high"}
+    assert "thinking" not in captured
+    assert captured["provider"] == {"order": ["OpenAI"], "allow_fallbacks": False}
+
+
+def test_call_llm_parse_json_false_unwraps_legacy_json_report_md():
+    # Defensive (PR #62 review, non-blocking suggestion): report_pass2's
+    # contract was JSON-wrapped for months before issue #60. If a model
+    # regresses to that habit despite the prompt now asking for bare
+    # markdown, unwrap the report_md field rather than shipping a raw JSON
+    # dump as the report.
+    import llm_client
+    importlib.reload(llm_client)
+    _load(None)
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": "stop",
+                                 "message": {"content": '{"report_md": "# Report\\n\\nBody text."}'}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _Resp()
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        out = llm_client.call_llm("p", system_prompt="s", stage="report_pass2", parse_json=False)
+    finally:
+        llm_client.httpx.post = orig
+    assert out["text"] == "# Report\n\nBody text.", repr(out["text"])
 
 
 def test_calibration_uses_its_own_stage_not_report_pass1():

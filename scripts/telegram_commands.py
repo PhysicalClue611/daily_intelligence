@@ -1328,7 +1328,9 @@ def _llm_followup(question: str, pre: dict) -> str:
         research_brief = "(情报检索失败)"
         research_source = "N/A"
 
-    # Step 4: Gemini 3.5 Flash via OR flex — personalised reasoning; fallback: Grok 4.3
+    # Step 4: model/provider/reasoning come from llm_config's "tg_followup"
+    # stage (currently openai/gpt-5.6-luna + reasoning.effort=high, issue #60);
+    # fallback: x-ai/grok-4.5.
     reply("推理中（整合实时行情 + 情报 + 持仓框架 + 知识库）...")
     portfolio = _get_portfolio_snapshot()
     mp_ctx    = _mempalace_context(question)
@@ -1476,12 +1478,15 @@ def _followup_reason(messages: list[dict]) -> tuple[str, str]:
     bypassing _deepseek_post's OR-flex fallback so the returned model label
     reflects the model that actually answered.
 
-    Thinking is enabled here by default, unlike every other DeepSeek call in
-    this project (issue #11): answer quality on open-ended portfolio reasoning
-    degrades badly without it. The guard rails that make that safe are the
-    large max_tokens and the empty-content check in _parse_step4_response —
-    with thinking on, `content` comes back null when reasoning tokens eat the
-    whole budget, which is exactly how issue #53 crashed in production.
+    Reasoning is enabled here by default (reasoning.effort=high, issue #60 —
+    previously DeepSeek's thinking.budget_tokens, issue #11): answer quality
+    on open-ended portfolio reasoning degrades badly without it. The guard
+    rails that make that safe are the large max_tokens and the empty-content
+    check in _parse_step4_response — with reasoning on, `content` comes back
+    null when reasoning tokens eat the whole budget (verified live 2026-08-04:
+    1/3 reps of deepseek-v4-flash+thinking did exactly this even with
+    budget_tokens=3000 set — the field is a soft hint, not an enforced
+    ceiling), the same shape issue #53 crashed on in production.
 
     The fallback model is tried once whenever the primary attempt didn't
     produce a usable answer — whether that's because the transport failed
@@ -1511,7 +1516,8 @@ def _followup_reason(messages: list[dict]) -> tuple[str, str]:
                       "messages": messages,
                       "max_tokens": fu_cfg["max_tokens"],
                       "temperature": fu_cfg["temperature"],
-                      **({"thinking": fu_cfg["thinking"]} if fu_cfg["thinking"] else {})},
+                      **({"thinking": fu_cfg["thinking"]} if fu_cfg.get("thinking") else {}),
+                      **({"reasoning": fu_cfg["reasoning"]} if fu_cfg.get("reasoning") else {})},
                 # 180s, not the pre-thinking 120s: reasoning tokens are generated
                 # before the first visible token, so a timeout tuned for
                 # no-thinking latency would push every call to the fallback.
@@ -1564,8 +1570,9 @@ def _followup_reason(messages: list[dict]) -> tuple[str, str]:
     if not answer:
         if finish_reason == "length":
             logger.error(f"Step 4 [{model_label}]: budget exhausted before any visible answer "
-                         f"(finish_reason=length, empty content) — raise tg_followup.max_tokens "
-                         f"or lower thinking.budget_tokens in llm_config.json")
+                         f"(finish_reason=length, empty content) — raise tg_followup.max_tokens/"
+                         f"fallback_max_tokens or lower reasoning.effort/fallback_reasoning.effort "
+                         f"in llm_config.json")
             raise _FollowupError(
                 "（推理失败：模型用尽 token 预算仍未产出可见回答，"
                 "可调高 llm_config.json 中 tg_followup.max_tokens 后重试）")

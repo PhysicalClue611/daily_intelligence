@@ -20,16 +20,17 @@
     "",
     "Field notes: 'model'/'fallback_model' must be OpenRouter slugs ('vendor/model',",
     "optionally '~vendor/model-latest'). 'providers' is OpenRouter's provider",
-    "routing object, or null for no pin. 'thinking' applies to the primary model;",
-    "'fallback_reasoning' is OpenRouter's unified reasoning-effort param applied to",
-    "the fallback model. Keys starting with '_' are ignored (JSON has no comments)."
+    "routing object, or null for no pin. 'thinking' (DeepSeek) and 'reasoning'",
+    "(OpenAI-style {\"effort\": ...}) both apply to the primary model, whichever the",
+    "model expects. 'fallback_reasoning' is the same reasoning-effort param applied",
+    "to the fallback model. Keys starting with '_' are ignored (JSON has no comments)."
   ],
   "stages": {
     "report_pass1": {
-      "_note": "google/gemma-4-31b-it, not deepseek-v4-flash (issue #59) — two real 2026-08-03 production failures showed Flash burns the full max_tokens budget on hidden reasoning even with no thinking key sent; gemma verified 6/6 clean (reasoning_tokens=0, finish_reason=stop) on the real prompt shape.",
+      "_note": "google/gemma-4-31b-it, not deepseek-v4-flash (issue #59) — two real 2026-08-03 production failures showed Flash burns the full max_tokens budget on hidden reasoning even with no thinking key sent; gemma verified 6/6 clean (reasoning_tokens=0, finish_reason=stop) on the real prompt shape. providers pinned to OpenInference (issue #60) — real calls across gemma stages were observed landing on several different providers with no pin; allow_fallbacks stays true.",
       "gateway": "openrouter",
       "model": "google/gemma-4-31b-it",
-      "providers": null,
+      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
       "max_tokens": 4000,
       "temperature": 0.2,
       "fallback_model": "google/gemini-3.1-flash-lite"
@@ -38,24 +39,35 @@
       "_note": "Split from report_pass1 (issue #59) so tuning the main report stage can't silently change this unrelated PM calibration judgement call's budget/model. Defaults mirror report_pass1 for now — same real-data validation.",
       "gateway": "openrouter",
       "model": "google/gemma-4-31b-it",
-      "providers": null,
+      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
       "max_tokens": 4000,
       "temperature": 0.2,
       "fallback_model": "google/gemini-3.1-flash-lite"
     },
     "report_pass2": {
+      "_note": "openai/gpt-5.6-luna (non-pro) + reasoning.effort=high, not deepseek-v4-pro+thinking (issue #60) — a real side-by-side comparison on 2026-08-03 PM's actual data surfaced a genuine correctness bug in deepseek-v4-pro's output (categorized the same fact as 生态位验证 in sas_candidates but then treated it as 认知提升-战略节点解锁 in the position-check section of the same response, giving a buy recommendation its own rules say that category can't justify); gpt-5.6-luna's output on the identical prompt stayed internally consistent. Also mischaracterized SPCX as an ETF in that run; gpt-5.6-luna did not. Provider pinned to OpenAI only, same treatment as tg_followup.",
       "gateway": "openrouter",
-      "model": "deepseek/deepseek-v4-pro",
-      "providers": {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": true},
-      "thinking": {"type": "enabled", "budget_tokens": 3000},
-      "max_tokens": 8000,
+      "model": "openai/gpt-5.6-luna",
+      "providers": {"order": ["OpenAI"], "allow_fallbacks": false},
+      "thinking": null,
+      "reasoning": {"effort": "high"},
+      "max_tokens": 16000,
       "temperature": 0.2,
       "fallback_model": "google/gemini-3.5-flash"
+    },
+    "sas_candidate_extract": {
+      "_note": "Split out of report_pass2 (issue #60) so report_pass2's report_md — the largest payload in this project — no longer has to be escaped into a JSON string that a truncation mid-string would destroy wholesale. google/gemma-4-31b-it verified 9/9 across 3 real adversarial test batches (exact reproduction of the real 2026-08-03 PM SAS候选证据日志.md ground truth, correct holdings-only gating, correct rejection of generic-beat/scheduled-sale traps).",
+      "gateway": "openrouter",
+      "model": "google/gemma-4-31b-it",
+      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
+      "max_tokens": 800,
+      "temperature": 0.0,
+      "fallback_model": "google/gemini-3.1-flash-lite"
     },
     "semantic_filter": {
       "gateway": "openrouter",
       "model": "google/gemma-4-31b-it",
-      "providers": null,
+      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
       "max_tokens": 200,
       "temperature": 0.0,
       "fallback_model": "google/gemini-3.1-flash-lite"
@@ -71,7 +83,7 @@
       "_note": "Not deepseek-v4-flash: at temperature=0, 3 real reps of the identical simple command produced 3 different broken outcomes (hallucinated action, full truncation, mid-JSON truncation) — see llm_config.py DEFAULTS comment for the full writeup. gemma-4-31b-it reproduced clean on every rep across 5 command types.",
       "gateway": "openrouter",
       "model": "google/gemma-4-31b-it",
-      "providers": null,
+      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
       "max_tokens": 600,
       "temperature": 0.0,
       "fallback_model": "google/gemini-3.1-flash-lite"
@@ -80,7 +92,7 @@
       "_note": "Throwaway yes/no judgement on a 60-token budget — not deepseek-v4-flash, it burns the whole budget on hidden reasoning here even with no thinking key sent (verified live, issue #53/#11); gemma-4-31b-it reproduces clean.",
       "gateway": "openrouter",
       "model": "google/gemma-4-31b-it",
-      "providers": null,
+      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
       "max_tokens": 60,
       "temperature": 0.1,
       "fallback_model": null
@@ -92,11 +104,13 @@
       "temperature": 0.1
     },
     "tg_followup": {
+      "_note": "openai/gpt-5.6-luna (non-pro) + reasoning.effort=high, not deepseek-v4-flash+thinking (issue #60) — a real reconstructed prompt reproduced 1/3 reps burning straight through max_tokens on hidden reasoning (thinking.budget_tokens is a soft hint, not an enforced ceiling). gpt-5.6-luna verified 7/7 finish_reason=stop on the real prompt; provider pinned to OpenAI only, matching the same model's validated config in the sister project (clip_processor.py Stage 2).",
       "gateway": "openrouter",
-      "model": "deepseek/deepseek-v4-flash",
-      "providers": {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": true},
-      "thinking": {"type": "enabled", "budget_tokens": 3000},
-      "max_tokens": 12000,
+      "model": "openai/gpt-5.6-luna",
+      "providers": {"order": ["OpenAI"], "allow_fallbacks": false},
+      "thinking": null,
+      "reasoning": {"effort": "high"},
+      "max_tokens": 16000,
       "temperature": 0.3,
       "fallback_model": "x-ai/grok-4.5",
       "fallback_reasoning": {"effort": "medium"},

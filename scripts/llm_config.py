@@ -72,11 +72,13 @@ CONFIG_PATH = Path(os.getenv("DAILY_INTEL_LLM_CONFIG", str(_PROJ_DIR / "llm_conf
 # confusing HTTP error at call time.
 KNOWN_GATEWAYS = {"openrouter"}
 
-# DeepSeek routing on OpenRouter. Retained as the default for the DeepSeek
-# stages; note the account has BYOK configured for DeepSeek, so `allow_fallbacks`
-# is what lets traffic degrade to another provider when BYOK capacity is
-# exhausted (see issue #53/#55 for why that is expected, not a pin failure).
-_DS_PROVIDERS = {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": True}
+# google/gemma-4-31b-it routing on OpenRouter (issue #60). Real calls across
+# this project's gemma stages have been observed landing on several different
+# providers (Friendli, Crusoe, Novita, OpenInference, OpenInference-bf16...)
+# with no explicit pin — OpenInference standardized on as the preferred
+# provider for consistency, allow_fallbacks=true so a real outage still
+# degrades to another provider rather than failing the call outright.
+_GEMMA_PROVIDERS = {"order": ["OpenInference"], "allow_fallbacks": True}
 
 DEFAULTS: dict[str, dict] = {
     # ── Report pipeline (run_finance.py / calibration.py via llm_client.py) ──
@@ -98,11 +100,12 @@ DEFAULTS: dict[str, dict] = {
         # test faithfully reproduced the production failure). Output quality
         # checked, not just structural JSON validity: correct 4-section
         # report_md, correct [!]-ticker identification, schema-compliant
-        # 可验证信号/tavily_queries. providers is null (not the DeepSeek
-        # DigitalOcean/Venice pin) because gemma isn't routed through those.
+        # 可验证信号/tavily_queries. providers is _GEMMA_PROVIDERS (not the
+        # DeepSeek DigitalOcean/Venice pin) because gemma isn't routed
+        # through those.
         "gateway": "openrouter",
         "model": "google/gemma-4-31b-it",
-        "providers": None,
+        "providers": _GEMMA_PROVIDERS,
         "max_tokens": 4000,
         "temperature": 0.2,
         "fallback_model": "google/gemini-3.1-flash-lite",  # OR service_tier=flex
@@ -122,25 +125,41 @@ DEFAULTS: dict[str, dict] = {
     "am_calibration": {
         "gateway": "openrouter",
         "model": "google/gemma-4-31b-it",
-        "providers": None,
+        "providers": _GEMMA_PROVIDERS,
         "max_tokens": 4000,
         "temperature": 0.2,
         "fallback_model": "google/gemini-3.1-flash-lite",
     },
     "report_pass2": {
+        # openai/gpt-5.6-luna (non-pro) + reasoning.effort=high, not
+        # deepseek-v4-pro+thinking (issue #60): a real side-by-side
+        # comparison on 2026-08-03 PM's actual data (real price table, real
+        # holdings, real Sonar/Tavily context) surfaced a genuine correctness
+        # bug in deepseek-v4-pro's output, not just a formatting/stability
+        # difference — it categorized the same ORCL/CACI fact as "生态位验证"
+        # in the sas_candidates field but then treated it as "认知提升-战略
+        # 节点解锁" in the 持仓异动核对 section of the same response, giving a
+        # concrete buy recommendation the prompt's own rules explicitly say
+        # that category cannot justify. gpt-5.6-luna's output on the
+        # identical prompt stayed internally consistent and correctly
+        # declined to treat it as sufficient (see issue #60 comments for the
+        # full excerpt). Also independently noted: deepseek-v4-pro
+        # mischaracterized SPCX as an ETF in that same run, gpt-5.6-luna did
+        # not. max_tokens 8000->16000 and provider pinned to OpenAI only,
+        # matching the same treatment already applied to tg_followup.
         "gateway": "openrouter",
-        "model": "deepseek/deepseek-v4-pro",
-        "providers": _DS_PROVIDERS,
-        # Required by Together/Fireworks for v4-pro to emit content at all.
-        "thinking": {"type": "enabled", "budget_tokens": 3000},
-        "max_tokens": 8000,
+        "model": "openai/gpt-5.6-luna",
+        "providers": {"order": ["OpenAI"], "allow_fallbacks": False},
+        "thinking": None,
+        "reasoning": {"effort": "high"},
+        "max_tokens": 16000,
         "temperature": 0.2,
         "fallback_model": "google/gemini-3.5-flash",
     },
     "semantic_filter": {
         "gateway": "openrouter",
         "model": "google/gemma-4-31b-it",
-        "providers": None,
+        "providers": _GEMMA_PROVIDERS,
         "max_tokens": 200,
         "temperature": 0.0,
         "fallback_model": "google/gemini-3.1-flash-lite",
@@ -179,7 +198,7 @@ DEFAULTS: dict[str, dict] = {
         # stage's primary job.
         "gateway": "openrouter",
         "model": "google/gemma-4-31b-it",
-        "providers": None,
+        "providers": _GEMMA_PROVIDERS,
         # 600 is deliberate headroom over the JSON schema this stage emits;
         # it was raised once already after truncation (docs/PITFALLS.md#55).
         # With gemma's reasoning_tokens=0 there is no longer a variable
@@ -201,7 +220,7 @@ DEFAULTS: dict[str, dict] = {
         # identical semantic_filter judgement call, PR #54) reproduces clean
         # on this prompt: finish_reason=stop, reasoning_tokens=0.
         "model": "google/gemma-4-31b-it",
-        "providers": None,
+        "providers": _GEMMA_PROVIDERS,
         "max_tokens": 60,
         "temperature": 0.1,
         "fallback_model": None,
@@ -213,22 +232,65 @@ DEFAULTS: dict[str, dict] = {
         "temperature": 0.1,
     },
     "tg_followup": {
+        # Not deepseek-v4-flash+thinking (issue #60): budget_tokens=3000 is a
+        # soft hint, not an enforced ceiling — a real reconstructed-prompt
+        # test (2026-08-04, real 07-29 INTC/PLTR/SPCX followup) reproduced
+        # 1/3 reps burning straight through max_tokens=12000 on hidden
+        # reasoning (reasoning=11999/12000, content_len=0), the same failure
+        # shape issue #53/#59 fixed elsewhere. Low production risk (0 real
+        # failures observed, fallback_model absorbs it), but the same fix
+        # already validated for report_pass1/am_calibration doesn't carry
+        # over here: this stage needs genuine reasoning depth for open-ended
+        # portfolio analysis (issue #11 showed gemma-4-31b-it's no-reasoning
+        # output is materially worse here), so the fix is a model swap, not
+        # dropping reasoning. openai/gpt-5.6-luna (non-pro) + reasoning.effort
+        # =high verified live on the real 07-29 prompt: 7/7 finish_reason=
+        # stop, reasoning 34-95% of a 12000 budget (one rep at 94.7%, tight)
+        # and 59-66% of 16000 — max_tokens raised to 16000 alongside the swap
+        # for headroom. Content quality checked, not just structural success:
+        # concrete actionable priority ordering, and one rep caught a real
+        # data-consistency edge case (portfolio snapshot timestamped after
+        # the analysis point) unprompted. provider pinned to OpenAI only,
+        # matching the same model's validated config in the sister project
+        # (Obsidian "LLM-Reasoning-eval设计与实现", clip_processor.py Stage 2)
+        # — avoids routing to a provider that might not honor `reasoning`.
         "gateway": "openrouter",
-        "model": "deepseek/deepseek-v4-flash",
-        "providers": _DS_PROVIDERS,
-        # Thinking on: without it V4 Flash's answer quality on open-ended
-        # portfolio reasoning is materially worse. Budget mirrors report_pass2
-        # (3000), which has never hit the ceiling in production; max_tokens is
-        # raised well above the old 8000 so reasoning tokens cannot starve the
-        # visible answer the way they did in issue #53.
-        "thinking": {"type": "enabled", "budget_tokens": 3000},
-        "max_tokens": 12000,
+        "model": "openai/gpt-5.6-luna",
+        "providers": {"order": ["OpenAI"], "allow_fallbacks": False},
+        "thinking": None,
+        "reasoning": {"effort": "high"},
+        "max_tokens": 16000,
         "temperature": 0.3,
         "fallback_model": "x-ai/grok-4.5",
         # OpenRouter's unified reasoning param, applied to the fallback model
         # only ("medium" is an effort level, not a separate model slug).
         "fallback_reasoning": {"effort": "medium"},
         "fallback_max_tokens": 8000,
+    },
+    # SAS candidate-evidence extraction (issue #32's sas_candidates, issue
+    # #60): split out of report_pass2 rather than sharing its JSON envelope,
+    # so report_pass2's report_md — the largest payload of any stage in this
+    # project and one of the two that has actually hit finish_reason=length
+    # in production (issue #59) — can drop the JSON wrapper entirely. A
+    # truncation mid-string inside a JSON-wrapped report_md loses the whole
+    # report; the same truncation in plain markdown only loses the tail.
+    # google/gemma-4-31b-it verified live (2026-08-04) on this stage's real
+    # extraction task: 9/9 across 3 real adversarial batches built from real
+    # portfolio + real archived SAS候选证据日志.md ground truth — exact
+    # reproduction of the one real candidate logged for 2026-08-03 PM,
+    # correct rejection of a non-held ticker's dramatic earnings beat, and
+    # correct precision on two deliberately hard traps (generic earnings
+    # beat vs a specific previously-doubted target actually confirmed;
+    # genuine open-market insider buying vs a scheduled 10b5-1 sale
+    # disguised as "an insider transaction"). All 9 reasoning_tokens=0,
+    # finish_reason=stop, across 4 different OR providers.
+    "sas_candidate_extract": {
+        "gateway": "openrouter",
+        "model": "google/gemma-4-31b-it",
+        "providers": _GEMMA_PROVIDERS,
+        "max_tokens": 800,
+        "temperature": 0.0,
+        "fallback_model": "google/gemini-3.1-flash-lite",
     },
 }
 
@@ -315,6 +377,7 @@ _VALIDATORS = {
     "fallback_model": _v_model_or_none,
     "providers": _v_providers,
     "thinking": _v_thinking,
+    "reasoning": _v_reasoning,
     "fallback_reasoning": _v_reasoning,
     "max_tokens": _v_max_tokens,
     "fallback_max_tokens": _v_max_tokens,
@@ -385,7 +448,7 @@ def _read_raw() -> dict:
 def _build() -> dict[str, dict]:
     """Merge validated overrides onto DEFAULTS, logging every effective change."""
     # deepcopy, not dict(): several stages' "providers" default points at the
-    # same shared _DS_PROVIDERS object literal. A shallow copy here still
+    # same shared _GEMMA_PROVIDERS object literal. A shallow copy here still
     # shares that nested dict across every stage that hasn't overridden it —
     # fine for the read-only call sites that exist today, but a future
     # in-place mutation (or a careless test) would poison DEFAULTS for the
@@ -474,6 +537,8 @@ def describe(name: str) -> str:
     thinking = cfg.get("thinking")
     if thinking and thinking.get("type") == "enabled":
         out += " (thinking)"
+    elif cfg.get("reasoning"):
+        out += f" (reasoning:{cfg['reasoning']['effort']})"
     fb = cfg.get("fallback_model")
     if fb:
         out += f" -> {fb}"
