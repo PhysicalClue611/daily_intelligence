@@ -1570,8 +1570,9 @@ def _followup_reason(messages: list[dict]) -> tuple[str, str]:
     if not answer:
         if finish_reason == "length":
             logger.error(f"Step 4 [{model_label}]: budget exhausted before any visible answer "
-                         f"(finish_reason=length, empty content) — raise tg_followup.max_tokens "
-                         f"or lower thinking.budget_tokens in llm_config.json")
+                         f"(finish_reason=length, empty content) — raise tg_followup.max_tokens/"
+                         f"fallback_max_tokens or lower reasoning.effort/fallback_reasoning.effort "
+                         f"in llm_config.json")
             raise _FollowupError(
                 "（推理失败：模型用尽 token 预算仍未产出可见回答，"
                 "可调高 llm_config.json 中 tg_followup.max_tokens 后重试）")
