@@ -32,6 +32,20 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-08-04/05，issue #60 / PR #62，已合并 + 生产双跑验证）
+
+**issue #60 三项改动全部实现并合并（PR #62，squash `384be56`）**：① `tg_followup`（Telegram Step 4）从 `deepseek/deepseek-v4-flash`+`thinking` 切换为 `openai/gpt-5.6-luna`（非pro）+`reasoning:{"effort":"high"}`，provider 锁定 `{"order":["OpenAI"],"allow_fallbacks":false}`，`max_tokens` 12000→16000；② `report_pass2` 同样从 `deepseek/deepseek-v4-pro`+`thinking` 切到 `gpt-5.6-luna`+`reasoning.effort=high`（同一套 provider 锁定），`max_tokens` 8000→16000，且 `report_md` 脱离 JSON 包裹（`llm_client.py::call_llm()` 新增 `parse_json=False` 模式，直接返回裸 markdown，防止截断发生在 JSON 字符串中途时把整份报告一起作废）；③ `sas_candidates`（issue #32）从 Pass2 JSON 的一个字段拆成独立的 `sas_candidate_extract` stage（`google/gemma-4-31b-it`），复用 Pass2 已组装好的上下文单独调一次，失败不再连累 report_md。六个 `google/gemma-4-31b-it` stage（`report_pass1`/`am_calibration`/`sas_candidate_extract`/`semantic_filter`/`tg_preprocess`/`tg_gap_detect`）的 `providers` 从不锁定改为锁定 `OpenInference`（`allow_fallbacks:true`，观察到真实调用此前散落在 Friendli/Crusoe/Novita/OpenInference 多个 provider）。
+
+**Code review（`blacktomb42`，PR #62，两轮，第二轮 APPROVED）抓到一个真实 P0**：`llm_client.py::call_llm()` 的 `parse_json=False` 路径沿用了旧的 `content or reasoning_content or reasoning` 取值顺序——`finish_reason=="length"` 且 `content` 为空时（issue #53/#59/#60 反复出现的"reasoning 吃满预算"故障形态），会把部分思维链错误地当成 `report_md` 正文返回，且不触发重试/fallback。这是 PR #56 修过的 Telegram Step4 CoT-promotion bug 在新调用路径里的再现，用新的 `_resolve_content()`（镜像 `_parse_step4_response` 的既有防线：`finish_reason=="length"` 时绝不提升 `reasoning_content`）修复，primary 和 flex-fallback 两条路径都改了。同批修了 4 项非阻断建议：SAS 抽取包 try/except 隔离、hard pin 跳过 flex fallback 的行为记入注释而非静默、legacy JSON 包裹防御性 unwrap、删除死代码 `_DS_PROVIDERS`（合并后已无任何 stage 用 DeepSeek 模型）。第二轮 re-review 又指出两处非阻断残留（SAS prompt 措辞可能诱导裸 `[]` 输出浪费重试；Step4 日志误提已废弃的 `thinking.budget_tokens`），均已修复后合并。61/61 测试通过（`test_llm_config.py` 28/28，新增 5 条专门覆盖 CoT-promotion 修复的用例）。
+
+**合并后 `com.daily-intel.finance.telegram` 已重启**（PID 变化+启动时间晚于 merge，日志确认 `Finance Telegram bot started`）。`llm_config.json`/`run_finance.py`/`llm_client.py`/`calibration.py` 改动无需重启（前者 mtime 热加载；后三者每次 launchd 触发都是全新进程）。
+
+**真实生产双跑验证（2026-08-04）**：合并当晚用户要求"完整重跑一次今日PM报告"——当天 17:11 ET 定时 PM 报告已用旧代码（`deepseek-v4-pro`）跑过一次，合并生效后 20:22 ET 用新代码（`gpt-5.6-luna`）完整重跑一次，两次都是真实 `run_finance.py` 完整流水线执行（非模拟测试），构成一次真实（虽非受控 A/B，两次运行相隔3小时、Tavily 搜索结果不同）的生产环境对比。核心发现：`gpt-5.6-luna` 对二手信源的怀疑度处理明显更彻底（几乎每条依赖间接信源的断言都显式标注"单一来源待核实"/"同源媒体重复报道不等于独立交叉验证"，deepseek-v4-pro 同类处理明显更简略）；对"生态位验证不能直接当认知提升"这条防线也主动说得更清楚。`sas_candidate_extract` 独立调用（`gemma-4-31b-it`）正确遵守了 prompt 里"fact 字段含来源"的要求，旧的 Pass2 内嵌调用（`deepseek-v4-pro`）没有。`gpt-5.6-luna` 的 report_md 明显更长（completion 10166 vs 3262 token，约3倍）但 reasoning 占比反而更低（56% vs 74%），即更多预算转化成了可见分析而非纯思考。完整对比记录已同步更新进 Obsidian `Hermes/Homepage/LLM-Reasoning-eval设计与实现.md`（"生产环境双跑对比"节，在已有的 report_pass2 章节内原地更新，不是新增独立段落）和 `LLM-No-Reasoning-eval设计与实现.md`（§21.3 状态行更新为已实施+已生产验证，新增 §21.5 记录 `sas_candidate_extract` 的引用格式服从对照）。
+
+两份报告均已真实发出（email+TG各一次），今日 Obsidian 月度文件因此有两条"## 2026-08-04 夜盘收市速报"，用户知情，未做去重处理（保留供对比）。
+
+---
+
 ## 当前系统状态（2026-08-04，issue #59 / PR #61，已合并；issue #60 排查中）
 
 **issue #59 已在 PR #61 实现并合并**（下方 2026-08-03/04 章节记录的是排查阶段，结论仍然成立，但"未改代码"等表述已过时——本章节记录实现结果）。`report_pass1`（`scripts/llm_config.py` DEFAULTS）从 `deepseek/deepseek-v4-flash` 切换为 `google/gemma-4-31b-it`（`providers` 同步改为 `None`，不再走 DeepSeek 专属的 DigitalOcean/Venice pin）。`calibration.py::_evaluate_am_predictions()` 不再复用 `report_pass1` stage，改为独立的 `am_calibration` stage（同样默认 `google/gemma-4-31b-it`）——理由与 `tg_gap_detect`/`tg_followup` 拆分为独立 stage 一致：避免未来调 report_pass1 预算/模型时静默影响这个无关的 PM 校验判断。`llm_config.json`/`llm_config.example.json` 同步更新，新增回归测试 `test_calibration_uses_its_own_stage_not_report_pass1`，`test_llm_config.py` 21/21 通过。
@@ -695,6 +709,7 @@ _Tavily: N/10_
 86. 手动跑`run_finance.py`被Bash工具默认2分钟超时杀掉，残留stale lock文件但fcntl.flock跟进程走不阻塞下次运行 → 详见 `docs/PITFALLS.md#86`
 87. `telegram_utils.py::call_telegram()`重试只捕获`httpx.ConnectError`，SSL握手超时是并列兄弟类`httpx.ConnectTimeout`，零重试直接放弃 → 详见 `docs/PITFALLS.md#87`
 88. Bash工具同步命令超时"exit 143"不代表网络请求被取消——本地进程死了，OpenRouter服务端仍会处理并计费，造成未察觉的真实调用 → 详见 `docs/PITFALLS.md#88`
+89. `call_llm()`新增免JSON文本路径时沿用了`content or reasoning_content or reasoning`取值顺序，`finish_reason=length`+空content时会把部分思维链错误当正文返回 → 详见 `docs/PITFALLS.md#89`
 
 ---
 
@@ -710,7 +725,8 @@ _Tavily: N/10_
 8. **`llm_config.json` 实际使用观察**（issue #11，2026-07-25 起）：目前该文件内容与 DEFAULTS 完全一致（零覆盖），观察是否有实际调整需求（如某 stage 换模型、调预算）；每次编辑后确认 `/tmp/daily_intelligence.log` 或 `/tmp/finance_telegram.log` 出现对应的 `LLM config override:` 日志，验证改动真的生效
 9. **`report_pass1`/`am_calibration` 切 gemma-4-31b-it 后的生产观察**（issue #59/PR #61，2026-08-04 起）：模型选型本身已用真实 prompt 验证完成（6/6 通过，见上方状态章节），不需要再跑付费验证；观察项改为 `grep "LLM tokens \[report_pass1/google/gemma-4-31b-it\]\|LLM tokens \[am_calibration/google/gemma-4-31b-it\]" /tmp/daily_intelligence.log`，确认 `reasoning=0`、`finish_reason=stop` 在真实 AM/PM 报告运行中持续成立，不再出现 `finish_reason=length` 告警
 10. **issue #58：`call_telegram()` ConnectTimeout 修复**（2026-08-03 起）：等用户确认修复方向（`httpx.TransportError` 兜底 vs 显式加 `httpx.ConnectTimeout`）后实施，修复后观察 TG 报告/状态消息投递是否还出现单次握手超时就整体放弃的情况
-11. **issue #60：`tg_followup` 换用 `openai/gpt-5.6-luna`（非pro）+`reasoning.effort=high`**（2026-08-04 起，候选已验证可行，未实施）：需要代码改动（主模型路径接入 OpenRouter 统一 `reasoning` 参数、`max_tokens` 12000→16000）而非纯配置切换，建议单独排期；实施后同样按上一条模式观察生产日志确认稳定
+11. **issue #60/PR #62 生产观察**（2026-08-05 起，已实施+已合并，见上方状态章节）：`tg_followup`/`report_pass2` 均已切至 `gpt-5.6-luna`+`reasoning.effort=high`，2026-08-04 当晚已用真实生产双跑验证过一次（质量优于旧模型，见上方状态章节完整记录）；后续观察 `grep "LLM tokens \[report_pass2/openai/gpt-5.6-luna\]\|Step 4 tokens \[openai/gpt-5.6-luna\]" /tmp/daily_intelligence.log /tmp/finance_telegram.log`，确认 `finish_reason=stop` 持续成立、`provider=OpenAI` 稳定路由（硬 pin 不允许 fallback，需要留意是否出现非429 4xx 导致的静默降级到 Pass1-only report_md，PR #62 review 已识别此风险并记入 `llm_client.py` 注释，未做代码修复）
+12. **真实成本核算**（issue #60 遗留缺口）：`gpt-5.6-luna` 与 `deepseek-v4-pro`/`deepseek-v4-flash` 的实际生产量级成本差异尚未核算，观察一段时间后可用 OR 账单核实
 
 ---
 
