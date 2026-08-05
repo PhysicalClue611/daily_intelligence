@@ -80,6 +80,7 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
     cfg = llm_config.stage(stage)
     model = cfg["model"]
     thinking_cfg = cfg.get("thinking")
+    reasoning_cfg = cfg.get("reasoning")
     max_tokens = cfg["max_tokens"]
     providers = cfg.get("providers")
     last_error = None
@@ -106,6 +107,7 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                     "max_tokens": max_tokens,
                     "temperature": cfg["temperature"],
                     **({"thinking": thinking_cfg} if thinking_cfg else {}),
+                    **({"reasoning": reasoning_cfg} if reasoning_cfg else {}),
                 },
                 timeout=180,
             )

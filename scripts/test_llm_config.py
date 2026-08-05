@@ -72,7 +72,8 @@ def test_defaults_when_file_missing():
     _load(None)
     assert llm_config.model("report_pass1") == "google/gemma-4-31b-it"
     assert llm_config.model("am_calibration") == "google/gemma-4-31b-it"
-    assert llm_config.model("report_pass2") == "deepseek/deepseek-v4-pro"
+    assert llm_config.model("report_pass2") == "openai/gpt-5.6-luna"
+    assert llm_config.stage("report_pass2")["reasoning"] == {"effort": "high"}
     assert llm_config.model("semantic_filter") == "google/gemma-4-31b-it"
     assert llm_config.model("tg_followup") == "openai/gpt-5.6-luna"
     assert llm_config.stage("tg_followup")["reasoning"] == {"effort": "high"}
@@ -184,11 +185,16 @@ def test_thinking_budget_without_headroom_reverts_both_fields():
     # max_tokens and thinking.budget_tokens each pass field-level validation
     # independently, but together they recreate issue #53's starvation.
     # Neither field alone is "invalid", so only a cross-field check catches it.
-    # report_pass2, not tg_followup (issue #60): tg_followup switched from
-    # DeepSeek's thinking.budget_tokens to OpenAI's reasoning.effort, which
-    # has no token budget to cross-check against max_tokens — report_pass2
-    # is now the only stage still exercising this DeepSeek-specific guard.
-    records = _load({"stages": {"report_pass2": {"max_tokens": 3200}}})
+    # Issue #60: no stage defaults to thinking-enabled anymore (report_pass2
+    # and tg_followup both switched to OpenAI's reasoning.effort, which has
+    # no token budget to cross-check against max_tokens) — the "thinking"
+    # field is still a known key on report_pass2 (default null), so a
+    # hand-edit can still turn it on via override, which is exactly the
+    # realistic scenario this guard exists for. Exercise it that way.
+    records = _load({"stages": {"report_pass2": {
+        "thinking": {"type": "enabled", "budget_tokens": 3000},
+        "max_tokens": 3200,
+    }}})
     cfg = llm_config.stage("report_pass2")
     assert cfg["max_tokens"] == llm_config.DEFAULTS["report_pass2"]["max_tokens"]
     assert cfg["thinking"] == llm_config.DEFAULTS["report_pass2"]["thinking"]
@@ -197,8 +203,14 @@ def test_thinking_budget_without_headroom_reverts_both_fields():
 
 
 def test_thinking_budget_with_headroom_is_accepted():
-    _load({"stages": {"report_pass2": {"max_tokens": 20000}}})
-    assert llm_config.stage("report_pass2")["max_tokens"] == 20000
+    records = _load({"stages": {"report_pass2": {
+        "thinking": {"type": "enabled", "budget_tokens": 3000},
+        "max_tokens": 20000,
+    }}})
+    cfg = llm_config.stage("report_pass2")
+    assert cfg["max_tokens"] == 20000
+    assert cfg["thinking"] == {"type": "enabled", "budget_tokens": 3000}
+    assert not any("thinking.budget_tokens" in m for m in _levels(records, "WARNING"))
 
 
 def test_thinking_budget_check_skipped_when_thinking_disabled():
@@ -225,18 +237,19 @@ def test_provider_pass_through_unknown_keys():
 
 def test_stage_returns_are_independent_deep_copies():
     # Multiple stages' "providers" default share the same object literal
-    # (_DS_PROVIDERS) in DEFAULTS. A shallow copy would let mutating one
-    # stage's returned providers dict corrupt every other stage that still
-    # points at the same default — persisting for the life of the
+    # (_GEMMA_PROVIDERS, issue #60) in DEFAULTS. A shallow copy would let
+    # mutating one stage's returned providers dict corrupt every other stage
+    # that still points at the same default — persisting for the life of the
     # long-running Telegram bot process.
-    # report_pass1 no longer defaults to _DS_PROVIDERS (issue #59 — it's
-    # gemma now, providers is null); report_pass2 and tg_followup still do.
+    # report_pass1 and semantic_filter both default to the shared
+    # _GEMMA_PROVIDERS object; report_pass2 and tg_followup each have their
+    # own independent OpenAI-pin literal now (issue #60), not a shared one.
     _load(None)
-    a = llm_config.stage("report_pass2")
+    a = llm_config.stage("report_pass1")
     a["providers"]["order"].append("Mutated")
-    b = llm_config.stage("tg_followup")  # also defaults to the shared _DS_PROVIDERS
+    b = llm_config.stage("semantic_filter")  # also defaults to the shared _GEMMA_PROVIDERS
     assert "Mutated" not in b["providers"]["order"]
-    c = llm_config.stage("report_pass2")
+    c = llm_config.stage("report_pass1")
     assert "Mutated" not in c["providers"]["order"]
 
 
@@ -316,8 +329,9 @@ def test_llm_client_reads_stage_config():
         llm_client.httpx.post = orig
     assert out.get("ok") is True
     assert captured["model"] == "x-ai/grok-4.5"
-    assert captured["thinking"] == {"type": "enabled", "budget_tokens": 3000}
-    assert captured["max_tokens"] == 8000
+    assert "thinking" not in captured           # report_pass2 no longer uses DeepSeek's thinking
+    assert captured["reasoning"] == {"effort": "high"}
+    assert captured["max_tokens"] == 16000
 
 
 def test_call_llm_parse_json_false_returns_raw_text():
@@ -373,7 +387,7 @@ def test_call_llm_parse_json_false_empty_content_falls_back():
 
     def fake_post(url, headers=None, json=None, timeout=None):
         calls.append(json["model"])
-        # Primary (report_pass2's deepseek-v4-pro) always returns empty;
+        # Primary (report_pass2's gpt-5.6-luna) always returns empty;
         # the flex-fallback request (google/gemini-3.5-flash) returns text.
         if json["model"] == llm_config.stage("report_pass2")["fallback_model"]:
             return _Resp("Fallback report body.")
@@ -388,7 +402,7 @@ def test_call_llm_parse_json_false_empty_content_falls_back():
         llm_client.httpx.post = orig
     assert out["text"] == "Fallback report body."
     assert out["_llm_meta"]["fallback"] is True
-    assert calls.count("deepseek/deepseek-v4-pro") == 2  # primary + 1 retry, both empty
+    assert calls.count("openai/gpt-5.6-luna") == 2  # primary + 1 retry, both empty
 
 
 def test_calibration_uses_its_own_stage_not_report_pass1():

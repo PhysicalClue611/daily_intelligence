@@ -2,7 +2,7 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-08-04（issue #60：`tg_followup` 切换至 `openai/gpt-5.6-luna`+`reasoning.effort=high`；`report_pass2` 的 `report_md` 脱离 JSON 包裹；`sas_candidates` 拆成独立 stage `sas_candidate_extract`；详见第八节和文末变更记录。另含 2026-08-04 之前的 `report_pass1`/`am_calibration` 切换至 `google/gemma-4-31b-it`，issue #59/PR #61）
+> **最后更新**：2026-08-04（issue #60：`tg_followup` 与 `report_pass2` 均切换至 `openai/gpt-5.6-luna`+`reasoning.effort=high`（provider锁定OpenAI）；`report_pass2` 的 `report_md` 脱离 JSON 包裹；`sas_candidates` 拆成独立 stage `sas_candidate_extract`；六个 `google/gemma-4-31b-it` stage 统一锁定 provider 为 OpenInference（allow_fallbacks）；详见第八节和文末变更记录。另含 2026-08-04 之前的 `report_pass1`/`am_calibration` 切换至 `google/gemma-4-31b-it`，issue #59/PR #61）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -446,7 +446,7 @@ if not anomalies and not triggered_geo_topics:
 - max_results=12（原 8）
 - Tavily 断连自动 fallback SerpApi；两者均耗尽则跳过搜索继续生成基础报告
 
-**Pass 2（有搜索结果时）**：使用 `deepseek-v4-pro`（原 flash）合并 Tavily 结果生成最终报告。
+**Pass 2（有搜索结果时）**：使用 `openai/gpt-5.6-luna`（非pro，issue #60，此前依次是 `deepseek-v4-flash` → `deepseek-v4-pro`）合并 Tavily 结果生成最终报告，`report_md` 直接输出裸 markdown（不再是 JSON 字段，见第八节）。
 
 **错误韧性**：两个 pass 的 LLM 调用（`call_llm()`）在遇到网络/5xx 错误时自动重试 2 次（指数退避 2s/4s），4xx 和 JSON 解析错误不重试。`telegram_commands.py` 中 DeepSeek 调用通过 `_deepseek_post()` 直连，Claude/Sonar 调用通过 `_openrouter_post()` 走 OR，均使用相同重试策略（网络/5xx 自动重试 2 次）。
 
@@ -688,15 +688,15 @@ stage 名与调用点对应：`report_pass1` / `am_calibration` / `report_pass2`
 
 | #   | 调用位置 | 用途 | 主力模型 | Fallback | max_tokens | 成本估算 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1   | `run_finance.py` Pass 1（stage `report_pass1`） | 报告草稿 + 生成 tavily_queries | `google/gemma-4-31b-it`（OR，无 provider pin，issue #59——原 `deepseek-v4-flash` 在 2026-08-03 真实生产两次故障，reasoning 隐式吃满预算导致 `finish_reason=length`） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.001 |
-| 1b  | `calibration.py::_evaluate_am_predictions()`（stage `am_calibration`） | PM slot：对照实际数据核验 AM「可验证信号」，产出知识条目 | `google/gemma-4-31b-it`（OR，无 provider pin，issue #59——从 `report_pass1` stage 拆分为独立 stage，避免未来调 report_pass1 预算/模型时静默影响这个无关的判断） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.0005 |
-| 2   | `run_finance.py` Pass 2 | 整合 Tavily 结果生成最终报告 | `deepseek/deepseek-v4-pro` via OR（thinking=enabled，budget=3000，Together/Fireworks 服务） | `google/gemini-3.5-flash` OR flex | 8000 | ~$0.01 |
-| 2b  | `run_finance.py` Pass 2 后（stage `sas_candidate_extract`，issue #60） | 独立提取 SAS 候选证据（原是 Pass 2 JSON 的一个字段，见上文"SAS候选证据标注"说明） | `google/gemma-4-31b-it`（OR，无 provider pin，9/9 真实对抗测试验证） | `google/gemini-3.1-flash-lite` OR flex | 800 | ~$0.0003 |
-| 3   | `run_finance.py` Layer 2b（stage `semantic_filter`） | 语义过滤 15→10 条搜索结果 | `google/gemma-4-31b-it`（OR，无 provider pin，issue #53/PR #54） | `google/gemini-3.1-flash-lite` OR flex | 200 | ~$0.0001 |
+| 1   | `run_finance.py` Pass 1（stage `report_pass1`） | 报告草稿 + 生成 tavily_queries | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #59/#60——原 `deepseek-v4-flash` 在 2026-08-03 真实生产两次故障，reasoning 隐式吃满预算导致 `finish_reason=length`） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.001 |
+| 1b  | `calibration.py::_evaluate_am_predictions()`（stage `am_calibration`） | PM slot：对照实际数据核验 AM「可验证信号」，产出知识条目 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #59/#60——从 `report_pass1` stage 拆分为独立 stage，避免未来调 report_pass1 预算/模型时静默影响这个无关的判断） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.0005 |
+| 2   | `run_finance.py` Pass 2 | 整合 Tavily 结果生成最终报告 | `openai/gpt-5.6-luna`（非pro）via OR/OpenAI（provider锁定，不允许fallback到其他provider；`reasoning={"effort":"high"}`，issue #60——原 `deepseek-v4-pro+thinking` 真实数据对比暴露自相矛盾判断，见文末记录） | `google/gemini-3.5-flash` OR flex | 16000 | ~$0.02（未核实精确单价） |
+| 2b  | `run_finance.py` Pass 2 后（stage `sas_candidate_extract`，issue #60） | 独立提取 SAS 候选证据（原是 Pass 2 JSON 的一个字段，见上文"SAS候选证据标注"说明） | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #60，9/9 真实对抗测试验证） | `google/gemini-3.1-flash-lite` OR flex | 800 | ~$0.0003 |
+| 3   | `run_finance.py` Layer 2b（stage `semantic_filter`） | 语义过滤 15→10 条搜索结果 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #53/PR #54/#60） | `google/gemini-3.1-flash-lite` OR flex | 200 | ~$0.0001 |
 | 4   | `intel_sources.py` step 6c（stage `macro_brief`） | Sonar 宏观快照（AM/PM 各一次） | `perplexity/sonar`（OR，`search_recency_filter="day"`，2026-07-02 加，见 issue #24） | 重试1次(5s) → `””` 空节 | 1500（issue #55 由 800 提高） | ~$0.005（含固定搜索费） |
-| 5   | `telegram_commands.py` Step 1（stage `tg_preprocess`） | 统一预处理：意图分类 + 2条 query 生成 | `google/gemma-4-31b-it`（OR，无 provider pin，issue #11） | `google/gemini-3.1-flash-lite` OR flex | 600 | ~$0.0001 |
+| 5   | `telegram_commands.py` Step 1（stage `tg_preprocess`） | 统一预处理：意图分类 + 2条 query 生成 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #11/#60） | `google/gemini-3.1-flash-lite` OR flex | 600 | ~$0.0001 |
 | 6   | `telegram_commands.py` Step 3 | 追问原文情报（2条 query + P1 可选第3条 + 3 URL extract，P2 聚合 URL 优先） | Parallel.ai SDK `parallel-web==0.4.2` | Sonar（重试1次→Exa） | — | ~$0.007（无P1）/ ~$0.012（P1触发） |
-| 6b  | `telegram_commands.py` Step 3 P1（stage `tg_gap_detect`） | gap detection：是否需要第3条 query | `google/gemma-4-31b-it`（OR，无 provider pin，issue #11——原 deepseek-v4-flash 在此 prompt 上实测烧光60-token预算于隐藏推理，功能实际从未跑成功过） | fail-open（不触发即跳过） | 60 | ~$0.0001 |
+| 6b  | `telegram_commands.py` Step 3 P1（stage `tg_gap_detect`） | gap detection：是否需要第3条 query | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #11/#60——原 deepseek-v4-flash 在此 prompt 上实测烧光60-token预算于隐藏推理，功能实际从未跑成功过） | fail-open（不触发即跳过） | 60 | ~$0.0001 |
 | 7   | `telegram_commands.py` Step 4（stage `tg_followup`） | 个人化推理 | `openai/gpt-5.6-luna`（非pro）via OR/OpenAI（provider锁定，不允许fallback到其他provider；`reasoning={"effort":"high"}`，issue #60——原 `deepseek-v4-flash+thinking` 实测同样会无视 `budget_tokens` 软上限烧穿 `max_tokens`，7/7 真实调用验证新配置） | `x-ai/grok-4.5`（OR，`reasoning={"effort":"medium"}`，max_tokens 8000） | 16000 | ~$0.01（模型换成本结构不同，未核实精确单价） |
 | 8   | `sas_review.py`（季度手动/自动触发，issue #32） | 直接打 SAS 四维度分（Strategic Space/Execution/Expectation Gap/Alpha Potential） | `~anthropic/claude-sonnet-latest`（OR） | 无（v1 故意不接，观察实际效果后再评估） | 4000 | ~$0.05（OR `usage.cost` 实际读取，无硬编码价格表） |
 
@@ -1243,3 +1243,5 @@ LLM 调用层的容错设计一直是"网络错误/5xx 重试，4xx 不重试"�
 3. **`sas_candidates` 拆成独立 stage `sas_candidate_extract`**：不再是 Pass 2 JSON 的一个字段，而是 Pass 2 report_md 调用之后的第二次独立调用，复用同一份已组装好的价格/新闻/持仓上下文（`run_finance.py::SAS_CANDIDATE_PROMPT_TEMPLATE`），模型选 `google/gemma-4-31b-it`（9/9 真实对抗测试验证，见 issue #60 评论）。带来一个此前没有的副作用（正面）：`sas_candidates` 提取失败不再能连累 `report_md`——原先两者共享一个 JSON 信封，一次解析失败两个都丢。
 
 验证：`test_llm_config.py`（24/24）、`test_telegram_followup_reason.py`（16/16，含 `reasoning` 字段透传、`provider` 锁定断言）新增/更新用例覆盖 `parse_json=False` 的正常返回、空文本重试/fallback、`reasoning` 字段校验；另用真实生产 `llm_client.call_llm(stage="report_pass2", parse_json=False)`、`call_llm(stage="sas_candidate_extract")`、`telegram_commands._followup_reason()` 三处端到端冒烟测试确认代码路径正确接入（非仅 mock 测试）。
+
+**`report_pass2` 模型换成 `openai/gpt-5.6-luna`（同日追加，用户确认后实施）**：上一段记录的"模型本身未换、按 n=1 建议暂不换"是 PR 首次提交时的状态；用户复核上一轮真实数据对比（ORCL/CACI 事件的分类自相矛盾、SPCX 被误标为ETF两处真实问题，详见 issue #60 评论）后决定直接换模型，不再等待更多样本。改动：`report_pass2` 的 `model` 改为 `openai/gpt-5.6-luna`（非pro），`thinking` 置空、新增 `reasoning={"effort":"high"}`，`providers` 从 DeepSeek 的 `{order:[DigitalOcean,Venice]}` 改为锁定 `{order:[OpenAI],allow_fallbacks:false}`，`max_tokens` 8000→16000——与 `tg_followup` 完全同一套处理方式。`llm_client.py::call_llm()` 原先只透传 `thinking` 字段、从不发送 `reasoning`（即使 stage 配置了它）——这是本次修复顺带发现并补上的真实缺口，若不修，`report_pass2`/`tg_followup` 配置的 `reasoning` 参数会被静默丢弃，模型退化为无显式推理强度设置调用。同批，六个 `google/gemma-4-31b-it` stage（`report_pass1`/`am_calibration`/`sas_candidate_extract`/`semantic_filter`/`tg_preprocess`/`tg_gap_detect`）的 `providers` 从 `null`（不锁定）统一改为 `{order:["OpenInference"],allow_fallbacks:true}`——此前这些 stage 的真实调用观察到落在 Friendli/Crusoe/Novita/OpenInference 等多个不同 provider 上，改为显式偏好 OpenInference、允许失败时降级到其他 provider（而非强制锁死不可 fallback）。真实生产 `call_llm()` 冒烟测试确认三处均正确接入：`report_pass2` 路由到 `OpenAI`，`sas_candidate_extract` 路由到 `OpenInference`，`report_pass1` 一次实测降级路由到 `Novita`（验证了 `allow_fallbacks:true` 确实按预期生效，不是摆设）。

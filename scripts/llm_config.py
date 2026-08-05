@@ -78,6 +78,14 @@ KNOWN_GATEWAYS = {"openrouter"}
 # exhausted (see issue #53/#55 for why that is expected, not a pin failure).
 _DS_PROVIDERS = {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": True}
 
+# google/gemma-4-31b-it routing on OpenRouter (issue #60). Real calls across
+# this project's gemma stages have been observed landing on several different
+# providers (Friendli, Crusoe, Novita, OpenInference, OpenInference-bf16...)
+# with no explicit pin — OpenInference standardized on as the preferred
+# provider for consistency, allow_fallbacks=true so a real outage still
+# degrades to another provider rather than failing the call outright.
+_GEMMA_PROVIDERS = {"order": ["OpenInference"], "allow_fallbacks": True}
+
 DEFAULTS: dict[str, dict] = {
     # ── Report pipeline (run_finance.py / calibration.py via llm_client.py) ──
     "report_pass1": {
@@ -98,11 +106,12 @@ DEFAULTS: dict[str, dict] = {
         # test faithfully reproduced the production failure). Output quality
         # checked, not just structural JSON validity: correct 4-section
         # report_md, correct [!]-ticker identification, schema-compliant
-        # 可验证信号/tavily_queries. providers is null (not the DeepSeek
-        # DigitalOcean/Venice pin) because gemma isn't routed through those.
+        # 可验证信号/tavily_queries. providers is _GEMMA_PROVIDERS (not the
+        # DeepSeek DigitalOcean/Venice pin) because gemma isn't routed
+        # through those.
         "gateway": "openrouter",
         "model": "google/gemma-4-31b-it",
-        "providers": None,
+        "providers": _GEMMA_PROVIDERS,
         "max_tokens": 4000,
         "temperature": 0.2,
         "fallback_model": "google/gemini-3.1-flash-lite",  # OR service_tier=flex
@@ -122,25 +131,41 @@ DEFAULTS: dict[str, dict] = {
     "am_calibration": {
         "gateway": "openrouter",
         "model": "google/gemma-4-31b-it",
-        "providers": None,
+        "providers": _GEMMA_PROVIDERS,
         "max_tokens": 4000,
         "temperature": 0.2,
         "fallback_model": "google/gemini-3.1-flash-lite",
     },
     "report_pass2": {
+        # openai/gpt-5.6-luna (non-pro) + reasoning.effort=high, not
+        # deepseek-v4-pro+thinking (issue #60): a real side-by-side
+        # comparison on 2026-08-03 PM's actual data (real price table, real
+        # holdings, real Sonar/Tavily context) surfaced a genuine correctness
+        # bug in deepseek-v4-pro's output, not just a formatting/stability
+        # difference — it categorized the same ORCL/CACI fact as "生态位验证"
+        # in the sas_candidates field but then treated it as "认知提升-战略
+        # 节点解锁" in the 持仓异动核对 section of the same response, giving a
+        # concrete buy recommendation the prompt's own rules explicitly say
+        # that category cannot justify. gpt-5.6-luna's output on the
+        # identical prompt stayed internally consistent and correctly
+        # declined to treat it as sufficient (see issue #60 comments for the
+        # full excerpt). Also independently noted: deepseek-v4-pro
+        # mischaracterized SPCX as an ETF in that same run, gpt-5.6-luna did
+        # not. max_tokens 8000->16000 and provider pinned to OpenAI only,
+        # matching the same treatment already applied to tg_followup.
         "gateway": "openrouter",
-        "model": "deepseek/deepseek-v4-pro",
-        "providers": _DS_PROVIDERS,
-        # Required by Together/Fireworks for v4-pro to emit content at all.
-        "thinking": {"type": "enabled", "budget_tokens": 3000},
-        "max_tokens": 8000,
+        "model": "openai/gpt-5.6-luna",
+        "providers": {"order": ["OpenAI"], "allow_fallbacks": False},
+        "thinking": None,
+        "reasoning": {"effort": "high"},
+        "max_tokens": 16000,
         "temperature": 0.2,
         "fallback_model": "google/gemini-3.5-flash",
     },
     "semantic_filter": {
         "gateway": "openrouter",
         "model": "google/gemma-4-31b-it",
-        "providers": None,
+        "providers": _GEMMA_PROVIDERS,
         "max_tokens": 200,
         "temperature": 0.0,
         "fallback_model": "google/gemini-3.1-flash-lite",
@@ -179,7 +204,7 @@ DEFAULTS: dict[str, dict] = {
         # stage's primary job.
         "gateway": "openrouter",
         "model": "google/gemma-4-31b-it",
-        "providers": None,
+        "providers": _GEMMA_PROVIDERS,
         # 600 is deliberate headroom over the JSON schema this stage emits;
         # it was raised once already after truncation (docs/PITFALLS.md#55).
         # With gemma's reasoning_tokens=0 there is no longer a variable
@@ -201,7 +226,7 @@ DEFAULTS: dict[str, dict] = {
         # identical semantic_filter judgement call, PR #54) reproduces clean
         # on this prompt: finish_reason=stop, reasoning_tokens=0.
         "model": "google/gemma-4-31b-it",
-        "providers": None,
+        "providers": _GEMMA_PROVIDERS,
         "max_tokens": 60,
         "temperature": 0.1,
         "fallback_model": None,
@@ -268,7 +293,7 @@ DEFAULTS: dict[str, dict] = {
     "sas_candidate_extract": {
         "gateway": "openrouter",
         "model": "google/gemma-4-31b-it",
-        "providers": None,
+        "providers": _GEMMA_PROVIDERS,
         "max_tokens": 800,
         "temperature": 0.0,
         "fallback_model": "google/gemini-3.1-flash-lite",
