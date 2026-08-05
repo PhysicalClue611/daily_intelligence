@@ -1642,26 +1642,35 @@ def _main_body():
 
         # SAS candidate extraction (issue #32) is now a fully independent call
         # (issue #60), not sharing report_md's JSON envelope — its own model/
-        # budget, and its failure can no longer take report_md down with it.
-        sas_prompt = SAS_CANDIDATE_PROMPT_TEMPLATE.format(
-            date=today_et,
-            pm_afterhours_note=pm_afterhours_note,
-            price_data_label=price_data_label,
-            price_table=price_table,
-            price_missing_note=price_missing_note,
-            news_text=news_text,
-            finnhub_news_section=finnhub_news_section,
-            brave_news_section=brave_news_section,
-            sonar_macro_section=sonar_macro_section,
-            social_sentiment_section=social_sentiment_section,
-            tavily_section=tavily_section,
-            personal_context=personal_context,
-        )
-        sas_result = call_llm(
-            sas_prompt, stage="sas_candidate_extract",
-            system_prompt="你是一名严格遵循规则的候选证据提取器，只输出JSON，不输出任何其他文字。",
-        )
-        write_sas_candidate_log(today_et, slot_label, sas_result.get("sas_candidates", []))
+        # budget. Explicitly wrapped in try/except (PR #62 review): call_llm()
+        # is documented to fail open by returning {} rather than raising, but
+        # that's an implicit contract at this call site, not an enforced one —
+        # an unexpected raise from call_llm/.format()/stage lookup here would
+        # otherwise abort _main_body() *after* report_md is already built,
+        # taking the whole report down with it for a feature that's supposed
+        # to be a side channel.
+        try:
+            sas_prompt = SAS_CANDIDATE_PROMPT_TEMPLATE.format(
+                date=today_et,
+                pm_afterhours_note=pm_afterhours_note,
+                price_data_label=price_data_label,
+                price_table=price_table,
+                price_missing_note=price_missing_note,
+                news_text=news_text,
+                finnhub_news_section=finnhub_news_section,
+                brave_news_section=brave_news_section,
+                sonar_macro_section=sonar_macro_section,
+                social_sentiment_section=social_sentiment_section,
+                tavily_section=tavily_section,
+                personal_context=personal_context,
+            )
+            sas_result = call_llm(
+                sas_prompt, stage="sas_candidate_extract",
+                system_prompt="你是一名严格遵循规则的候选证据提取器，只输出JSON，不输出任何其他文字。",
+            )
+            write_sas_candidate_log(today_et, slot_label, sas_result.get("sas_candidates", []))
+        except Exception as e:
+            logger.warning(f"SAS candidate extraction failed (non-fatal, report_md unaffected): {e}")
 
     if not report_md:
         logger.warning("Empty report_md, skipping")

@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-Regression tests for telegram_commands._followup_reason() (issue #11).
+Regression tests for telegram_commands._followup_reason() (issue #11, updated
+for the openai/gpt-5.6-luna + reasoning.effort=high switch, issue #60).
 
 No pytest dependency — plain asserts, same style as the other test_*.py here.
 
 What these protect:
-  - Thinking is enabled on the TG follow-up call (the change this PR makes)
-    and, critically, is NOT enabled on tg_gap_detect's 60-token budget — that
-    combination is what crashed production in issue #53.
+  - reasoning.effort=high is sent on the TG follow-up call's primary request
+    (deepseek-v4-flash's thinking.budget_tokens turned out to be a soft hint,
+    not an enforced ceiling — 1/3 real reps burned through max_tokens on
+    hidden reasoning even with it set, issue #60) and, critically, is NOT
+    enabled on tg_gap_detect's 60-token budget — that combination is what
+    crashed production in issue #53.
   - `content: null` (the shape of that crash) degrades to a user-visible
     message instead of raising AttributeError on .strip() and killing the
-    polling loop.
+    polling loop — including when finish_reason=="length" and a non-empty
+    reasoning_content holds a partial chain of thought: that must never be
+    promoted and returned as if it were the answer (PR #56's original fix
+    for this, still enforced here after the model swap).
   - The fallback goes to the configured model with OpenRouter's reasoning
     effort param attached, and the reported model label follows it.
 

@@ -405,6 +405,155 @@ def test_call_llm_parse_json_false_empty_content_falls_back():
     assert calls.count("openai/gpt-5.6-luna") == 2  # primary + 1 retry, both empty
 
 
+def test_call_llm_parse_json_false_never_promotes_partial_cot_on_length():
+    # PR #62 review bug: finish_reason=="length" + content=null/"" + a
+    # non-empty reasoning_content is the issue #53/#59/#60 reasoning-
+    # exhausted-the-budget shape — reasoning_content there is a partial
+    # chain of thought, not an answer. An earlier version of this code did
+    # `content or reasoning_content or reasoning`, which made that CoT text
+    # truthy and shipped it as result["text"] (the daily report itself, for
+    # report_pass2) with no retry and no fallback. Must instead treat this
+    # exactly like empty content: retry, then reach fallback_model.
+    import llm_client
+    importlib.reload(llm_client)
+    _load(None)
+    calls = []
+
+    class _Resp:
+        def __init__(self, content, reasoning_content=None, finish="stop"):
+            self._content = content
+            self._reasoning_content = reasoning_content
+            self._finish = finish
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            msg = {"content": self._content}
+            if self._reasoning_content is not None:
+                msg["reasoning_content"] = self._reasoning_content
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": self._finish, "message": msg}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(json["model"])
+        if json["model"] == llm_config.stage("report_pass2")["fallback_model"]:
+            return _Resp("Fallback report body.")
+        # Primary: budget exhausted on hidden reasoning — content empty,
+        # finish_reason=length, but reasoning_content holds a partial CoT.
+        return _Resp(None, reasoning_content="...partial chain of thought, not an answer...",
+                     finish="length")
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        out = llm_client.call_llm("p", system_prompt="s", stage="report_pass2",
+                                   parse_json=False, max_retries=1)
+    finally:
+        llm_client.httpx.post = orig
+    assert out["text"] == "Fallback report body."
+    assert "partial chain of thought" not in out["text"]
+    assert out["_llm_meta"]["fallback"] is True
+    assert calls.count("openai/gpt-5.6-luna") == 2  # primary + 1 retry, neither promoted CoT
+
+
+def test_call_llm_parse_json_false_accepts_partial_content_on_length():
+    # Contrast with the case above: finish_reason=="length" does NOT mean
+    # "reject the response" — only an *empty* content under length should be
+    # treated as failure. Genuinely truncated but non-empty visible content
+    # (the model wrote real markdown and then ran out of budget mid-report)
+    # must still be accepted as a (partial) report rather than discarded.
+    import llm_client
+    importlib.reload(llm_client)
+    _load(None)
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": "length",
+                                 "message": {"content": "# Report\n\n价格异动部分正常写完，"
+                                                         "后面被截断了"}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _Resp()
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        out = llm_client.call_llm("p", system_prompt="s", stage="report_pass2", parse_json=False)
+    finally:
+        llm_client.httpx.post = orig
+    assert "价格异动部分正常写完" in out["text"]
+    assert out["_llm_meta"]["fallback"] is False  # accepted on the primary attempt, no fallback needed
+
+
+def test_call_llm_sends_reasoning_param_for_report_pass2_parse_json_false():
+    # PR #62 review: confirm `reasoning` is actually present on the outbound
+    # OpenRouter payload for report_pass2 under parse_json=False, not just
+    # under the default parse_json=True path (test_llm_client_reads_stage_config).
+    import llm_client
+    importlib.reload(llm_client)
+    _load(None)
+    captured = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": "stop", "message": {"content": "# Report\n\nBody."}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured.update(json)
+        return _Resp()
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        llm_client.call_llm("p", system_prompt="s", stage="report_pass2", parse_json=False)
+    finally:
+        llm_client.httpx.post = orig
+    assert captured["model"] == "openai/gpt-5.6-luna"
+    assert captured["reasoning"] == {"effort": "high"}
+    assert "thinking" not in captured
+    assert captured["provider"] == {"order": ["OpenAI"], "allow_fallbacks": False}
+
+
+def test_call_llm_parse_json_false_unwraps_legacy_json_report_md():
+    # Defensive (PR #62 review, non-blocking suggestion): report_pass2's
+    # contract was JSON-wrapped for months before issue #60. If a model
+    # regresses to that habit despite the prompt now asking for bare
+    # markdown, unwrap the report_md field rather than shipping a raw JSON
+    # dump as the report.
+    import llm_client
+    importlib.reload(llm_client)
+    _load(None)
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": "stop",
+                                 "message": {"content": '{"report_md": "# Report\\n\\nBody text."}'}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _Resp()
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        out = llm_client.call_llm("p", system_prompt="s", stage="report_pass2", parse_json=False)
+    finally:
+        llm_client.httpx.post = orig
+    assert out["text"] == "# Report\n\nBody text.", repr(out["text"])
+
+
 def test_calibration_uses_its_own_stage_not_report_pass1():
     # issue #59: calibration.py used to hardcode stage="report_pass1" (its
     # justification was "same model/budget as the main report", but that

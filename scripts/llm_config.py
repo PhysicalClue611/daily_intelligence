@@ -72,12 +72,6 @@ CONFIG_PATH = Path(os.getenv("DAILY_INTEL_LLM_CONFIG", str(_PROJ_DIR / "llm_conf
 # confusing HTTP error at call time.
 KNOWN_GATEWAYS = {"openrouter"}
 
-# DeepSeek routing on OpenRouter. Retained as the default for the DeepSeek
-# stages; note the account has BYOK configured for DeepSeek, so `allow_fallbacks`
-# is what lets traffic degrade to another provider when BYOK capacity is
-# exhausted (see issue #53/#55 for why that is expected, not a pin failure).
-_DS_PROVIDERS = {"order": ["DigitalOcean", "Venice"], "allow_fallbacks": True}
-
 # google/gemma-4-31b-it routing on OpenRouter (issue #60). Real calls across
 # this project's gemma stages have been observed landing on several different
 # providers (Friendli, Crusoe, Novita, OpenInference, OpenInference-bf16...)
@@ -454,7 +448,7 @@ def _read_raw() -> dict:
 def _build() -> dict[str, dict]:
     """Merge validated overrides onto DEFAULTS, logging every effective change."""
     # deepcopy, not dict(): several stages' "providers" default points at the
-    # same shared _DS_PROVIDERS object literal. A shallow copy here still
+    # same shared _GEMMA_PROVIDERS object literal. A shallow copy here still
     # shares that nested dict across every stage that hasn't overridden it —
     # fine for the read-only call sites that exist today, but a future
     # in-place mutation (or a careless test) would poison DEFAULTS for the
