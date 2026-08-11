@@ -649,7 +649,7 @@ Step 4  openai/gpt-5.6-luna（非pro）via OR（主，stage `tg_followup`，issu
 ### 7.1b 持仓计算信号（user message，纯计算，零LLM/搜索成本，issue #33）
 
 `_compute_holding_signals()` 将两项计算结果注入 Layer B，与持仓快照、投资框架并列：
-- **52周区间百分位+距历史高点回撤**（`fetch_prices.py::fetch_52week_stats()`，yfinance period="1y"），对应 Manual 7.4 节"股价相对位置"信号，代码算好不让 LLM 从文本自行估算
+- **52周区间百分位+距历史高点回撤**（`fetch_prices.py::fetch_52week_stats()`，yfinance period="1y"；issue #63 起 bulk 缺失时 `Ticker.history` 重试一次，并在拉取期间压低 yfinance ERROR 日志以免 healthcheck 误报），对应 Manual 7.4 节"股价相对位置"信号，代码算好不让 LLM 从文本自行估算
 - **持仓占组合%**（`_get_portfolio_weights()`，市值÷组合总USD市值），对应 Manual 第6节减仓条件C（>15%），⑦号规则直接读取这个计算值判断，不再让 LLM 自己从持仓快照文本估算百分比
 - 适用范围仅限核心主动个股（排除 QQQM/VOO/EWJ/SGOL/BOXX/CASH），与 Manual 第1节三层结构对齐
 
