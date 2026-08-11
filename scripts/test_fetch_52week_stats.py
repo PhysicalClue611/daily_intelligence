@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -214,14 +213,68 @@ def test_empty_tickers_short_circuit():
     assert fetch_52week_stats([]) == {}
 
 
+def test_single_ticker_bulk_flat_close_series_skips_history():
+    """n_tickers==1 path: flat Close Series (common single-ticker yf shape)."""
+    closes = _close_series(n=30, start=40.0, step=0.5)
+    # Flat OHLCV-like frame: data["Close"] is a Series, not MultiIndex
+    download_df = pd.DataFrame({
+        "Open": closes,
+        "High": closes,
+        "Low": closes,
+        "Close": closes,
+        "Volume": [1_000_000] * len(closes),
+    })
+    mock_yf = MagicMock()
+    mock_yf.download.return_value = download_df
+
+    out = fetch_52week_stats(
+        ["INTC"],
+        _yf=mock_yf,
+        _sleep=lambda _s: None,
+    )
+    assert "INTC" in out
+    assert out["INTC"]["range_percentile"] == 100.0
+    mock_yf.Ticker.assert_not_called()
+
+
+def test_single_ticker_bulk_one_column_close_dataframe_skips_history():
+    """n_tickers==1 path: Close as one-column DataFrame (group_by=column leftover)."""
+    closes = _close_series(n=30, start=10.0, step=1.0)
+    # data["Close"] is a DataFrame with a single ticker column
+    close_block = pd.DataFrame({"INTC": closes})
+    download_df = pd.concat({"Close": close_block}, axis=1)
+    mock_yf = MagicMock()
+    mock_yf.download.return_value = download_df
+
+    out = fetch_52week_stats(
+        ["INTC"],
+        _yf=mock_yf,
+        _sleep=lambda _s: None,
+    )
+    assert "INTC" in out
+    assert out["INTC"]["range_percentile"] == 100.0
+    assert out["INTC"]["pct_from_high"] == 0.0
+    mock_yf.Ticker.assert_not_called()
+
+
 def test_download_exception_fail_open():
     mock_yf = MagicMock()
     mock_yf.download.side_effect = RuntimeError("network down")
-    out = fetch_52week_stats(["INTC"], _yf=mock_yf, _sleep=lambda _s: None)
-    # Bulk total failure still attempts per-ticker recovery
+    ticker_obj = MagicMock()
+    # Explicit empty history — do not rely on MagicMock default truthiness
+    ticker_obj.history.return_value = pd.DataFrame({"Close": pd.Series(dtype=float)})
+    mock_yf.Ticker.return_value = ticker_obj
+    sleep_calls: list[float] = []
+
+    out = fetch_52week_stats(
+        ["INTC"],
+        _yf=mock_yf,
+        _sleep=lambda s: sleep_calls.append(s),
+    )
     mock_yf.Ticker.assert_called_with("INTC")
-    # history also fails empty by default MagicMock → no stats
-    assert out == {} or isinstance(out, dict)
+    assert ticker_obj.history.call_count == 2  # initial + 1 retry
+    assert sleep_calls == [1.0]
+    assert out == {}
 
 
 def main():
@@ -235,6 +288,8 @@ def main():
         test_per_ticker_retry_sleeps_then_succeeds_on_second_attempt,
         test_per_ticker_exhausted_returns_partial_and_warns,
         test_empty_tickers_short_circuit,
+        test_single_ticker_bulk_flat_close_series_skips_history,
+        test_single_ticker_bulk_one_column_close_dataframe_skips_history,
         test_download_exception_fail_open,
     ]
     failed = 0
