@@ -11,6 +11,7 @@ NOTE: 429 errors during dev sessions are caused by manual testing volume.
 import logging
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
@@ -608,45 +609,146 @@ def format_price_table(rows: list[PriceRow], slot: str = "daily") -> str:
     return "\n".join(lines)
 
 
-def fetch_52week_stats(tickers: list[str]) -> dict[str, dict]:
-    """52-week range percentile + drawdown from high (issue #33).
+@contextmanager
+def _quiet_yfinance_logs():
+    """Issue #63 B: demote yfinance logger during 52w pulls.
+
+    yfinance logs false 'possibly delisted; no price data found (period=1y)' at
+    ERROR. Homepage healthcheck finance logs_scan treats any ERROR line as a
+    hit (threshold=1), so one transient miss becomes a WARN. Suppress while we
+    pull; restore previous level on exit. Callers still emit our own WARNING.
+    """
+    yf_log = logging.getLogger("yfinance")
+    previous = yf_log.level
+    yf_log.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        yf_log.setLevel(previous)
+
+
+def _compute_52week_from_closes(closes) -> dict | None:
+    """Map a daily Close series → {range_percentile, pct_from_high}, or None.
+
+    Requires ≥20 bars and a non-zero high/low range. Pure; no I/O.
+    """
+    try:
+        closes = closes.dropna()
+        if len(closes) < 20:
+            return None
+        current = float(closes.iloc[-1])
+        hi = float(closes.max())
+        lo = float(closes.min())
+        if hi == lo:
+            return None
+        return {
+            "range_percentile": round((current - lo) / (hi - lo) * 100, 1),
+            "pct_from_high": round((current - hi) / hi * 100, 1),
+        }
+    except Exception:
+        return None
+
+
+def _closes_from_bulk(data, ticker: str, n_tickers: int):
+    """Extract Close series for one ticker from yf.download multi/single frame."""
+    if data is None:
+        return None
+    try:
+        empty = getattr(data, "empty", True)
+        if empty:
+            return None
+        if n_tickers == 1:
+            closes = data["Close"]
+            # Single-ticker download sometimes still has a ticker column level
+            if hasattr(closes, "columns"):
+                closes = closes.iloc[:, 0] if closes.shape[1] else closes
+        else:
+            closes = data["Close"][ticker]
+        return closes
+    except Exception:
+        return None
+
+
+def _history_closes(yf_mod, ticker: str, *, retries: int = 1, sleep_fn=time.sleep):
+    """Issue #63 A: per-ticker Ticker.history with one delayed retry on empty.
+
+    sleep_fn is injectable for unit tests (default time.sleep).
+    """
+    attempts = retries + 1
+    for attempt in range(attempts):
+        try:
+            with _quiet_yfinance_logs():
+                hist = yf_mod.Ticker(ticker).history(period="1y", auto_adjust=True)
+            if hist is not None and not getattr(hist, "empty", True) and "Close" in hist:
+                closes = hist["Close"]
+                if len(closes.dropna()) >= 20:
+                    return closes
+        except Exception as e:
+            logger.debug(f"{ticker}: 52-week history attempt {attempt + 1} failed: {e}")
+        if attempt < retries:
+            sleep_fn(1.0)
+    return None
+
+
+def fetch_52week_stats(
+    tickers: list[str],
+    *,
+    _yf=None,
+    _sleep=time.sleep,
+) -> dict[str, dict]:
+    """52-week range percentile + drawdown from high (issue #33 / #63).
 
     Pure computation on yfinance daily history — the "股价相对位置" signal from
     Investment Operating Manual 7.4 (Expectation Gap 市场共识类信号). No LLM,
     no search cost; meant to be injected as a computed fact so Pass 2 doesn't
     have to eyeball "high or low" from prose. Fail-open: a failure for one or
     all tickers returns an empty/partial dict, never raises.
+
+    Resilience (issue #63):
+      A — bulk miss / short series → Ticker.history per ticker, 1 retry after 1s
+      B — quiet yfinance ERROR logs during pull (healthcheck noise)
+
+    _yf / _sleep are test hooks; production callers omit them.
     """
     if not tickers:
         return {}
-    try:
-        import yfinance as yf
-    except ImportError:
-        return {}
-    try:
-        data = yf.download(tickers, period="1y", interval="1d", progress=False,
-                            auto_adjust=True, group_by="column")
-    except Exception as e:
-        logger.warning(f"52-week stats download failed: {e}")
-        return {}
-    out: dict[str, dict] = {}
-    for ticker in tickers:
+    if _yf is None:
         try:
-            closes = data["Close"] if len(tickers) == 1 else data["Close"][ticker]
-            closes = closes.dropna()
-            if len(closes) < 20:
-                continue
-            current = float(closes.iloc[-1])
-            hi = float(closes.max())
-            lo = float(closes.min())
-            if hi == lo:
-                continue
-            out[ticker] = {
-                "range_percentile": round((current - lo) / (hi - lo) * 100, 1),
-                "pct_from_high": round((current - hi) / hi * 100, 1),
-            }
-        except Exception as e:
-            logger.debug(f"{ticker}: 52-week stats failed: {e}")
+            import yfinance as yf
+        except ImportError:
+            return {}
+        yf_mod = yf
+    else:
+        yf_mod = _yf
+
+    data = None
+    try:
+        with _quiet_yfinance_logs():
+            data = yf_mod.download(
+                tickers,
+                period="1y",
+                interval="1d",
+                progress=False,
+                auto_adjust=True,
+                group_by="column",
+            )
+    except Exception as e:
+        logger.warning(f"52-week stats bulk download failed: {e}")
+        data = None
+
+    out: dict[str, dict] = {}
+    n = len(tickers)
+    for ticker in tickers:
+        closes = _closes_from_bulk(data, ticker, n)
+        stats = _compute_52week_from_closes(closes) if closes is not None else None
+        if stats is None:
+            logger.info(f"{ticker}: 52-week bulk miss/short — per-ticker history retry")
+            closes = _history_closes(yf_mod, ticker, retries=1, sleep_fn=_sleep)
+            stats = _compute_52week_from_closes(closes) if closes is not None else None
+        if stats is None:
+            logger.warning(f"{ticker}: 52-week stats unavailable after retry")
+            continue
+        out[ticker] = stats
     return out
 
 
