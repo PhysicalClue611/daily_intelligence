@@ -32,6 +32,12 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-08-11，issue #63 / PR #64，已合并）
+
+**`fetch_52week_stats` 韧性 + 巡检降噪（issue #63 / PR #64，squash `b6acbda`）**。2026-08-10 AM 主价格 18/18 成功后，Pass2 Layer B 拉 52 周日线时 yfinance 对 INTC 瞬时假 delisted（`period=1y`），库 logger 连打 3 行 ERROR，触发 Homepage healthcheck `finance 新错误`（阈值 1）；报告/邮件/TG 仍成功发出。修复：① bulk miss/短序列 → `Ticker.history` + 1s 后再试 1 次（fail-open 保留）；② 拉取期间 `yfinance` logger → CRITICAL，失败改我们 `WARNING`。Finnhub 免费档无 candle，未做跨源 1y fallback。单元测试 `scripts/test_fetch_52week_stats.py` 12/12（含 review 后单 ticker bulk 形状覆盖）。不改 `telegram_commands.py`，无需重启 TG bot；下次 AM/PM 自动吃到新 `fetch_prices.py`。
+
+---
+
 ## 当前系统状态（2026-08-04/05，issue #60 / PR #62，已合并 + 生产双跑验证）
 
 **issue #60 三项改动全部实现并合并（PR #62，squash `384be56`）**：① `tg_followup`（Telegram Step 4）从 `deepseek/deepseek-v4-flash`+`thinking` 切换为 `openai/gpt-5.6-luna`（非pro）+`reasoning:{"effort":"high"}`，provider 锁定 `{"order":["OpenAI"],"allow_fallbacks":false}`，`max_tokens` 12000→16000；② `report_pass2` 同样从 `deepseek/deepseek-v4-pro`+`thinking` 切到 `gpt-5.6-luna`+`reasoning.effort=high`（同一套 provider 锁定），`max_tokens` 8000→16000，且 `report_md` 脱离 JSON 包裹（`llm_client.py::call_llm()` 新增 `parse_json=False` 模式，直接返回裸 markdown，防止截断发生在 JSON 字符串中途时把整份报告一起作废）；③ `sas_candidates`（issue #32）从 Pass2 JSON 的一个字段拆成独立的 `sas_candidate_extract` stage（`google/gemma-4-31b-it`），复用 Pass2 已组装好的上下文单独调一次，失败不再连累 report_md。六个 `google/gemma-4-31b-it` stage（`report_pass1`/`am_calibration`/`sas_candidate_extract`/`semantic_filter`/`tg_preprocess`/`tg_gap_detect`）的 `providers` 从不锁定改为锁定 `OpenInference`（`allow_fallbacks:true`，观察到真实调用此前散落在 Friendli/Crusoe/Novita/OpenInference 多个 provider）。
@@ -710,6 +716,7 @@ _Tavily: N/10_
 87. `telegram_utils.py::call_telegram()`重试只捕获`httpx.ConnectError`，SSL握手超时是并列兄弟类`httpx.ConnectTimeout`，零重试直接放弃 → 详见 `docs/PITFALLS.md#87`
 88. Bash工具同步命令超时"exit 143"不代表网络请求被取消——本地进程死了，OpenRouter服务端仍会处理并计费，造成未察觉的真实调用 → 详见 `docs/PITFALLS.md#88`
 89. `call_llm()`新增免JSON文本路径时沿用了`content or reasoning_content or reasoning`取值顺序，`finish_reason=length`+空content时会把部分思维链错误当正文返回 → 详见 `docs/PITFALLS.md#89`
+90. `fetch_52week_stats` bulk 1y 瞬时失败无重试 + yfinance ERROR 触发 healthcheck 误报 → 详见 `docs/PITFALLS.md#90`
 
 ---
 
@@ -727,6 +734,7 @@ _Tavily: N/10_
 10. **issue #58：`call_telegram()` ConnectTimeout 修复**（2026-08-03 起）：等用户确认修复方向（`httpx.TransportError` 兜底 vs 显式加 `httpx.ConnectTimeout`）后实施，修复后观察 TG 报告/状态消息投递是否还出现单次握手超时就整体放弃的情况
 11. **issue #60/PR #62 生产观察**（2026-08-05 起，已实施+已合并，见上方状态章节）：`tg_followup`/`report_pass2` 均已切至 `gpt-5.6-luna`+`reasoning.effort=high`，2026-08-04 当晚已用真实生产双跑验证过一次（质量优于旧模型，见上方状态章节完整记录）；后续观察 `grep "LLM tokens \[report_pass2/openai/gpt-5.6-luna\]\|Step 4 tokens \[openai/gpt-5.6-luna\]" /tmp/daily_intelligence.log /tmp/finance_telegram.log`，确认 `finish_reason=stop` 持续成立、`provider=OpenAI` 稳定路由（硬 pin 不允许 fallback，需要留意是否出现非429 4xx 导致的静默降级到 Pass1-only report_md，PR #62 review 已识别此风险并记入 `llm_client.py` 注释，未做代码修复）
 12. **真实成本核算**（issue #60 遗留缺口）：`gpt-5.6-luna` 与 `deepseek-v4-pro`/`deepseek-v4-flash` 的实际生产量级成本差异尚未核算，观察一段时间后可用 OR 账单核实
+13. **issue #63/PR #64 生产观察**（2026-08-11 起）：下次 AM/PM 后 `grep -E "52-week|possibly delisted" /tmp/daily_intelligence.log`——期望不再出现 yfinance `possibly delisted` ERROR 行；bulk 抖时可见 `52-week bulk miss` INFO 与/或单次 `52-week stats unavailable after retry` WARNING，报告仍发出
 
 ---
 
