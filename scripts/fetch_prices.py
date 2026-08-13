@@ -63,10 +63,40 @@ class PriceRow:
     slot: str = "daily"             # "am", "pm", "daily"
 
 
+def _yf_download(yf_mod, tickers, **kwargs):
+    """yf.download with yfinance ERROR noise suppressed (issue #63 / #67)."""
+    with _quiet_yfinance_logs():
+        return yf_mod.download(tickers, **kwargs)
+
+
+def _missing_close_tickers(data, tickers: list[str]) -> list[str]:
+    """Tickers whose Close series has fewer than 2 non-NaN rows (or is absent)."""
+    if not tickers:
+        return []
+    if data is None or getattr(data, "empty", True):
+        return list(tickers)
+    missing: list[str] = []
+    n = len(tickers)
+    for ticker in tickers:
+        try:
+            if n == 1:
+                closes = data["Close"]
+                if hasattr(closes, "columns"):
+                    closes = closes.iloc[:, 0] if closes.shape[1] else closes
+            else:
+                closes = data["Close"][ticker]
+            if len(closes.dropna()) < 2:
+                missing.append(ticker)
+        except Exception:
+            missing.append(ticker)
+    return missing
+
+
 def _fetch_intraday_data(all_tickers: list[str], yf):
     """Download 2-day 1-minute bars with pre/post market. Returns DataFrame or None."""
     try:
-        data = yf.download(
+        data = _yf_download(
+            yf,
             all_tickers,
             period="2d",
             interval="1m",
@@ -303,18 +333,26 @@ def fetch_prices(
     thresholds: dict,
     slot: str = "daily",
     report_date=None,
+    *,
+    _sleep=time.sleep,
+    _yf=None,
 ) -> list[PriceRow]:
     """Fetch prices for all watchlist tickers.
 
     slot="am"    → pre-market price vs prev close (requires intraday prepost data)
     slot="pm"    → today's close vs prev close + after-hours change
     slot="daily" → legacy: latest daily close vs previous close
+
+    _sleep / _yf are test hooks (issue #67). Production callers omit them.
     """
-    try:
-        import yfinance as yf
-    except ImportError:
-        logger.error("yfinance not installed in host venv")
-        return []
+    if _yf is None:
+        try:
+            import yfinance as yf
+        except ImportError:
+            logger.error("yfinance not installed in host venv")
+            return []
+    else:
+        yf = _yf
 
     all_tickers = stocks + commodities + fx
     if not all_tickers:
@@ -326,18 +364,40 @@ def fetch_prices(
     tnx_bps          = float(thresholds.get("tnx_bps", 10))
 
     # ── Daily download: prev_close and 5-day history ──────────────────────────
+    # Issue #67: quiet yfinance ERROR (false "possibly delisted"); retry once
+    # if any ticker's Close series is unusable so FX/commodities get a second
+    # Yahoo chance before Finnhub (which cannot fill those).
+    _dl_kwargs = dict(
+        period="8d",
+        interval="1d",
+        progress=False,
+        auto_adjust=True,
+        group_by="column",
+    )
     try:
-        data_daily = yf.download(
-            all_tickers,
-            period="8d",
-            interval="1d",
-            progress=False,
-            auto_adjust=True,
-            group_by="column",
-        )
+        data_daily = _yf_download(yf, all_tickers, **_dl_kwargs)
     except Exception as e:
         logger.error(f"yfinance daily download failed: {e} — trying Finnhub fallback")
         return _fetch_prices_finnhub(all_tickers, stocks, fx, commodities, thresholds, slot=slot)
+
+    missing = _missing_close_tickers(data_daily, all_tickers)
+    if missing:
+        logger.warning(
+            f"yfinance daily bulk incomplete: {len(missing)}/{len(all_tickers)} "
+            f"tickers missing {missing} — retrying once"
+        )
+        try:
+            _sleep(1.0)
+            data_daily = _yf_download(yf, all_tickers, **_dl_kwargs)
+        except Exception as e:
+            logger.warning(f"yfinance daily retry failed: {e} — keeping first response")
+        missing = _missing_close_tickers(data_daily, all_tickers)
+        if missing:
+            logger.warning(
+                f"yfinance daily bulk still incomplete after retry: "
+                f"{len(missing)}/{len(all_tickers)} tickers missing {missing} "
+                f"— per-ticker fallback will run"
+            )
 
     # ── Intraday download for AM/PM enrichment (fail-open) ───────────────────
     data_intraday = None
@@ -611,9 +671,9 @@ def format_price_table(rows: list[PriceRow], slot: str = "daily") -> str:
 
 @contextmanager
 def _quiet_yfinance_logs():
-    """Issue #63 B: demote yfinance logger during 52w pulls.
+    """Issue #63 / #67: demote yfinance logger during any yf.download / history.
 
-    yfinance logs false 'possibly delisted; no price data found (period=1y)' at
+    yfinance logs false 'possibly delisted; no price data found (period=...)' at
     ERROR. Homepage healthcheck finance logs_scan treats any ERROR line as a
     hit (threshold=1), so one transient miss becomes a WARN. Suppress while we
     pull; restore previous level on exit. Callers still emit our own WARNING.
