@@ -95,16 +95,18 @@ def call_telegram(
     timeout: float = 10,
     max_connect_retries: int = 2,
 ) -> dict:
-    """POST to the Telegram Bot API, retrying transient transport errors.
+    """POST to the Telegram Bot API, retrying transient connect-stage errors.
 
     Returns the parsed JSON response, or {} if the call ultimately failed.
     Logs INFO if a retry recovered the call, WARNING only when every attempt
     (including retries) failed.
 
-    Retries httpx.TransportError (ConnectError, ConnectTimeout, ReadError,
-    …) — ConnectTimeout is a sibling of ConnectError, not a subclass
-    (issue #58 / docs/PITFALLS.md #87). HTTP 4xx/other exceptions are not
-    retried.
+    Retries ConnectError and ConnectTimeout only (issue #58: ConnectTimeout
+    is a sibling of ConnectError, not a subclass). ReadTimeout / WriteTimeout
+    / other TransportError can mean the request already reached Telegram;
+    sendMessage is not idempotent, so those are not retried. HTTP 4xx and
+    other exceptions are not retried either. Stale-Client rebuild after
+    any TransportError still happens in _telegram_post.
     """
     url = f"https://api.telegram.org/bot{bot_token}/{endpoint}"
     last_err: Exception | None = None
@@ -114,7 +116,7 @@ def call_telegram(
             if attempt > 0:
                 logger.info(f"Telegram API {endpoint} recovered after {attempt} retry(ies)")
             return resp.json()
-        except httpx.TransportError as e:
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             last_err = e
             continue
         except Exception as e:

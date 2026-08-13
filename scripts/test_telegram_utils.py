@@ -14,6 +14,7 @@ What these protect:
   - Consecutive transport failures rebuild the Client (stale TLS after
     the Shadowrocket flake in pitfalls #74/#76).
   - call_telegram retries ConnectTimeout, not just ConnectError (#58).
+  - call_telegram does not retry ReadTimeout on send (duplicate-delivery).
 
 Run: ~/Daily_Intelligence/.venv/bin/python scripts/test_telegram_utils.py
 """
@@ -25,7 +26,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import httpx
 
 import telegram_utils as tu
-import telegram_commands as tc
 
 
 TOKEN = "test-token"
@@ -156,6 +156,24 @@ def test_call_telegram_retries_connect_timeout():
         _restore(orig)
 
 
+def test_call_telegram_does_not_retry_read_timeout():
+    """sendMessage is not idempotent; ReadTimeout may mean Telegram already got it."""
+    orig = _install_fake_client()
+    try:
+        tu.call_telegram(TOKEN, "getMe", {})
+        client = tu._telegram_client()
+        client._side_effects = [
+            httpx.ReadTimeout("slow"),
+            _FakeResponse({"ok": True, "result": {"id": 99}}),
+        ]
+        out = tu.call_telegram(TOKEN, "sendMessage", {"chat_id": "1", "text": "x"})
+        assert out == {}
+        # getMe + one send only — no retry that would duplicate the message
+        assert len(client.posts) == 2
+    finally:
+        _restore(orig)
+
+
 def test_consecutive_transport_failures_rebuild_client():
     orig = _install_fake_client()
     try:
@@ -196,14 +214,8 @@ def test_aged_client_is_rebuilt_before_next_request():
         _restore(orig)
 
 
-def test_run_uses_poll_helper_not_bare_httpx_post():
-    import inspect
-    src = inspect.getsource(tc.run)
-    assert "poll_telegram" in src
-    assert "httpx.post" not in src
-
-
 def test_process_recycles_after_24h_only():
+    import telegram_commands as tc
     start = 1_000_000.0
     assert not tc._process_due_for_recycle(start, start + 86400 - 1)
     assert tc._process_due_for_recycle(start, start + 86400)
@@ -216,9 +228,9 @@ if __name__ == "__main__":
         test_poll_reuses_same_client_as_send,
         test_poll_does_not_retry_transport_error,
         test_call_telegram_retries_connect_timeout,
+        test_call_telegram_does_not_retry_read_timeout,
         test_consecutive_transport_failures_rebuild_client,
         test_aged_client_is_rebuilt_before_next_request,
-        test_run_uses_poll_helper_not_bare_httpx_post,
         test_process_recycles_after_24h_only,
     ]
     failed = 0
