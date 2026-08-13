@@ -32,7 +32,7 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 
-from telegram_utils import call_telegram
+from telegram_utils import call_telegram, poll_telegram
 from calibration import format_calibration_metrics_report
 import llm_config
 from quota_store import save_quota
@@ -1707,6 +1707,20 @@ def execute(cmd: dict) -> str:
 
 # ── Main long-polling loop ────────────────────────────────────────────────────
 
+_PROCESS_RECYCLE_SEC = 24 * 3600
+
+
+def _process_due_for_recycle(started_at: float, now: float,
+                             recycle_after: float = _PROCESS_RECYCLE_SEC) -> bool:
+    """True once the KeepAlive process has lived long enough to exit cleanly.
+
+    launchd KeepAlive respawns. Checking only at the top of the poll loop
+    means we never die mid-followup. This is a residual-leak cap (issue #65),
+    not the primary Client-reuse fix.
+    """
+    return now - started_at >= recycle_after
+
+
 def run():
     if not BOT_TOKEN or not CHAT_ID:
         logger.error("FINANCE_TELEGRAM_BOT_TOKEN or FINANCE_TELEGRAM_CHAT_ID not set")
@@ -1714,6 +1728,7 @@ def run():
 
     logger.info("Finance Telegram bot started (long polling)")
     offset = load_offset()
+    started_at = time.time()
 
     POLL_TIMEOUT = 30             # server-side long-poll wait (Telegram payload param)
     POLL_RETRY_PAUSE = 5          # pacing delay before the next natural poll after a failed attempt
@@ -1722,6 +1737,10 @@ def run():
     failing_since: float | None = None
 
     while True:
+        if _process_due_for_recycle(started_at, time.time()):
+            logger.info("Recycling telegram bot process after 24h uptime")
+            sys.exit(0)
+
         # Stateless single-shot (issue #25): this loop already re-polls every
         # ~30s, so the loop itself is the retry mechanism — no need for an
         # in-call retry on top of it (that used to add ~3.2s latency to
@@ -1732,12 +1751,7 @@ def run():
         # unless something is genuinely wrong, not just a flaky proxy hop)
         # escalates to WARNING.
         try:
-            resp = httpx.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                json={"offset": offset, "timeout": POLL_TIMEOUT, "limit": 20},
-                timeout=POLL_TIMEOUT + 5,
-            )
-            updates = resp.json().get("result", [])
+            updates = poll_telegram(BOT_TOKEN, offset, poll_timeout=POLL_TIMEOUT)
             if failing_since is not None:
                 logger.info(f"getUpdates recovered after {time.time() - failing_since:.0f}s")
                 failing_since = None
