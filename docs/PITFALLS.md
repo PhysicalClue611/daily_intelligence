@@ -376,7 +376,7 @@ except Exception as e:
     return {}
 ```
 
-docstring 明确写着设计意图是"重试瞬时 connect 阶段失败"，用来吸收 api.telegram.org 在 TLS 握手阶段的瞬时抖动（坑74/76 描述的 `ConnectError`）。但 SSL **握手超时**在 httpx 里是 `httpx.ConnectTimeout`，属于 `httpx.TimeoutException` 的子类，与 `httpx.ConnectError` 是并列的兄弟类、不是子类关系——`except httpx.ConnectError` 捕获不到它，直接落进 `except Exception` 分支，零重试放弃。坑74/76 当初的修复只堵了"连接被拒/DNS失败"这一类瞬时故障，没堵"连接建立但握手阶段卡住超时"这一类，两者是同一条网络路径（Shadowrocket TUN 隧道）的瞬时抖动的不同表现形式，被 httpx 归为不同异常类型。已开 issue #58 记录，**尚未修复**（建议方向：`except httpx.ConnectError` 扩大为 `httpx.TransportError` 或显式加 `httpx.ConnectTimeout`），等用户确认后再改代码。**影响面**：`call_telegram()` 是 `send_telegram_report()`/`send_telegram_alert()`/`telegram_commands.py` 长轮询和回复的唯一入口，`send_telegram_alert()` 本身（失败告警机制）也可能被同一根因打掉。
+docstring 明确写着设计意图是"重试瞬时 connect 阶段失败"，用来吸收 api.telegram.org 在 TLS 握手阶段的瞬时抖动（坑74/76 描述的 `ConnectError`）。但 SSL **握手超时**在 httpx 里是 `httpx.ConnectTimeout`，属于 `httpx.TimeoutException` 的子类，与 `httpx.ConnectError` 是并列的兄弟类、不是子类关系——`except httpx.ConnectError` 捕获不到它，直接落进 `except Exception` 分支，零重试放弃。坑74/76 当初的修复只堵了"连接被拒/DNS失败"这一类瞬时故障，没堵"连接建立但握手阶段卡住超时"这一类，两者是同一条网络路径（Shadowrocket TUN 隧道）的瞬时抖动的不同表现形式，被 httpx 归为不同异常类型。已开 issue #58。**2026-08-13 随 PR #66 / issue #65 一并修掉**：`call_telegram()` 现对 `httpx.ConnectError` 与 `httpx.ConnectTimeout` 重试；`ReadTimeout` 等仍不重试（`sendMessage` 非幂等）。Client 重建仍在 `_telegram_post` 对任意 `TransportError` 计数。
 
 ### 88. Bash 工具同步命令超时（"exit 143"）不代表网络请求被取消——本地进程死了，OpenRouter 服务端仍会处理并计费
 （2026-08-03 发现）为对比 `report_pass2` 模型（DeepSeek V4 Pro vs `~deepseek/deepseek-v4-flash-latest`）手写了一个测试脚本，第一次同步调用因为数据采集阶段（价格/RSS/Finnhub/Brave/Sonar 等）耗时超过 Bash 工具默认 2 分钟超时被判定"exit 143"，本地检查 `/tmp` 下预期产出的文件全部不存在，误判为"进程在有实质性副作用之前就被杀了，什么都没发生"，据此在后续披露测试成本时完全没有把这次计入。几天后用户提供的真实 OpenRouter Activity CSV 显示：这次"超时失败"的进程实际上已经完整发出并等到了一次 Sonar 调用（$0.00718）和一次 DeepSeek V4 Pro 调用（$0.00826）的响应——本地 httpx 客户端进程被 SIGTERM 杀死，不会让已经完全发送出去的 HTTP 请求在服务端被取消；OpenRouter 收到完整请求后照常处理、计费，只是响应没有机会被本地脚本读取并写入文件，所以本地检查"文件是否存在"看不出这次调用真的发生过。**教训**：涉及真实付费 API 调用的诊断脚本，凡是可能超过 Bash 默认超时的，必须在第一次尝试时就给足够宽裕的 `timeout` 参数（同坑86），不能"先用默认超时试试，超时了就当没发生"——本地进程被杀和"请求没有产生任何后果"是两回事，尤其是同步阻塞的 HTTP 调用，在被杀之前请求体很可能已经完整发出。事后核对真实成本，唯一可靠的信源是服务端的账单/日志（OpenRouter Activity 面板/CSV），不能只凭本地文件是否落盘来判断某次调用是否发生。
@@ -386,6 +386,17 @@ docstring 明确写着设计意图是"重试瞬时 connect 阶段失败"，用�
 
 ### 90. `fetch_52week_stats` bulk `period=1y` 瞬时失败无重试 + yfinance ERROR 触发 healthcheck 误报（issue #63/PR #64）
 （2026-08-10 发现，2026-08-11 修复）巡检 `finance 新错误` 报 3 条 ERROR，末条 `['INTC']: possibly delisted; no price data found (period=1y)`。排查：同日 AM 05:30 主价格 `fetch_prices()` 已 18/18 成功；05:34 Pass2 组装 Layer B 时 `fetch_52week_stats()` 调 `yf.download(..., period="1y")` 对 INTC 瞬时空响应；yfinance 自带 logger 连打 3 行 ERROR（文案假 delisted，不等于退市）；报告/邮件/TG 仍成功。函数原先 fail-open 但无 per-ticker 重试；Finnhub 免费档无 candle，不能当 1y 历史 fallback。同日志 08-06 已有 `period=2d` 同类假 delisted。**修复**（issue #63/PR #64）：① bulk 缺失/短序列 → `Ticker.history(period="1y")` + 1s 后再试 1 次；② 拉取期间将 `yfinance` logger 临时提到 CRITICAL，失败改由我们 `WARNING`，避免 Homepage healthcheck `threshold=1` 扫 ERROR 误报。**教训**：主链路有 Finnhub fallback 不代表所有 yfinance 调用点都有；第三方库 ERROR 级日志会直接进入 `/tmp/daily_intelligence.log` 被巡检当成业务故障——对已知噪音源要么我们自己 WARNING，要么压库 logger。
+
+### 91. KeepAlive 长轮询每轮裸 `httpx.post` 泄漏数百 MB（issue #65/PR #66）
+（2026-08-12 发现，2026-08-13 修复）`com.daily-intel.finance.telegram` 常驻 8 天后 `phys_footprint` 386MB（峰值 675）；独立复测同代码 6h → 459MB。冷启动把全部 import 跑完只有 38MB。Activity Monitor 的 Memory 是 footprint，不是 `ps` RSS（RSS 可只剩几 MB，堆已 swap）。
+
+httpx 0.28 顶层 `httpx.post()` 内部已是 `with Client(...)`，**不是忘关 Client**。机制是：每个 30s 周期构造一整套 Client+SSLContext+httpcore 再拆掉；本机对 `api.telegram.org` 新建 TLS 另有 25–30% 瞬时失败（坑 76），失败握手同样分配 nano/tiny；KeepAlive 进程永不退出，macOS `MALLOC_NANO`/`TINY` 几乎不把页还 OS。`vmmap`：467 万活对象、334MB allocated。
+
+**修复**：进程级单例 `httpx.Client`（`poll_telegram` / `call_telegram` 共用）；连续 3 次 `TransportError` 或满 6h 重建；`run()` 满 24h 在下一轮 poll 前 `sys.exit(0)`。不要给 KeepAlive plist 加 `StartCalendarInterval` 指望回收——进程在跑时 calendar 不会重启它。OpenRouter/Exa/Finnhub 不要并进这个 Client。
+
+**浸泡**：修复后同一 PID 13h10m → 58MB（约 2MB/h 残余）。旧斜率约 70MB/h。有日切则两周不会堆到数百兆；日切若没跑，裸外推 2 周约 700MB。
+
+**教训**：常驻进程里「每次请求 new Client」的代价不是 Python 解释器基线，是分配器不还页。验收看 `footprint`/`phys_footprint`，不要只看 RSS。改 `telegram_commands.py` 后仍须 kickstart（坑 32）。
 
 ---
 

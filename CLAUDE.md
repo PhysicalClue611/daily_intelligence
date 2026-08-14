@@ -32,6 +32,16 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-08-13，issue #65 / PR #66，已合并 + 13h 浸泡）
+
+**KeepAlive Telegram 长轮询泄漏（issue #65 / PR #66，squash `dda8d66`）**。`com.daily-intel.finance.telegram` 每 30s 裸 `httpx.post(getUpdates)`：httpx 0.28 顶层 `post()` 已是 `with Client()`，不是忘关 Client；短命 Client+TLS 在永不退出的进程里被 macOS `MALLOC_NANO`/`TINY` 吃成不可回收碎片。修复前：冷启动 38MB；8 天 PID 21106 → 386MB（峰值 675）；同代码 6h → 459MB。本 session 开 issue、kickstart 缓解（386→30MB），实现在 PR #66。
+
+实现：`telegram_utils` 进程级单例 `httpx.Client`；`poll_telegram()` 给 `run()`（仍无内层重试，issue #25）；连续 3 次 `TransportError` 或满 6h 重建 Client；`call_telegram` 补 `ConnectTimeout`（关掉 issue #58 / 坑 87）；满 24h 在下一轮 poll 前 `sys.exit(0)` 交给 KeepAlive。测试 `scripts/test_telegram_utils.py`。合并后已 kickstart（PID 31487，03:34:23，晚于 `dda8d66` 03:34:16）。
+
+浸泡（同一 PID 31487）：8min 30MB → 2h 36MB → **13h10m 58MB**（峰值=当前）。旧斜率约 70MB/h，13h 应近 1GB；现约 2MB/h 残余。有 24h 日切，两周不会堆到数百兆。OpenRouter/Exa/Finnhub 的 `httpx.post` 未收口（低频、不同 host）。
+
+---
+
 ## 当前系统状态（2026-08-11，issue #63 / PR #64，已合并）
 
 **`fetch_52week_stats` 韧性 + 巡检降噪（issue #63 / PR #64，squash `b6acbda`）**。2026-08-10 AM 主价格 18/18 成功后，Pass2 Layer B 拉 52 周日线时 yfinance 对 INTC 瞬时假 delisted（`period=1y`），库 logger 连打 3 行 ERROR，触发 Homepage healthcheck `finance 新错误`（阈值 1）；报告/邮件/TG 仍成功发出。修复：① bulk miss/短序列 → `Ticker.history` + 1s 后再试 1 次（fail-open 保留）；② 拉取期间 `yfinance` logger → CRITICAL，失败改我们 `WARNING`。Finnhub 免费档无 candle，未做跨源 1y fallback。单元测试 `scripts/test_fetch_52week_stats.py` 12/12（含 review 后单 ticker bulk 形状覆盖）。不改 `telegram_commands.py`，无需重启 TG bot；下次 AM/PM 自动吃到新 `fetch_prices.py`。
@@ -717,6 +727,7 @@ _Tavily: N/10_
 88. Bash工具同步命令超时"exit 143"不代表网络请求被取消——本地进程死了，OpenRouter服务端仍会处理并计费，造成未察觉的真实调用 → 详见 `docs/PITFALLS.md#88`
 89. `call_llm()`新增免JSON文本路径时沿用了`content or reasoning_content or reasoning`取值顺序，`finish_reason=length`+空content时会把部分思维链错误当正文返回 → 详见 `docs/PITFALLS.md#89`
 90. `fetch_52week_stats` bulk 1y 瞬时失败无重试 + yfinance ERROR 触发 healthcheck 误报 → 详见 `docs/PITFALLS.md#90`
+91. KeepAlive 长轮询每轮裸 `httpx.post` 泄漏数百 MB（不是忘关 Client；macOS libmalloc 不还页）→ 详见 `docs/PITFALLS.md#91`
 
 ---
 
@@ -731,7 +742,7 @@ _Tavily: N/10_
 7. **`tg_gap_detect`/`tg_preprocess` 切换 gemma-4-31b-it 后的真实使用观察**（issue #11，2026-07-25 起）：`tg_gap_detect` 此前疑似从未真正生效过（deepseek 隐藏推理烧光60-token预算），观察 TG 追问日志里 `Step 4 tokens` 前是否开始出现真实的"补搜第3条 query"命中；`tg_preprocess` 观察日常加/删 ticker、地缘关键词等指令是否不再出现分类错误或截断（此前 deepseek 在简单指令上出现过 3 次调用 3 种错误结果）
 8. **`llm_config.json` 实际使用观察**（issue #11，2026-07-25 起）：目前该文件内容与 DEFAULTS 完全一致（零覆盖），观察是否有实际调整需求（如某 stage 换模型、调预算）；每次编辑后确认 `/tmp/daily_intelligence.log` 或 `/tmp/finance_telegram.log` 出现对应的 `LLM config override:` 日志，验证改动真的生效
 9. **`report_pass1`/`am_calibration` 切 gemma-4-31b-it 后的生产观察**（issue #59/PR #61，2026-08-04 起）：模型选型本身已用真实 prompt 验证完成（6/6 通过，见上方状态章节），不需要再跑付费验证；观察项改为 `grep "LLM tokens \[report_pass1/google/gemma-4-31b-it\]\|LLM tokens \[am_calibration/google/gemma-4-31b-it\]" /tmp/daily_intelligence.log`，确认 `reasoning=0`、`finish_reason=stop` 在真实 AM/PM 报告运行中持续成立，不再出现 `finish_reason=length` 告警
-10. **issue #58：`call_telegram()` ConnectTimeout 修复**（2026-08-03 起）：等用户确认修复方向（`httpx.TransportError` 兜底 vs 显式加 `httpx.ConnectTimeout`）后实施，修复后观察 TG 报告/状态消息投递是否还出现单次握手超时就整体放弃的情况
+10. **issue #65 残余上涨 / 24h 日切**（2026-08-13 起，主泄漏已修）：PID 31487 13h 58MB、约 2MB/h。确认次日 ~03:34 后 PID 换新、日志有 `Recycling telegram bot process after 24h uptime`；若日切失败且斜率不减速，两周可到 ~700MB
 11. **issue #60/PR #62 生产观察**（2026-08-05 起，已实施+已合并，见上方状态章节）：`tg_followup`/`report_pass2` 均已切至 `gpt-5.6-luna`+`reasoning.effort=high`，2026-08-04 当晚已用真实生产双跑验证过一次（质量优于旧模型，见上方状态章节完整记录）；后续观察 `grep "LLM tokens \[report_pass2/openai/gpt-5.6-luna\]\|Step 4 tokens \[openai/gpt-5.6-luna\]" /tmp/daily_intelligence.log /tmp/finance_telegram.log`，确认 `finish_reason=stop` 持续成立、`provider=OpenAI` 稳定路由（硬 pin 不允许 fallback，需要留意是否出现非429 4xx 导致的静默降级到 Pass1-only report_md，PR #62 review 已识别此风险并记入 `llm_client.py` 注释，未做代码修复）
 12. **真实成本核算**（issue #60 遗留缺口）：`gpt-5.6-luna` 与 `deepseek-v4-pro`/`deepseek-v4-flash` 的实际生产量级成本差异尚未核算，观察一段时间后可用 OR 账单核实
 13. **issue #63/PR #64 生产观察**（2026-08-11 起）：下次 AM/PM 后 `grep -E "52-week|possibly delisted" /tmp/daily_intelligence.log`——期望不再出现 yfinance `possibly delisted` ERROR 行；bulk 抖时可见 `52-week bulk miss` INFO 与/或单次 `52-week stats unavailable after retry` WARNING，报告仍发出
