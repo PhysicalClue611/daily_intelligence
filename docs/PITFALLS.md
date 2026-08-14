@@ -398,6 +398,15 @@ httpx 0.28 顶层 `httpx.post()` 内部已是 `with Client(...)`，**不是忘�
 
 **教训**：常驻进程里「每次请求 new Client」的代价不是 Python 解释器基线，是分配器不还页。验收看 `footprint`/`phys_footprint`，不要只看 RSS。改 `telegram_commands.py` 后仍须 kickstart（坑 32）。
 
+### 92. 主路径 yfinance 8d/2d 假 delisted ERROR 刷屏；日线重试不可整表覆盖、不可把坍缩单列认成别的 ticker（issue #67/PR #68）
+（2026-08-13 发现修复）巡检 `finance 新错误` 34 条，末条 `['ORCL', 'INTC', ...] possibly delisted (period=2d)`。同一次 AM：`period=8d` 14 ticker + `period=2d` 16 ticker 假 delisted，库 logger 按标的打 ERROR；报告仍发出，价格 8/18。#63 只把 `_quiet_yfinance_logs()` 套在 `fetch_52week_stats`（`period=1y`）上，主 `fetch_prices()` 没盖到。同窗 NYT RSS / 部分 Finnhub 也握手超时。
+
+第一版 retry 把第二次 `yf.download` 整表赋给 `data_daily`：第一次 17/18 好、一次空 retry 会把商品/FX（Finnhub 补不上）一起打掉。第二轮：`_ohlc_series` 把单列 Close 或裸 Series 当成「当前问的 ticker」，yfinance 收成 AMKR-only 时会把 AMKR 价写到 INTC。
+
+**修复**：8d/2d 都 quiet；缺价再拉一次，`_merge_daily_ohlc()` 只叠回第一次缺失且第二次可用的列；取值必须列名/`Series.name` 对得上。测试 `test_fetch_prices_yfinance_noise.py` 10/10。
+
+**教训**：压第三方 ERROR 要按调用点清点，不能以为「这个文件里已经有 context manager」就盖住了所有 `yf.download`。重试是「补洞」不是「换整表」；第三方 bulk 形状（多列 / 单列 / Series）必须按名字认列，不能 `shape[1]==1` 就当自己要的 ticker。
+
 ---
 
 ## 十、凭据与日志卫生

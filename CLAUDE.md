@@ -32,6 +32,14 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-08-13，issue #67 / PR #68，已合并）
+
+**主价格 yfinance 8d/2d 假 delisted ERROR 触发巡检（issue #67 / PR #68，squash `df36a78`）**。2026-08-13 AM 05:30 ET：`yf.download(period=8d)` 14 ticker + `period=2d` 盘前 16 ticker 假 delisted，库 logger 连打 34 行 ERROR，Homepage healthcheck `finance 新错误`（阈值 1）。报告/邮件/TG 仍发出；价格表 8/18（Finnhub 补上 INTC/QCOM/SPCX/AMKR；QQQM/VOO/EWJ/SGOL Finnhub 也 SSL 超时；商品/FX 免费档无数据）。同窗 NYT RSS 握手超时，是早间出站不稳，不是退市。#63/`_quiet_yfinance_logs()` 只包了 `fetch_52week_stats`（`period=1y`），主路径没盖到。
+
+修复：日线 8d 与盘前 2d 都走 `_yf_download()`（内部 quiet）；日线缺价 sleep 1s 再拉一次，`_merge_daily_ohlc()` 只叠回「第一次缺、第二次有」的列，不整表覆盖；`_ohlc_series` 要求列名/`Series.name` 等于目标 ticker，避免 yfinance 收成单列时把 AMKR 价写到 INTC。测试 `scripts/test_fetch_prices_yfinance_noise.py` 10/10。两轮 `blacktomb42` review（整表覆盖、坍缩列误认）均已修后 APPROVE。不改 `telegram_commands.py`，无需重启 TG bot；下次 AM/PM 自动吃到新 `fetch_prices.py`。
+
+---
+
 ## 当前系统状态（2026-08-13，issue #65 / PR #66，已合并 + 13h 浸泡）
 
 **KeepAlive Telegram 长轮询泄漏（issue #65 / PR #66，squash `dda8d66`）**。`com.daily-intel.finance.telegram` 每 30s 裸 `httpx.post(getUpdates)`：httpx 0.28 顶层 `post()` 已是 `with Client()`，不是忘关 Client；短命 Client+TLS 在永不退出的进程里被 macOS `MALLOC_NANO`/`TINY` 吃成不可回收碎片。修复前：冷启动 38MB；8 天 PID 21106 → 386MB（峰值 675）；同代码 6h → 459MB。本 session 开 issue、kickstart 缓解（386→30MB），实现在 PR #66。
@@ -728,6 +736,7 @@ _Tavily: N/10_
 89. `call_llm()`新增免JSON文本路径时沿用了`content or reasoning_content or reasoning`取值顺序，`finish_reason=length`+空content时会把部分思维链错误当正文返回 → 详见 `docs/PITFALLS.md#89`
 90. `fetch_52week_stats` bulk 1y 瞬时失败无重试 + yfinance ERROR 触发 healthcheck 误报 → 详见 `docs/PITFALLS.md#90`
 91. KeepAlive 长轮询每轮裸 `httpx.post` 泄漏数百 MB（不是忘关 Client；macOS libmalloc 不还页）→ 详见 `docs/PITFALLS.md#91`
+92. 主路径 `yf.download` 8d/2d 假 delisted ERROR 刷屏（#63 只盖了 52 周）；重试不可整表覆盖、不可把坍缩单列认成别的 ticker → 详见 `docs/PITFALLS.md#92`
 
 ---
 
@@ -745,7 +754,7 @@ _Tavily: N/10_
 10. **issue #65 残余上涨 / 24h 日切**（2026-08-13 起，主泄漏已修）：PID 31487 13h 58MB、约 2MB/h。确认次日 ~03:34 后 PID 换新、日志有 `Recycling telegram bot process after 24h uptime`；若日切失败且斜率不减速，两周可到 ~700MB
 11. **issue #60/PR #62 生产观察**（2026-08-05 起，已实施+已合并，见上方状态章节）：`tg_followup`/`report_pass2` 均已切至 `gpt-5.6-luna`+`reasoning.effort=high`，2026-08-04 当晚已用真实生产双跑验证过一次（质量优于旧模型，见上方状态章节完整记录）；后续观察 `grep "LLM tokens \[report_pass2/openai/gpt-5.6-luna\]\|Step 4 tokens \[openai/gpt-5.6-luna\]" /tmp/daily_intelligence.log /tmp/finance_telegram.log`，确认 `finish_reason=stop` 持续成立、`provider=OpenAI` 稳定路由（硬 pin 不允许 fallback，需要留意是否出现非429 4xx 导致的静默降级到 Pass1-only report_md，PR #62 review 已识别此风险并记入 `llm_client.py` 注释，未做代码修复）
 12. **真实成本核算**（issue #60 遗留缺口）：`gpt-5.6-luna` 与 `deepseek-v4-pro`/`deepseek-v4-flash` 的实际生产量级成本差异尚未核算，观察一段时间后可用 OR 账单核实
-13. **issue #63/PR #64 生产观察**（2026-08-11 起）：下次 AM/PM 后 `grep -E "52-week|possibly delisted" /tmp/daily_intelligence.log`——期望不再出现 yfinance `possibly delisted` ERROR 行；bulk 抖时可见 `52-week bulk miss` INFO 与/或单次 `52-week stats unavailable after retry` WARNING，报告仍发出
+13. **issue #67/PR #68 生产观察**（2026-08-13 起，主路径已并入 #63 的 quiet logger）：下次 AM/PM 后 `grep -E "possibly delisted|yfinance daily bulk" /tmp/daily_intelligence.log`——期望不再出现 yfinance `possibly delisted` ERROR；bulk 抖时可见 `yfinance daily bulk incomplete` WARNING（及可选 `retry recovered` INFO），报告仍发出。52 周路径仍走同一套 `_quiet_yfinance_logs()`
 
 ---
 

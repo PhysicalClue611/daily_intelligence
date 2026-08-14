@@ -2,7 +2,7 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-08-04（issue #60：`tg_followup` 与 `report_pass2` 均切换至 `openai/gpt-5.6-luna`+`reasoning.effort=high`（provider锁定OpenAI）；`report_pass2` 的 `report_md` 脱离 JSON 包裹；`sas_candidates` 拆成独立 stage `sas_candidate_extract`；六个 `google/gemma-4-31b-it` stage 统一锁定 provider 为 OpenInference（allow_fallbacks）；详见第八节和文末变更记录。另含 2026-08-04 之前的 `report_pass1`/`am_calibration` 切换至 `google/gemma-4-31b-it`，issue #59/PR #61）
+> **最后更新**：2026-08-13（issue #67/PR #68：主路径 `fetch_prices` 的 8d/2d `yf.download` 拉取期间压低 yfinance ERROR；日线缺价重试一次并按列合并，不整表覆盖。详见 §5.1 与文末变更记录）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -256,6 +256,8 @@ user@example.com
 `PriceRow` 新增字段：`afterhours_price`、`afterhours_pct`、`slot`。`format_price_table(slot)` 按 slot 输出不同列：AM 显示「盘前价/盘前涨跌（vs昨收）」，PM 增加「盘后涨跌」列。
 
 yfinance 失败时 fallback 到 Finnhub `/api/v1/quote`（免费60 req/min）；Finnhub 无盘前/盘后数据，记 warning，返回日线等价数据。商品/FX（`GC=F`、`^TNX`、汇率等）在 Finnhub 免费 tier 无数据则跳过并记录。
+
+日线 `period=8d` 与 AM/PM 盘前盘后 `period=2d` 均经 `_yf_download()`：拉取期间将 yfinance logger 提到 CRITICAL（issue #63 的 `_quiet_yfinance_logs()`，issue #67 扩到主路径），避免库对瞬时空响应打 `possibly delisted` ERROR 触发 Homepage 巡检。日线任一 ticker Close 有效行不足时 sleep 1s 再拉一次，用 `_merge_daily_ohlc()` 只把「第一次缺失、第二次可用」的 Close/Open 叠回第一帧——不整表替换（否则一次更差的 retry 会丢掉 Finnhub 补不上的商品/FX）。取值必须列名或 `Series.name` 等于目标 ticker，防止 yfinance 把多标的 bulk 收成单列时把幸存者价格写到别的 ticker 上。
 
 **IBKR Client Portal Gateway（`ibkr/quotes.py`，隔夜/周末实时数据源）**：IBKR 自有 REST API，通过本地 gateway 代理，覆盖 ATS/OTC 隔夜时段和周末场外报价——这是 yfinance/Polygon 免费 tier 均无法覆盖的窗口。
 
@@ -1245,3 +1247,13 @@ LLM 调用层的容错设计一直是"网络错误/5xx 重试，4xx 不重试"�
 验证：`test_llm_config.py`（24/24）、`test_telegram_followup_reason.py`（16/16，含 `reasoning` 字段透传、`provider` 锁定断言）新增/更新用例覆盖 `parse_json=False` 的正常返回、空文本重试/fallback、`reasoning` 字段校验；另用真实生产 `llm_client.call_llm(stage="report_pass2", parse_json=False)`、`call_llm(stage="sas_candidate_extract")`、`telegram_commands._followup_reason()` 三处端到端冒烟测试确认代码路径正确接入（非仅 mock 测试）。
 
 **`report_pass2` 模型换成 `openai/gpt-5.6-luna`（同日追加，用户确认后实施）**：上一段记录的"模型本身未换、按 n=1 建议暂不换"是 PR 首次提交时的状态；用户复核上一轮真实数据对比（ORCL/CACI 事件的分类自相矛盾、SPCX 被误标为ETF两处真实问题，详见 issue #60 评论）后决定直接换模型，不再等待更多样本。改动：`report_pass2` 的 `model` 改为 `openai/gpt-5.6-luna`（非pro），`thinking` 置空、新增 `reasoning={"effort":"high"}`，`providers` 从 DeepSeek 的 `{order:[DigitalOcean,Venice]}` 改为锁定 `{order:[OpenAI],allow_fallbacks:false}`，`max_tokens` 8000→16000——与 `tg_followup` 完全同一套处理方式。`llm_client.py::call_llm()` 原先只透传 `thinking` 字段、从不发送 `reasoning`（即使 stage 配置了它）——这是本次修复顺带发现并补上的真实缺口，若不修，`report_pass2`/`tg_followup` 配置的 `reasoning` 参数会被静默丢弃，模型退化为无显式推理强度设置调用。同批，六个 `google/gemma-4-31b-it` stage（`report_pass1`/`am_calibration`/`sas_candidate_extract`/`semantic_filter`/`tg_preprocess`/`tg_gap_detect`）的 `providers` 从 `null`（不锁定）统一改为 `{order:["OpenInference"],allow_fallbacks:true}`——此前这些 stage 的真实调用观察到落在 Friendli/Crusoe/Novita/OpenInference 等多个不同 provider 上，改为显式偏好 OpenInference、允许失败时降级到其他 provider（而非强制锁死不可 fallback）。真实生产 `call_llm()` 冒烟测试确认三处均正确接入：`report_pass2` 路由到 `OpenAI`，`sas_candidate_extract` 路由到 `OpenInference`，`report_pass1` 一次实测降级路由到 `Novita`（验证了 `allow_fallbacks:true` 确实按预期生效，不是摆设）。
+
+---
+
+## 变更记录追加：2026-08-13 — 主路径 yfinance 8d/2d 降噪 + 日线按列合并重试（issue #67/PR #68）
+
+**触发**：2026-08-13 AM `yf.download(period=8d)` / `period=2d` 对十余个 ticker 瞬时假 delisted；yfinance 库 logger 连打 34 行 ERROR，Homepage healthcheck 阈值 1 必报。报告仍发出，价格 8/18。issue #63 只把 `_quiet_yfinance_logs()` 套在 `fetch_52week_stats`（`period=1y`）上。
+
+**决策**：quiet 扩到主路径两次 download；日线缺价再拉一次，按列合并回第一帧（不整表覆盖，避免更差的 retry 丢掉 Finnhub 补不上的商品/FX）；取值必须列名对得上，防止坍缩单列把幸存者价格写到别的 ticker。
+
+**实现**：`scripts/fetch_prices.py`；测试 `scripts/test_fetch_prices_yfinance_noise.py` 10/10。两轮 review 后 squash `df36a78`，issue #67 关闭。无需重启 TG bot。
