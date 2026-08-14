@@ -154,7 +154,10 @@ def test_daily_bulk_incomplete_after_retry_logs_our_warning_not_yfinance_error()
             slot="daily",
         )
 
+    calls: list[int] = []
+
     def fake_download(*_a, **_k):
+        calls.append(1)
         logging.getLogger("yfinance").error(
             "['INTC']: possibly delisted; no price data found  (period=8d)"
         )
@@ -164,6 +167,7 @@ def test_daily_bulk_incomplete_after_retry_logs_our_warning_not_yfinance_error()
     our_log, our_cap, our_prev = _attach(fp.logger.name)
     try:
         rows, _ = _run_daily(fake_download, finnhub=fallback)
+        assert len(calls) == 2
         assert {r.ticker for r in rows} == {"INTC", "AMKR"}
         assert all(r.price == 100.0 for r in rows)
         assert not any("possibly delisted" in m for m in yf_cap.messages())
@@ -176,6 +180,67 @@ def test_daily_bulk_incomplete_after_retry_logs_our_warning_not_yfinance_error()
     finally:
         _detach(yf_log, yf_cap, yf_prev)
         _detach(our_log, our_cap, our_prev)
+
+
+def test_mixed_bulk_keeps_first_yahoo_rows_when_retry_worse():
+    """Production shape: one Close series dead, the rest valid.
+
+    A worse second bulk must not wipe AMKR's first Yahoo rows (Finnhub cannot
+    fill futures/FX; even for stocks we should not throw away a good first hit).
+    """
+    calls: list[int] = []
+    finnhub_tickers: list[str] = []
+
+    def fake_download(*_a, **_k):
+        calls.append(1)
+        if len(calls) == 1:
+            return _ohlc_frame({
+                "INTC": [float("nan")] * 5,
+                "AMKR": [50.0, 51.0, 52.0, 53.0, 54.0],
+            })
+        return _empty_ohlc(["INTC", "AMKR"])
+
+    def fallback(ticker, *_a, **_k):
+        finnhub_tickers.append(ticker)
+        return PriceRow(
+            ticker=ticker,
+            display=ticker,
+            price=100.0,
+            prev_close=97.0,
+            change_pct=3.09,
+            week_change_pct=0.0,
+            is_anomaly=True,
+            unit="$",
+            slot="daily",
+        )
+
+    rows, _ = _run_daily(fake_download, finnhub=fallback)
+    by_ticker = {r.ticker: r.price for r in rows}
+    assert len(calls) == 2
+    assert by_ticker["AMKR"] == 54.0
+    assert by_ticker["INTC"] == 100.0
+    assert finnhub_tickers == ["INTC"]
+
+
+def test_mixed_bulk_merges_retry_recovery_without_dropping_first_hits():
+    """Retry recovers INTC but loses AMKR — keep both via column merge."""
+    calls: list[int] = []
+
+    def fake_download(*_a, **_k):
+        calls.append(1)
+        if len(calls) == 1:
+            return _ohlc_frame({
+                "INTC": [float("nan")] * 5,
+                "AMKR": [50.0, 51.0, 52.0, 53.0, 54.0],
+            })
+        return _ohlc_frame({
+            "INTC": [90.0, 91.0, 92.0, 93.0, 94.0],
+            "AMKR": [float("nan")] * 5,
+        })
+
+    rows, _ = _run_daily(fake_download)
+    assert len(calls) == 2
+    assert {r.ticker: r.price for r in rows} == {"INTC": 94.0, "AMKR": 54.0}
 
 
 def test_complete_daily_bulk_does_not_retry():
@@ -242,6 +307,8 @@ if __name__ == "__main__":
         test_daily_download_does_not_emit_yfinance_error,
         test_daily_bulk_retries_once_when_incomplete,
         test_daily_bulk_incomplete_after_retry_logs_our_warning_not_yfinance_error,
+        test_mixed_bulk_keeps_first_yahoo_rows_when_retry_worse,
+        test_mixed_bulk_merges_retry_recovery_without_dropping_first_hits,
         test_complete_daily_bulk_does_not_retry,
         test_intraday_download_does_not_emit_yfinance_error,
         test_intraday_empty_logs_our_warning,

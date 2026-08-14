@@ -69,27 +69,67 @@ def _yf_download(yf_mod, tickers, **kwargs):
         return yf_mod.download(tickers, **kwargs)
 
 
+def _ohlc_series(data, field: str, ticker: str):
+    """One ticker's Close/Open series from a group_by=column yf.download frame."""
+    if data is None or getattr(data, "empty", True):
+        return None
+    try:
+        block = data[field]
+        if hasattr(block, "columns"):
+            if ticker in block.columns:
+                return block[ticker]
+            if block.shape[1] == 1:
+                return block.iloc[:, 0]
+            return None
+        return block
+    except Exception:
+        return None
+
+
+def _close_usable(data, ticker: str) -> bool:
+    closes = _ohlc_series(data, "Close", ticker)
+    return closes is not None and len(closes.dropna()) >= 2
+
+
 def _missing_close_tickers(data, tickers: list[str]) -> list[str]:
     """Tickers whose Close series has fewer than 2 non-NaN rows (or is absent)."""
     if not tickers:
         return []
     if data is None or getattr(data, "empty", True):
         return list(tickers)
-    missing: list[str] = []
-    n = len(tickers)
-    for ticker in tickers:
-        try:
-            if n == 1:
-                closes = data["Close"]
-                if hasattr(closes, "columns"):
-                    closes = closes.iloc[:, 0] if closes.shape[1] else closes
-            else:
-                closes = data["Close"][ticker]
-            if len(closes.dropna()) < 2:
-                missing.append(ticker)
-        except Exception:
-            missing.append(ticker)
-    return missing
+    return [t for t in tickers if not _close_usable(data, t)]
+
+
+def _merge_daily_ohlc(first, retry, tickers: list[str]):
+    """Keep first-frame Yahoo rows; overlay retry only for tickers first missed.
+
+    A worse non-throwing retry must not replace a usable first bulk (issue #67
+    review). If first is empty and retry is not, take retry wholesale.
+    """
+    if first is None or getattr(first, "empty", True):
+        return retry
+    if retry is None or getattr(retry, "empty", True):
+        return first
+    first_miss = _missing_close_tickers(first, tickers)
+    if not first_miss:
+        return first
+    out = first.copy()
+    recovered: list[str] = []
+    for ticker in first_miss:
+        if not _close_usable(retry, ticker):
+            continue
+        for field in ("Close", "Open"):
+            src = _ohlc_series(retry, field, ticker)
+            if src is None:
+                continue
+            out[(field, ticker)] = src.reindex(out.index)
+        if _close_usable(out, ticker):
+            recovered.append(ticker)
+    if recovered:
+        logger.info(
+            f"yfinance daily retry recovered {len(recovered)} ticker(s): {recovered}"
+        )
+    return out
 
 
 def _fetch_intraday_data(all_tickers: list[str], yf):
@@ -365,8 +405,9 @@ def fetch_prices(
 
     # ── Daily download: prev_close and 5-day history ──────────────────────────
     # Issue #67: quiet yfinance ERROR (false "possibly delisted"); retry once
-    # if any ticker's Close series is unusable so FX/commodities get a second
-    # Yahoo chance before Finnhub (which cannot fill those).
+    # for missing tickers and merge recovered columns onto the first frame.
+    # Never replace a usable first bulk with a worse retry — Finnhub cannot
+    # fill FX/commodities in _FINNHUB_UNSUPPORTED.
     _dl_kwargs = dict(
         period="8d",
         interval="1d",
@@ -380,17 +421,20 @@ def fetch_prices(
         logger.error(f"yfinance daily download failed: {e} — trying Finnhub fallback")
         return _fetch_prices_finnhub(all_tickers, stocks, fx, commodities, thresholds, slot=slot)
 
-    missing = _missing_close_tickers(data_daily, all_tickers)
+    first_daily = data_daily
+    missing = _missing_close_tickers(first_daily, all_tickers)
     if missing:
         logger.warning(
             f"yfinance daily bulk incomplete: {len(missing)}/{len(all_tickers)} "
             f"tickers missing {missing} — retrying once"
         )
+        retry_daily = None
         try:
             _sleep(1.0)
-            data_daily = _yf_download(yf, all_tickers, **_dl_kwargs)
+            retry_daily = _yf_download(yf, all_tickers, **_dl_kwargs)
         except Exception as e:
             logger.warning(f"yfinance daily retry failed: {e} — keeping first response")
+        data_daily = _merge_daily_ohlc(first_daily, retry_daily, all_tickers)
         missing = _missing_close_tickers(data_daily, all_tickers)
         if missing:
             logger.warning(
