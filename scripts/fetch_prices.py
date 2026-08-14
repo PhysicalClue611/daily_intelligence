@@ -70,7 +70,12 @@ def _yf_download(yf_mod, tickers, **kwargs):
 
 
 def _ohlc_series(data, field: str, ticker: str):
-    """One ticker's Close/Open series from a group_by=column yf.download frame."""
+    """One ticker's Close/Open series from a group_by=column yf.download frame.
+
+    A collapsed retry (yfinance dropped every symbol but one) must not treat
+    the leftover column / flat Series as a different ticker. Same rule as
+    `_closes_from_bulk` for n_tickers > 1: no name match → None.
+    """
     if data is None or getattr(data, "empty", True):
         return None
     try:
@@ -78,10 +83,12 @@ def _ohlc_series(data, field: str, ticker: str):
         if hasattr(block, "columns"):
             if ticker in block.columns:
                 return block[ticker]
-            if block.shape[1] == 1:
+            if block.shape[1] == 1 and str(block.columns[0]) == ticker:
                 return block.iloc[:, 0]
             return None
-        return block
+        if getattr(block, "name", None) == ticker:
+            return block
+        return None
     except Exception:
         return None
 

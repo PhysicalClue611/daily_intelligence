@@ -243,6 +243,73 @@ def test_mixed_bulk_merges_retry_recovery_without_dropping_first_hits():
     assert {r.ticker: r.price for r in rows} == {"INTC": 94.0, "AMKR": 54.0}
 
 
+def _finnhub_stub(collected: list[str]):
+    def fallback(ticker, *_a, **_k):
+        collected.append(ticker)
+        return PriceRow(
+            ticker=ticker,
+            display=ticker,
+            price=100.0,
+            prev_close=97.0,
+            change_pct=3.09,
+            week_change_pct=0.0,
+            is_anomaly=True,
+            unit="$",
+            slot="daily",
+        )
+    return fallback
+
+
+def test_collapsed_retry_one_column_does_not_alias_survivor_onto_missing():
+    """Retry dropped INTC and returned AMKR-only one-column Close/Open.
+
+    Must not copy AMKR's series onto INTC (issue #67 second review).
+    """
+    calls: list[int] = []
+    finnhub_tickers: list[str] = []
+
+    def fake_download(*_a, **_k):
+        calls.append(1)
+        if len(calls) == 1:
+            return _ohlc_frame({
+                "INTC": [float("nan")] * 5,
+                "AMKR": [50.0, 51.0, 52.0, 53.0, 54.0],
+            })
+        return _ohlc_frame({"AMKR": [50.0, 51.0, 52.0, 53.0, 54.0]})
+
+    rows, _ = _run_daily(fake_download, finnhub=_finnhub_stub(finnhub_tickers))
+    by_ticker = {r.ticker: r.price for r in rows}
+    assert len(calls) == 2
+    assert by_ticker["AMKR"] == 54.0
+    assert by_ticker["INTC"] == 100.0
+    assert by_ticker["INTC"] != by_ticker["AMKR"]
+    assert finnhub_tickers == ["INTC"]
+
+
+def test_collapsed_retry_flat_series_does_not_alias_survivor_onto_missing():
+    """Retry collapsed to a flat Close Series (single-ticker yfinance shape)."""
+    calls: list[int] = []
+    finnhub_tickers: list[str] = []
+    idx = pd.date_range("2026-08-06", periods=5, freq="B")
+
+    def fake_download(*_a, **_k):
+        calls.append(1)
+        if len(calls) == 1:
+            return _ohlc_frame({
+                "INTC": [float("nan")] * 5,
+                "AMKR": [50.0, 51.0, 52.0, 53.0, 54.0],
+            })
+        close = pd.Series([50.0, 51.0, 52.0, 53.0, 54.0], index=idx, name="AMKR")
+        return pd.DataFrame({"Close": close, "Open": close.copy()})
+
+    rows, _ = _run_daily(fake_download, finnhub=_finnhub_stub(finnhub_tickers))
+    by_ticker = {r.ticker: r.price for r in rows}
+    assert len(calls) == 2
+    assert by_ticker["AMKR"] == 54.0
+    assert by_ticker["INTC"] == 100.0
+    assert finnhub_tickers == ["INTC"]
+
+
 def test_complete_daily_bulk_does_not_retry():
     calls: list[int] = []
     slept: list[float] = []
@@ -309,6 +376,8 @@ if __name__ == "__main__":
         test_daily_bulk_incomplete_after_retry_logs_our_warning_not_yfinance_error,
         test_mixed_bulk_keeps_first_yahoo_rows_when_retry_worse,
         test_mixed_bulk_merges_retry_recovery_without_dropping_first_hits,
+        test_collapsed_retry_one_column_does_not_alias_survivor_onto_missing,
+        test_collapsed_retry_flat_series_does_not_alias_survivor_onto_missing,
         test_complete_daily_bulk_does_not_retry,
         test_intraday_download_does_not_emit_yfinance_error,
         test_intraday_empty_logs_our_warning,
