@@ -741,11 +741,11 @@ def _get_portfolio_snapshot() -> str:
             header.append(f"持仓时间：{time_m.group(1).strip()}")
         if total_m:
             header.append(f"总市值：{total_m.group(1).strip()}")
-        ib_section = re.search(r"## IB（账户 0611）(.*?)(?=\n## |\Z)", text, re.DOTALL)
+        ib_section = re.search(r"## IB（账户[^）]*）(.*?)(?=\n## |\Z)", text, re.DOTALL)
         if not ib_section:
             return "\n".join(header)
         holdings = re.findall(
-            r"### (\w+) \w+ \d+\n.*?均价：([\d.]+).*?浮盈：[^（]+（([+\-\d.]+%)）",
+            r"### (\w+) \w+ \w+\n.*?均价：([\d.]+).*?浮盈：[^（]+（([+\-\d.]+%)）",
             ib_section.group(1), re.DOTALL
         )
         us_stocks = [(sym, cost, pnl) for sym, cost, pnl in holdings
@@ -773,10 +773,10 @@ def _get_core_holding_tickers() -> list[str]:
         if not latest_path.exists():
             return []
         text = latest_path.read_text(encoding="utf-8")
-        ib_section = re.search(r"## IB（账户 0611）(.*?)(?=\n## |\Z)", text, re.DOTALL)
+        ib_section = re.search(r"## IB（账户[^）]*）(.*?)(?=\n## |\Z)", text, re.DOTALL)
         if not ib_section:
             return []
-        tickers = re.findall(r"### (\w+) \w+ \d+", ib_section.group(1))
+        tickers = re.findall(r"### (\w+) \w+ \w+", ib_section.group(1))
         return [t for t in tickers if t.isalpha() and t not in _CORE_HOLDING_EXCLUDE]
     except Exception as e:
         logger.debug(f"Core holding ticker parse failed: {e}")
@@ -798,11 +798,11 @@ def _get_portfolio_weights() -> dict[str, float]:
         total_usd = float(total_m.group(1).replace(",", ""))
         if not total_usd:
             return {}
-        ib_section = re.search(r"## IB（账户 0611）(.*?)(?=\n## |\Z)", text, re.DOTALL)
+        ib_section = re.search(r"## IB（账户[^）]*）(.*?)(?=\n## |\Z)", text, re.DOTALL)
         if not ib_section:
             return {}
         holdings = re.findall(
-            r"### (\w+) \w+ \d+\n.*?市值：([\d.]+)\s*浮盈",
+            r"### (\w+) \w+ \w+\n.*?市值：([\d.]+)\s*浮盈",
             ib_section.group(1), re.DOTALL
         )
         return {
@@ -1002,8 +1002,11 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
    信号单独建议清仓或大幅减仓
 
 **持仓异动核对（唯一允许给出加减仓建议的依据来源）**：涉及"IB美股持仓"快照中实际持有标的（非仅
-   观察用的watchlist标的）的异动，须逐条核对以下具体标准，命中的写明命中哪条+对应事实依据；全部
-   不命中，必须写"不构成加/减仓依据"，不得给出与下列标准无关的仓位建议：
+   观察用的watchlist标的）时，加减仓建议只能建立在以下四类具体事实标准之上——但不要把它们做成
+   独立的逐条核对清单，而是作为判断标准自然融入上面对该标的驱动力/战略含义的论述：命中了，就在
+   讨论这只标的时顺带说清命中的是哪类事实、具体新证据是什么，不必复述标准原文或标注"命中第几条"；
+   一条都不命中，就在该标的论述收尾处用一句话说明当前证据不构成加/减仓依据，不必逐条否定排除。
+   不得给出与下列四类标准无关的仓位建议：
    - 认知提升（加仓依据，需满足其一，且必须基于新出现的可验证事实而非价格变动本身）：企业解锁了
      一个之前不确定的战略节点（如产品从内测进入商业化、新市场首次产生可计量收入）；竞争格局出现了
      有利于企业的结构性变化（如主要竞争对手退出、监管为企业构建护城河）；管理层兑现了此前市场明确
@@ -1014,7 +1017,8 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
      且两者战略空间量级相当（同量级TAM）
    - 仓位结构性超载（减仓依据）：并非主动加仓，而是价格被动上涨导致单一标的占组合比例超过15%——
      这个占比数字直接读取下方【持仓计算信号】里代码算好的值，不要自己从持仓文本估算
-   上面"驱动因素归类"里讨论的战略含义仅作理解背景，不能替代这里的逐条核对结果
+   上面"驱动因素归类"里讨论的战略含义和这里的事实核对是同一段论述的两个维度，不是先后两步——
+   写成"先归类背景、再单独核对"的两段式结构本身就是应该避免的机械化
 
 {verifiable_signals_rule}
 

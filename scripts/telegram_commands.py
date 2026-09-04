@@ -679,12 +679,12 @@ def _get_portfolio_snapshot() -> str:
             header.append(f"总市值：{total_m.group(1).strip()}")
 
         # Extract only IB section (US stocks, stop at 招商银行 section)
-        ib_section = re.search(r"## IB（账户 0611）(.*?)(?=\n## |\Z)", text, re.DOTALL)
+        ib_section = re.search(r"## IB（账户[^）]*）(.*?)(?=\n## |\Z)", text, re.DOTALL)
         if not ib_section:
             return "\n".join(header)
 
         holdings = re.findall(
-            r"### (\w+) \w+ \d+\n.*?均价：([\d.]+).*?浮盈：[^（]+（([+\-\d.]+%)）",
+            r"### (\w+) \w+ \w+\n.*?均价：([\d.]+).*?浮盈：[^（]+（([+\-\d.]+%)）",
             ib_section.group(1), re.DOTALL
         )
         # Skip CASH entries
