@@ -208,7 +208,7 @@ def _get_pm_prices(
 ) -> tuple[float | None, float | None, float | None]:
     """Return (today_open, today_close, afterhours_price) from intraday 1m data.
 
-    today_open: today's first regular-session (<=16:00 ET) bar's Open — the
+    today_open: today's first regular-session (09:30<=time<=16:00 ET) bar's Open — the
     authoritative source for "today" (issue #69: the daily bulk's last row may
     still be yesterday's when this runs, well before Yahoo lands today's daily bar).
     today_close: last bar at or before 16:00 ET today (regular session close).
