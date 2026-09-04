@@ -162,16 +162,26 @@ def _fetch_intraday_data(all_tickers: list[str], yf):
         return None
 
 
-def _closes_1m(data, ticker: str, all_tickers: list[str]):
-    """Extract 1m Close series for a ticker from the intraday DataFrame."""
+def _field_1m(data, field: str, ticker: str, all_tickers: list[str]):
+    """Extract 1m field (Close/Open) series for a ticker from the intraday DataFrame."""
     try:
         if len(all_tickers) == 1:
-            s = data["Close"]
+            s = data[field]
         else:
-            s = data["Close"][ticker]
+            s = data[field][ticker]
         return s.dropna()
     except Exception:
         return None
+
+
+def _closes_1m(data, ticker: str, all_tickers: list[str]):
+    """Extract 1m Close series for a ticker from the intraday DataFrame."""
+    return _field_1m(data, "Close", ticker, all_tickers)
+
+
+def _opens_1m(data, ticker: str, all_tickers: list[str]):
+    """Extract 1m Open series for a ticker from the intraday DataFrame."""
+    return _field_1m(data, "Open", ticker, all_tickers)
 
 
 def _get_premarket_price(closes_1m, today_et_date) -> float | None:
@@ -193,22 +203,27 @@ def _get_premarket_price(closes_1m, today_et_date) -> float | None:
         return None
 
 
-def _get_pm_prices(closes_1m, today_et_date) -> tuple[float | None, float | None]:
-    """Return (today_close, afterhours_price) from intraday 1m data.
+def _get_pm_prices(
+    closes_1m, opens_1m, today_et_date
+) -> tuple[float | None, float | None, float | None]:
+    """Return (today_open, today_close, afterhours_price) from intraday 1m data.
 
+    today_open: today's first regular-session (<=16:00 ET) bar's Open — the
+    authoritative source for "today" (issue #69: the daily bulk's last row may
+    still be yesterday's when this runs, well before Yahoo lands today's daily bar).
     today_close: last bar at or before 16:00 ET today (regular session close).
     afterhours_price: last bar after 16:00 ET today (no upper bound — AH runs until ~20:00 ET
     but some platforms extend further; also catches late prints).
     """
     if closes_1m is None or closes_1m.empty:
-        return None, None
+        return None, None, None
     try:
         idx_et = closes_1m.index.tz_convert(_ET)
         today_mask = idx_et.date == today_et_date
         today_bars = closes_1m[today_mask]
 
         if today_bars.empty:
-            return None, None
+            return None, None, None
 
         today_idx_et = today_bars.index.tz_convert(_ET)
         regular = today_bars[today_idx_et.time <= dtime(16, 0)]
@@ -217,14 +232,23 @@ def _get_pm_prices(closes_1m, today_et_date) -> tuple[float | None, float | None
         close    = float(regular.iloc[-1]) if not regular.empty else None
         ah_price = float(ah.iloc[-1])      if not ah.empty      else None
 
+        open_ = None
+        if not regular.empty and opens_1m is not None and not opens_1m.empty:
+            opens_idx_et = opens_1m.index.tz_convert(_ET)
+            opens_today = opens_1m[
+                (opens_idx_et.date == today_et_date) & (opens_idx_et.time <= dtime(16, 0))
+            ]
+            if not opens_today.empty:
+                open_ = float(opens_today.iloc[0])
+
         if ah_price is not None:
             last_ah_time = today_idx_et[today_idx_et.time > dtime(16, 0)][-1].strftime("%H:%M")
             logger.debug(f"AH bar found: {ah_price:.4f} at {last_ah_time} ET")
 
-        return close, ah_price
+        return open_, close, ah_price
     except Exception as e:
         logger.warning(f"_get_pm_prices error: {e}")
-        return None, None
+        return None, None, None
 
 
 def _finnhub_single_ticker(
@@ -539,43 +563,53 @@ def fetch_prices(
                     logger.debug(f"{ticker} AM: no premarket data")
 
             elif slot == "pm":
-                # price     = DAILY official close (matches Yahoo Finance — NOT intraday 1m last bar)
-                # prev_close = daily official previous close
-                # change_pct = official close vs official prev close — matches Yahoo Finance "day change"
-                # session_change_pct = close vs today's open (intraday session performance)
+                # price      = today's regular-session close from INTRADAY 1m data (issue #69).
+                #              NOT the daily bulk's last row — at 20:10 ET, Yahoo's daily bar
+                #              for "today" (period=8d/1d) is not reliably landed yet; treating
+                #              the batch's last row as "today" silently reused yesterday's
+                #              close (price==prev_close, change_pct==0.00% for every ticker).
+                # prev_close = daily official previous close (daily bulk IS reliable for dates
+                #              strictly before today, so this stays sourced from it)
+                # change_pct = today's intraday close vs official prev close
+                # session_change_pct = today's intraday close vs today's intraday open
                 # after-hours: from intraday 1m only
                 #
                 # Use date-aware indexing for robustness (handles FORCE_DATE / post-close testing)
                 import pandas as _pd
                 _report_ts   = _pd.Timestamp(today_et_date)
-                _today_mask  = closes_daily.index.normalize() == _report_ts
                 _prev_mask   = closes_daily.index.normalize() < _report_ts
-                # today's official close from daily data
-                _closes_today = closes_daily[_today_mask]
-                _closes_prev  = closes_daily[_prev_mask]
-                _opens_today  = opens_daily[_today_mask]
-                if _closes_today.empty:
-                    # market may not have closed yet or weekend — fall back to latest available
-                    _closes_today = closes_daily.iloc[[-1]]
-                    _opens_today  = opens_daily.iloc[[-1]]
-                if _closes_prev.empty or _closes_today.empty:
+                _closes_prev = closes_daily[_prev_mask]
+                if _closes_prev.empty:
                     logger.warning(f"{ticker} PM: insufficient daily data for report_date={today_et_date}")
                     continue
-                price      = float(_closes_today.iloc[-1])   # official daily close
                 prev_close = float(_closes_prev.iloc[-1])    # official previous close
-                if prev_close == 0 or price == 0:
+                if prev_close == 0:
                     continue
-                week_start      = float(closes_daily.iloc[-6]) if len(closes_daily) >= 6 else float(closes_daily.iloc[0])
+
+                closes_1m = _closes_1m(data_intraday, ticker, all_tickers) if data_intraday is not None else None
+                opens_1m  = _opens_1m(data_intraday, ticker, all_tickers) if data_intraday is not None else None
+                today_open, price, ah_price = _get_pm_prices(closes_1m, opens_1m, today_et_date)
+
+                if price is None:
+                    # Both sources lack "today" — no silent fallback to stale data (issue #69
+                    # design contract). Ticker is simply absent from rows; the caller's
+                    # failed-ticker detection (run_finance.py) picks this up and bans citing
+                    # this ticker's price in the LLM prompt, same as the 2026-06-18 pattern.
+                    logger.warning(
+                        f"{ticker} PM: no intraday regular-session close available, price unavailable"
+                    )
+                    continue
+                if price == 0:
+                    continue
+
+                # week_change_pct: 5 trading days back from _closes_prev (which excludes any
+                # "today" row, present or not) — anchoring to the batch's raw last row would
+                # be off by a day whenever "today" is missing from the batch (issue #69 §4).
+                week_start      = float(_closes_prev.iloc[-5]) if len(_closes_prev) >= 5 else float(_closes_prev.iloc[0])
                 week_change_pct = (price - week_start) / week_start * 100
                 change_pct      = (price - prev_close) / prev_close * 100
-                # session: close vs open using daily data
-                if not _opens_today.empty:
-                    today_open = float(_opens_today.iloc[-1])
-                    if today_open:
-                        session_change_pct = (price - today_open) / today_open * 100
-                # after-hours from intraday only (prev_close baseline = official daily close)
-                closes_1m = _closes_1m(data_intraday, ticker, all_tickers) if data_intraday is not None else None
-                _, ah_price = _get_pm_prices(closes_1m, today_et_date)
+                if today_open:
+                    session_change_pct = (price - today_open) / today_open * 100
                 if ah_price is not None and ah_price > 0 and price > 0:
                     afterhours_price = ah_price
                     afterhours_pct   = (ah_price - price) / price * 100
