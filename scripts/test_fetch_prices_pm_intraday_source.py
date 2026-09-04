@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
@@ -118,8 +118,12 @@ def _run_pm(daily_df, intraday_df):
 def test_pm_uses_intraday_close_when_daily_bulk_lacks_today():
     daily_df = _daily_frame()
     intraday_df = _intraday_frame({
-        "INTC": [("09:30", 97.0, 97.5), ("16:00", 104.0, 105.0), ("16:30", 105.0, 106.0)],
-        "AMKR": [("09:30", 47.0, 47.2), ("16:00", 48.0, 49.0), ("16:30", 49.0, 49.5)],
+        # 04:00 premarket bar included on purpose (review finding, PR #70): with
+        # prepost=True this bar sorts before the 09:30 RTH open, so if the RTH filter
+        # regressed to unbounded "<=16:00", .iloc[0] would wrongly pick 170.0 as "today's
+        # open" instead of the real RTH open (97.0).
+        "INTC": [("04:00", 170.0, 170.5), ("09:30", 97.0, 97.5), ("16:00", 104.0, 105.0), ("16:30", 105.0, 106.0)],
+        "AMKR": [("04:00", 80.0, 80.2), ("09:30", 47.0, 47.2), ("16:00", 48.0, 49.0), ("16:30", 49.0, 49.5)],
     })
     rows = _run_pm(daily_df, intraday_df)
     by_ticker = {r.ticker: r for r in rows}
@@ -131,6 +135,8 @@ def test_pm_uses_intraday_close_when_daily_bulk_lacks_today():
     assert intc.prev_close == 97.0        # daily bulk's last (=yesterday) row
     assert round(intc.change_pct, 4) == round((105.0 - 97.0) / 97.0 * 100, 4)
     assert intc.change_pct != 0.0         # the #69 bug produced 0.00% here
+    # session_change_pct must use the 09:30 RTH open (97.0), NOT the 04:00 premarket
+    # open (170.0) that also satisfies "time <= 16:00".
     assert round(intc.session_change_pct, 4) == round((105.0 - 97.0) / 97.0 * 100, 4)
     assert intc.afterhours_price == 106.0
     assert round(intc.afterhours_pct, 4) == round((106.0 - 105.0) / 105.0 * 100, 4)
@@ -167,10 +173,36 @@ def test_pm_skips_ticker_and_warns_when_both_sources_lack_today():
         ), f"missing hard-failure WARNING for {ticker}: {msgs}"
 
 
+# ── scenario 3: whole-table miss must NOT trigger a Finnhub refill for PM ─────
+
+
+def test_pm_stays_empty_on_whole_table_miss_even_with_finnhub_available():
+    """Review finding (PR #70): if every ticker hits the per-ticker intraday-miss
+    hard-fail, `rows` ends up empty and the function-level `if not rows:` tail must
+    not silently refill via Finnhub for slot="pm" — that would defeat the
+    no-silent-substitute contract and skip run_finance.py's price-citation ban.
+    """
+    daily_df = _daily_frame()
+    idx = pd.DatetimeIndex([pd.Timestamp("2026-09-02 09:30", tz=_ET)])
+    close = pd.DataFrame({"INTC": [97.5], "AMKR": [47.2]}, index=idx)
+    intraday_df = pd.concat({"Close": close, "Open": close.copy()}, axis=1)
+
+    def finnhub_would_refill(*_a, **_k):
+        raise AssertionError(
+            "Finnhub fallback must not be called for a PM whole-table intraday miss"
+        )
+
+    with patch.object(fp, "_fetch_prices_finnhub", side_effect=finnhub_would_refill):
+        rows = _run_pm(daily_df, intraday_df)
+
+    assert rows == []
+
+
 if __name__ == "__main__":
     tests = [
         test_pm_uses_intraday_close_when_daily_bulk_lacks_today,
         test_pm_skips_ticker_and_warns_when_both_sources_lack_today,
+        test_pm_stays_empty_on_whole_table_miss_even_with_finnhub_available,
     ]
     failed = 0
     for fn in tests:

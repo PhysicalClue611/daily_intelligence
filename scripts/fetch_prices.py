@@ -226,7 +226,11 @@ def _get_pm_prices(
             return None, None, None
 
         today_idx_et = today_bars.index.tz_convert(_ET)
-        regular = today_bars[today_idx_et.time <= dtime(16, 0)]
+        # RTH bounded on both ends — with prepost=True, unbounded "<=16:00" would let a
+        # ~04:00 premarket bar win .iloc[0] as "today's open" (review finding, PR #70).
+        regular = today_bars[
+            (today_idx_et.time >= dtime(9, 30)) & (today_idx_et.time <= dtime(16, 0))
+        ]
         ah = today_bars[today_idx_et.time > dtime(16, 0)]
 
         close    = float(regular.iloc[-1]) if not regular.empty else None
@@ -236,7 +240,9 @@ def _get_pm_prices(
         if not regular.empty and opens_1m is not None and not opens_1m.empty:
             opens_idx_et = opens_1m.index.tz_convert(_ET)
             opens_today = opens_1m[
-                (opens_idx_et.date == today_et_date) & (opens_idx_et.time <= dtime(16, 0))
+                (opens_idx_et.date == today_et_date)
+                & (opens_idx_et.time >= dtime(9, 30))
+                & (opens_idx_et.time <= dtime(16, 0))
             ]
             if not opens_today.empty:
                 open_ = float(opens_today.iloc[0])
@@ -664,6 +670,18 @@ def fetch_prices(
 
     logger.info(f"Prices: {len(rows)}/{len(all_tickers)} tickers fetched (slot={slot})")
     if not rows:
+        if slot == "pm":
+            # issue #69 review: PM rows can end up empty specifically because every ticker
+            # hit the per-ticker "no intraday regular-session close for today" hard-fail —
+            # that's the double-source-miss case the design explicitly forbids papering over.
+            # A whole-table Finnhub refill here would silently substitute regular-session
+            # prices and skip run_finance.py's price-citation ban, defeating the fix.
+            logger.warning(
+                "PM: no ticker has both a daily prev_close and an intraday regular-session "
+                "close for today — returning empty rather than falling back to Finnhub "
+                "(issue #69: no silent stale substitute for PM 'today')"
+            )
+            return []
         logger.warning("yfinance returned no rows — trying Finnhub fallback")
         return _fetch_prices_finnhub(all_tickers, stocks, fx, commodities, thresholds, slot=slot)
     return rows
