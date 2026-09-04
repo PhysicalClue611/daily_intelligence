@@ -32,6 +32,14 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-09-03，issue #69 / PR #70，已合并）
+
+**PM 价格数据静默失真修复（issue #69 / PR #70）**。09-02/09-03 连续两个交易日，夜盘报告价格表 18 个标的的「日内↑↓（vs前收）」集体显示 `+0.00%`（此前正常噪音只有 0-5/18），用户对照手机 App 真实数据发现（PLTR 报告写"收盘 $169.46"，真实 $182.53）。根因：`fetch_prices.py` PM 分支在批量日线（`period=8d, interval=1d`）当天数据于 20:10 ET 运行时尚未落库（Yahoo 后端时序行为，非我方回归）时，`_closes_today` 为空静默回退成"批量表最后一行"（=昨天），且该 fallback 路径无任何日志；同一次运行已经正确拉取的 intraday（`period=2d, interval=1m, prepost=True`）数据里其实有正确的今日收盘（`vs今开`/`盘后`两列因此一直是对的），却被 `_, ah_price = _get_pm_prices(...)` 丢弃。
+
+修复：PM「今日收盘/今日开盘」改由 intraday 提供——`_get_pm_prices()` 扩展为返回 `(today_open, today_close, ah_price)`（新增 `_opens_1m()`/`_field_1m()` helper）；批量日线只保留给 `prev_close` 和 5 日涨幅这类需要多日窗口的计算。双源皆缺（intraday 也没有今天数据）时不允许任何静默兜底——ticker 直接从 `rows` 剔除 + WARNING，`run_finance.py` 现有的失败标的检测机制自动接管、注入价格禁引声明（复用 2026-06-18 模式）。顺带修正 `week_change_pct` 的锚点从"批量表最后一行"改为 `_closes_prev.iloc[-5]`，修复批量表当天缺行时的 1 天窗口错位。TDD：新增 `scripts/test_fetch_prices_pm_intraday_source.py`（2/2），`test_fetch_prices_yfinance_noise.py`（10/10）无回归。不改 `telegram_commands.py`，无需重启 TG bot。squash 合并至 main，issue #69 随 PR `Closes` 自动关闭。
+
+---
+
 ## 当前系统状态（2026-08-13，issue #67 / PR #68，已合并）
 
 **主价格 yfinance 8d/2d 假 delisted ERROR 触发巡检（issue #67 / PR #68，squash `df36a78`）**。2026-08-13 AM 05:30 ET：`yf.download(period=8d)` 14 ticker + `period=2d` 盘前 16 ticker 假 delisted，库 logger 连打 34 行 ERROR，Homepage healthcheck `finance 新错误`（阈值 1）。报告/邮件/TG 仍发出；价格表 8/18（Finnhub 补上 INTC/QCOM/SPCX/AMKR；QQQM/VOO/EWJ/SGOL Finnhub 也 SSL 超时；商品/FX 免费档无数据）。同窗 NYT RSS 握手超时，是早间出站不稳，不是退市。#63/`_quiet_yfinance_logs()` 只包了 `fetch_52week_stats`（`period=1y`），主路径没盖到。
