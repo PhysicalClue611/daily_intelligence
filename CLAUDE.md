@@ -32,6 +32,16 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-09-04，issue #69 / PR #70，review 中，未合并）
+
+**PM 价格数据静默失真修复（issue #69 / PR #70，代码仍在 feature 分支，main 尚未拿到修复）**。09-02/09-03 连续两个交易日，夜盘报告价格表 18 个标的的「日内↑↓（vs前收）」集体显示 `+0.00%`（此前正常噪音只有 0-5/18），用户对照手机 App 真实数据发现（PLTR 报告写"收盘 $169.46"，真实 $182.53）。根因：`fetch_prices.py` PM 分支在批量日线（`period=8d, interval=1d`）当天数据于 20:10 ET 运行时尚未落库（Yahoo 后端时序行为，非我方回归）时，`_closes_today` 为空静默回退成"批量表最后一行"（=昨天），且该 fallback 路径无任何日志；同一次运行已经正确拉取的 intraday（`period=2d, interval=1m, prepost=True`）数据里其实有正确的今日收盘（`vs今开`/`盘后`两列因此一直是对的），却被 `_, ah_price = _get_pm_prices(...)` 丢弃。
+
+修复方向：PM「今日收盘/今日开盘」改由 intraday 提供——`_get_pm_prices()` 扩展为返回 `(today_open, today_close, ah_price)`（新增 `_opens_1m()`/`_field_1m()` helper）；批量日线只保留给 `prev_close` 和 5 日涨幅这类需要多日窗口的计算。双源皆缺（intraday 也没有今天数据）时不允许任何静默兜底——ticker 直接从 `rows` 剔除 + WARNING，`run_finance.py` 现有的失败标的检测机制自动接管、注入价格禁引声明（复用 2026-06-18 模式）。顺带修正 `week_change_pct` 的锚点从"批量表最后一行"改为 `_closes_prev.iloc[-5]`。
+
+**协作者 `blacktomb42` 首轮 review REQUEST_CHANGES（2026-09-04），抓到 2 个真实 bug，均已在 feature 分支修复**：① `_get_pm_prices` 的"regular session"筛选只卡了 `<=16:00` 上界、没卡 `>=09:30` 下界——`prepost=True` 拉到的 04:00 盘前 bar 也满足这个条件，`opens_today.iloc[0]` 会错误地把盘前价当"今日开盘"，`vs今开`列在真实运行中会算错；已改为显式 `09:30<=time<=16:00` 双边界，并在测试 fixture 里加入盘前 bar 复现。② PM 分支所有 ticker 都因"intraday 也没有今天数据"被 per-ticker `continue` 后，`rows` 为空，函数尾部原有的 `if not rows: 走 Finnhub fallback` 逻辑仍会整表回填 regular-session 价格，绕过了刚做的硬失败设计——已改为 `slot=="pm"` 且整表落空时直接返回 `[]`，不再触发 Finnhub 回填。新增回归测试覆盖两处（含"Finnhub key 存在也不应被调用"的断言）。TDD：`scripts/test_fetch_prices_pm_intraday_source.py` 现 3/3，`test_fetch_prices_yfinance_noise.py`（10/10）无回归。不改 `telegram_commands.py`，无需重启 TG bot。**等待 re-review，未合并**——review 也指出此前文档一度提前写"已合并"，已改正为如实反映"待合并"状态，教训是：状态段落只应描述已发生的事，不能预写尚未发生的合并结果。
+
+---
+
 ## 当前系统状态（2026-08-13，issue #67 / PR #68，已合并）
 
 **主价格 yfinance 8d/2d 假 delisted ERROR 触发巡检（issue #67 / PR #68，squash `df36a78`）**。2026-08-13 AM 05:30 ET：`yf.download(period=8d)` 14 ticker + `period=2d` 盘前 16 ticker 假 delisted，库 logger 连打 34 行 ERROR，Homepage healthcheck `finance 新错误`（阈值 1）。报告/邮件/TG 仍发出；价格表 8/18（Finnhub 补上 INTC/QCOM/SPCX/AMKR；QQQM/VOO/EWJ/SGOL Finnhub 也 SSL 超时；商品/FX 免费档无数据）。同窗 NYT RSS 握手超时，是早间出站不稳，不是退市。#63/`_quiet_yfinance_logs()` 只包了 `fetch_52week_stats`（`period=1y`），主路径没盖到。
