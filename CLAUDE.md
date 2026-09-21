@@ -32,6 +32,18 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-09-21，issue #72 / PR #73，已合并 `4a54d39`）
+
+**异动归因搜索精度（issue #72 / PR #73，squash `4a54d39`）**。2026-09-21 AM 正确把 INTC 盘前 +5.47% 标为异动，但 Pass 2 只能引用 Sonar 泛化归因；真实驱动是 Digitimes 首发的英特尔-友达 Micro LED 先进封装。三处缺口：RSS 无台湾半导体贸易媒体；异动 query 是 `"{tickers} stock news earnings"` 且多标的合并；INTC 被异动 / Pass1 / rotation 各查一次。
+
+实现：① `RSS_FEEDS` 增加 Digitimes `https://www.digitimes.com/rss/daily.xml`（15 源 + Guardian）。② `_anomaly_search_jobs()` 按 `|change_pct|` 取前 3，各一条 `surge|drop + 幅度 + premarket|afterhours + reason + 日期`，`days=min(query_days,7)`。③ 7 天围栏只打在 `_anomaly_query` job 上（`_drop_stale_dated_results`，年龄相对 `now_et`，无日期放行）；合并池 `score_and_filter` 不再切 rotation 的 30 天窗。④ rotation 命中当天异动 ticker 则跳过；Pass1 `{anomaly_tickers_note}` 禁止重复建议同名 ticker。
+
+`blacktomb42` REQUEST_CHANGES 两条均已修后合并：P1 初版把 7 天过滤放进 pooled `score_and_filter`，等于把 issue #33 的 30 天窗砍成 7 天；P2 用 `datetime.now(ET)` 会让 `FINANCE_FORCE_DATE` 补跑丢掉相对报告日仍新鲜的证据。测试 `test_issue72_anomaly_search.py` 9/9。不改 `telegram_commands.py`。
+
+**未改（另开 issue #74）**：rotation 30 天材料仍与异动/地缘结果进入同一 `tavily_section`，Pass 2 写【价格异动】时可能串味。候选落点：只进 SAS 日志、或独立小节且禁止用来解释当日 [!]。
+
+---
+
 ## 当前系统状态（2026-09-04，issue #69 / PR #70，已合并 `d457455`）
 
 **PM 价格数据静默失真修复（issue #69 / PR #70，squash `d457455`，已合并至 main，远程分支已删除，issue #69 随 `Closes` 自动关闭）**。09-02/09-03 连续两个交易日，夜盘报告价格表 18 个标的的「日内↑↓（vs前收）」集体显示 `+0.00%`（此前正常噪音只有 0-5/18），用户对照手机 App 真实数据发现（PLTR 报告写"收盘 $169.46"，真实 $182.53）。根因：`fetch_prices.py` PM 分支在批量日线（`period=8d, interval=1d`）当天数据于 20:10 ET 运行时尚未落库（Yahoo 后端时序行为，非我方回归）时，`_closes_today` 为空静默回退成"批量表最后一行"（=昨天），且该 fallback 路径无任何日志；同一次运行已经正确拉取的 intraday（`period=2d, interval=1m, prepost=True`）数据里其实有正确的今日收盘（`vs今开`/`盘后`两列因此一直是对的），却被 `_, ah_price = _get_pm_prices(...)` 丢弃。
@@ -473,7 +485,7 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
     - AM：日线数据取 prev_close + week_change；另拉 2d/1m prepost=True 取盘前最新价作为 price；change_pct = (premarket - prev_close) / prev_close
     - PM：日线数据取今日收盘为 price；另拉 1m prepost=True 取 16:00-20:00 ET 最后 bar 为 afterhours_price；is_anomaly = close_anomaly OR ah_anomaly
     - fallback：两级，yfinance失败→Finnhub（无盘前/盘后，记日志）；format_price_table(slot) 输出对应列
-6.  RSS 聚合（14个 feed + Guardian API，过去24小时）→ 计算 triggered_geo_topics（RSS 命中的地缘政治主题列表）；Guardian key 存在时合并 Guardian 结果并重排
+6.  RSS 聚合（15个 feed + Guardian API，过去24小时，含 Digitimes）→ 计算 triggered_geo_topics（RSS 命中的地缘政治主题列表）；Guardian key 存在时合并 Guardian 结果并重排
 7.  代码层 skip：无 anomaly 且无 triggered_geo_topics → 静默退出（不调用 LLM，零成本）
 8.  bridge 拉取 KB 上下文（fail-open）：MemPalace + Obsidian → kb_section；字符预算 2000（MP 1200 / Obs 800 独立截断）
 8b. Finnhub 即时新闻（免费，无配额）：异动标的优先 + watchlist 股票补齐，取前8个，
@@ -485,8 +497,8 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
 10. LLM pass 1（deepseek-v4-flash）注入 price_table + RSS + finnhub_news + kb_section + triggered_geo_topics
     → 输出：{report_md, tavily_queries:[{query, search_depth, days, max_results}]}
     （网络/5xx 错误自动重试 2 次，间隔 2s/4s；4xx 和 JSON parse 不重试）
-11. 构建搜索任务列表：代码生成异动查询（AM=advanced/PM=basic）在前，LLM 建议查询在后（PM slot 全部降为 basic）
-12. 顺序执行搜索任务，每次预检 budget（advanced 需 2 credits），Tavily 断连自动 fallback SerpApi
+11. 构建搜索任务列表：代码生成异动追因 query（`_anomaly_search_jobs`：前 3 大 `|change_pct|` 各一条 basic，PM+Finnhub 覆盖则跳过）→ Pass1 `tavily_queries` → issue #33 rotation（当天已是异动 ticker 则跳过）
+12. 顺序执行搜索任务，每次预检 budget；异动 job 搜完后 `_drop_stale_dated_results(..., now=now_et, max_age_days=7)`；Tavily 断连自动 fallback SerpApi
 13. 有搜索结果 → LLM pass 2（deepseek-v4-pro）合并生成最终报告（同样含 finnhub_news_section）
 14. PM slot：替换报告标题为「夜盘动向」
 15. Append 到 Obsidian 月度文件 Daily_Intel_report_YYYYMM.md
@@ -619,7 +631,7 @@ _Tavily: N/10_
 
 ---
 
-## RSS Feeds（已验证可达，14个源 + Guardian API）
+## RSS Feeds（已验证可达，15个源 + Guardian API）
 
 | Feed | URL | 定位 |
 |---|---|---|
@@ -637,6 +649,7 @@ _Tavily: N/10_
 | Reuters（via Google News） | `https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en` | 综合/财经（Google 代理，<1h延迟） |
 | AP（via Google News） | `https://news.google.com/rss/search?q=site:apnews.com&hl=en-US&gl=US&ceid=US:en` | 综合新闻（Google 代理） |
 | WSJ（via Google News） | `https://news.google.com/rss/search?q=site:wsj.com&hl=en-US&gl=US&ceid=US:en` | 专业财经（Google 代理） |
+| Digitimes | `https://www.digitimes.com/rss/daily.xml` | 台湾/大陆半导体供应链贸易媒体（issue #72） |
 
 **Guardian API**（`content.guardianapis.com/search`，非 RSS）：免费 500次/日，JSON 结构化，`GUARDIAN_API_KEY` 控制，fail-open。`fetch_guardian_news()` 拉取 business/world/politics/us-news 板块最新 20 条，合并进 RSS 结果统一排序。
 
@@ -748,6 +761,7 @@ _Tavily: N/10_
 90. `fetch_52week_stats` bulk 1y 瞬时失败无重试 + yfinance ERROR 触发 healthcheck 误报 → 详见 `docs/PITFALLS.md#90`
 91. KeepAlive 长轮询每轮裸 `httpx.post` 泄漏数百 MB（不是忘关 Client；macOS libmalloc 不还页）→ 详见 `docs/PITFALLS.md#91`
 92. 主路径 `yf.download` 8d/2d 假 delisted ERROR 刷屏（#63 只盖了 52 周）；重试不可整表覆盖、不可把坍缩单列认成别的 ticker → 详见 `docs/PITFALLS.md#92`
+93. 7 天围栏若打在 pooled `score_and_filter` 上会把 issue #33 rotation 的 30 天窗砍成 7 天；年龄必须用 `now_et` 不能用墙钟 → 详见 `docs/PITFALLS.md#93`
 
 ---
 
@@ -766,6 +780,8 @@ _Tavily: N/10_
 11. **issue #60/PR #62 生产观察**（2026-08-05 起，已实施+已合并，见上方状态章节）：`tg_followup`/`report_pass2` 均已切至 `gpt-5.6-luna`+`reasoning.effort=high`，2026-08-04 当晚已用真实生产双跑验证过一次（质量优于旧模型，见上方状态章节完整记录）；后续观察 `grep "LLM tokens \[report_pass2/openai/gpt-5.6-luna\]\|Step 4 tokens \[openai/gpt-5.6-luna\]" /tmp/daily_intelligence.log /tmp/finance_telegram.log`，确认 `finish_reason=stop` 持续成立、`provider=OpenAI` 稳定路由（硬 pin 不允许 fallback，需要留意是否出现非429 4xx 导致的静默降级到 Pass1-only report_md，PR #62 review 已识别此风险并记入 `llm_client.py` 注释，未做代码修复）
 12. **真实成本核算**（issue #60 遗留缺口）：`gpt-5.6-luna` 与 `deepseek-v4-pro`/`deepseek-v4-flash` 的实际生产量级成本差异尚未核算，观察一段时间后可用 OR 账单核实
 13. **issue #67/PR #68 生产观察**（2026-08-13 起，主路径已并入 #63 的 quiet logger）：下次 AM/PM 后 `grep -E "possibly delisted|yfinance daily bulk" /tmp/daily_intelligence.log`——期望不再出现 yfinance `possibly delisted` ERROR；bulk 抖时可见 `yfinance daily bulk incomplete` WARNING（及可选 `retry recovered` INFO），报告仍发出。52 周路径仍走同一套 `_quiet_yfinance_logs()`
+14. **issue #72 生产观察**（2026-09-21 起）：Digitimes 触发命中率；前 3 大异动各一条 + rotation 去重后 Tavily 日消耗是否持平或下降；`anomaly fence: dropped` 与 `Issue #33 rotation skipped` 日志。
+15. **issue #74**（未实现）：rotation 30 天材料与异动证据同池，污染【价格异动】归因。改善方向见该 issue，不在 #72 范围。
 
 ---
 

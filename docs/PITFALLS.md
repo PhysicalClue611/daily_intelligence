@@ -160,6 +160,13 @@ peer closed connection / Server disconnected / SSL UNEXPECTED_EOF 等瞬时错�
 
 **遗留**：方向 4（wire 原文优先/视频路径降权）并入 issue #14 范围：把"信源形态"判断从"extract 抓完全文后事后打标"前移到"候选阶段 URL 路径正则前筛"（识别 `/video/`、`/watch/`、`/gallery/` 等），与 #14 原有的"相关度分类"（个股直接命中/行业关联/宏观背景）合并成统一候选打标层，同域名同事件的视频版/文章版做去重降权，省 Tavily extract credit。用户决定先观察一段时间再评估是否启动。方向 5（输出侧二次核验）暂缓，需评估额外搜索额度成本（当前 Tavily 预算仅 20cr/日）。
 
+### 93. 7 天围栏打在 pooled `score_and_filter` 上会砍掉 rotation 的 30 天窗；年龄必须用报告时钟（issue #72 / PR #73 review）
+（2026-09-21 发现修复）初版把「异动证据不得超过 7 天」写进合并后的 `score_and_filter()`。`_rotation_search_job()` 的 `days=30` 仍会向 Tavily 拉 10 天前的 milestone 并计费，随后被无条件丢掉，issue #33 窗口名存实亡。同函数用 `datetime.now(ET)` 算年龄：`FINANCE_FORCE_DATE=2026-09-01` 在 09-21 补跑会把 08-31 的催化剂当成 21 天前。
+
+**修复**：异动 job 打 `_anomaly_query`，仅对这批结果跑 `_drop_stale_dated_results(..., now=now_et)`；`score_and_filter` 的 recency 也吃 `now_et`。测试覆盖 09-11 rotation 命中在 09-21 报告日保留、FORCE_DATE 09-01 保留 08-31。
+
+**未修**：rotation 材料仍进同一 Pass 2 证据池（issue #74）。
+
 ### 78. Sonar 宏观快照报告过时/幻觉信息，未限定检索时间窗且未锚定实时价格
 （2026-07-02 发现修复，issue #24）2026-07-02 AM 报告的 Sonar 宏观快照声称"原油飙破 $100、黄金下跌、美元走强"（典型滞涨初期画面），但同一份报告的实际价格数据显示 WTI 跌破 $70（$68.58，-2.13%），黄金 ETF 盘前涨 1.30%——与 Sonar 描述完全相反。Pass 2 LLM 靠自己核对价格数据发现了矛盾并在报告里做了修正说明，但这只是运气好被下游 LLM 接住，机制上没有防线——用户明确要求：严格限定 Sonar 情报的检索时间窗，或找别的办法拿到新情报；至少要求返回信息带时间戳。
 
