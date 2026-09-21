@@ -47,6 +47,8 @@ RSS_FEEDS = [
     ("Reuters", "https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en"),
     ("AP",      "https://news.google.com/rss/search?q=site:apnews.com&hl=en-US&gl=US&ceid=US:en"),
     ("WSJ",     "https://news.google.com/rss/search?q=site:wsj.com&hl=en-US&gl=US&ceid=US:en"),
+    # Digitimes — Taiwan/China semiconductor supply-chain trade press (issue #72)
+    ("Digitimes", "https://www.digitimes.com/rss/daily.xml"),
 ]
 
 
