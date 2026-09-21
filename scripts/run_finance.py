@@ -376,11 +376,44 @@ _TRUSTED_DOMAINS = [
 _VIDEO_PATH_RE = re.compile(r"/(?:video|watch|gallery|live-blog)/", re.IGNORECASE)
 
 
+def _drop_stale_dated_results(
+    results: list[dict],
+    now: datetime,
+    max_age_days: int = 7,
+) -> list[dict]:
+    """Drop dated hits older than max_age_days relative to `now`.
+
+    Used only on anomaly-attribution searches (issue #72). Undated results
+    pass through. Age is measured against the report clock, not wall clock.
+    """
+    kept = []
+    dropped = 0
+    for r in results:
+        pub = r.get("published_date", "")
+        if not pub:
+            kept.append(r)
+            continue
+        try:
+            from dateutil import parser as _dp
+            pub_dt = _dp.parse(pub).astimezone(ET)
+        except Exception:
+            kept.append(r)
+            continue
+        if (now - pub_dt).days > max_age_days:
+            dropped += 1
+            continue
+        kept.append(r)
+    if dropped:
+        logger.info(f"anomaly fence: dropped {dropped} stale (>{max_age_days}d) result(s)")
+    return kept
+
+
 def score_and_filter(
     results: list[dict],
     anomaly_tickers: list[str],
     geo_keywords: dict[str, list[str]],
     top_n: int = 8,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Score, deduplicate (exact URL + near-duplicate title within a time window),
     and return top_n search results by composite score.
@@ -414,10 +447,10 @@ def score_and_filter(
     # anchoring paths stay in sync.
     keywords = build_keyword_set(anomaly_tickers, geo_keywords)
 
-    now = datetime.now(ET)
+    if now is None:
+        now = datetime.now(ET)
     scored: list[tuple[float, dict, "datetime | None"]] = []
     seen: set[str] = set()
-    stale_count = 0
 
     for r in results:
         url = r.get("url", "")
@@ -441,12 +474,6 @@ def score_and_filter(
                 recency_bonus = 0.10 if age_h <= 24 else (0.05 if age_h <= 72 else 0)
             except Exception:
                 pass
-
-        # Issue #72: hard 7-day fence. Dated results older than 7 days cannot
-        # explain today's move. Undated results keep current pass-through.
-        if pub_dt is not None and (now - pub_dt).days > 7:
-            stale_count += 1
-            continue
 
         text = (r.get("title", "") + " " + (r.get("content") or "")).lower()
         kw_bonus = 0.05 * sum(1 for k in keywords if k and k in text)
@@ -493,8 +520,6 @@ def score_and_filter(
     top = [r for _, r in kept[:top_n]]
     if dup_count:
         logger.info(f"score_and_filter: dropped {dup_count} near-duplicate-title result(s) (cross-source dedup)")
-    if stale_count:
-        logger.info(f"score_and_filter: dropped {stale_count} stale (>7d) result(s)")
     logger.info(f"score_and_filter: {len(results)} → {len(top)} results (top_n={top_n})")
     return top
 
@@ -1270,6 +1295,7 @@ def _anomaly_search_jobs(
             "search_depth": "basic",
             "days": days,
             "max_results": 15,
+            "_anomaly_query": True,
         })
     return jobs
 
@@ -1614,6 +1640,8 @@ def _main_body():
             start_date=job.get("start_date", search_start),
             end_date=job.get("end_date", search_end),
         )
+        if job.get("_anomaly_query"):
+            results = _drop_stale_dated_results(results, now=now_et, max_age_days=7)
         raw_results.extend(results)
 
     if raw_results:
@@ -1623,6 +1651,7 @@ def _main_body():
             anomaly_ticker_syms,
             wl["geo_keywords"],
             top_n=15,
+            now=now_et,
         )
 
         # Layer 2b — semantic ranking: supply-chain aware → top 10

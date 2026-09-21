@@ -8,7 +8,7 @@ Run: python scripts/test_issue72_anomaly_search.py
 """
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -129,37 +129,49 @@ def test_pass1_prompt_tells_model_not_to_requery_anomalies():
     assert "不需要你重复建议同名 ticker" in filled
 
 
-def test_score_and_filter_drops_stale_published_results():
-    now = datetime.now(ET)
-    stale = (now - timedelta(days=20)).isoformat()
-    fresh = (now - timedelta(hours=6)).isoformat()
-    results = [
-        {
-            "title": "INTC Q2 earnings recap",
-            "url": "https://example.com/old",
-            "score": 0.9,
-            "content": "INTC earnings",
-            "published_date": stale,
-        },
-        {
-            "title": "INTC packaging talks today",
-            "url": "https://example.com/new",
-            "score": 0.5,
-            "content": "INTC AUO",
-            "published_date": fresh,
-        },
-        {
-            "title": "INTC undated wire",
-            "url": "https://example.com/nodate",
-            "score": 0.4,
-            "content": "INTC",
-        },
-    ]
-    kept = rf.score_and_filter(results, ["INTC"], {}, top_n=15)
-    urls = {r["url"] for r in kept}
-    assert "https://example.com/old" not in urls
-    assert "https://example.com/new" in urls
-    assert "https://example.com/nodate" in urls
+def test_score_and_filter_keeps_rotation_window_hits():
+    """P1: pooled filter must not shrink issue #33's 30-day window to 7 days."""
+    report_now = datetime(2026, 9, 21, 5, 30, tzinfo=ET)
+    mid_window = datetime(2026, 9, 11, 12, 0, tzinfo=ET).isoformat()
+    kept = rf.score_and_filter(
+        [{
+            "title": "INTC product commercialization milestone",
+            "url": "https://example.com/milestone",
+            "score": 0.8,
+            "content": "INTC commercialization",
+            "published_date": mid_window,
+        }],
+        ["INTC"], {}, top_n=15, now=report_now,
+    )
+    assert [r["url"] for r in kept] == ["https://example.com/milestone"]
+
+
+def test_anomaly_fence_uses_report_date_not_wall_clock():
+    """P2: FINANCE_FORCE_DATE=2026-09-01 on a 2026-09-21 machine."""
+    report_now = datetime(2026, 9, 1, 5, 30, tzinfo=ET)
+    keep = datetime(2026, 8, 31, 12, 0, tzinfo=ET).isoformat()
+    drop = datetime(2026, 8, 20, 12, 0, tzinfo=ET).isoformat()
+    out = rf._drop_stale_dated_results(
+        [
+            {"url": "https://a/keep", "published_date": keep, "title": "x"},
+            {"url": "https://a/drop", "published_date": drop, "title": "y"},
+            {"url": "https://a/nodate", "title": "z"},
+        ],
+        now=report_now,
+        max_age_days=7,
+    )
+    urls = {r["url"] for r in out}
+    assert "https://a/keep" in urls
+    assert "https://a/drop" not in urls
+    assert "https://a/nodate" in urls
+
+
+def test_anomaly_jobs_are_marked_for_fence():
+    jobs = rf._anomaly_search_jobs(
+        [_row("INTC", 5.47)], run_slot="am", today_et=TODAY,
+        query_days=2, finnhub_covers=False,
+    )
+    assert jobs and all(j.get("_anomaly_query") for j in jobs)
 
 
 def run():
@@ -170,7 +182,9 @@ def run():
         test_anomaly_jobs_pm_afterhours_and_skip_when_finnhub,
         test_rotation_skips_when_ticker_already_an_anomaly,
         test_pass1_prompt_tells_model_not_to_requery_anomalies,
-        test_score_and_filter_drops_stale_published_results,
+        test_score_and_filter_keeps_rotation_window_hits,
+        test_anomaly_fence_uses_report_date_not_wall_clock,
+        test_anomaly_jobs_are_marked_for_fence,
     ]
     failed = []
     for t in tests:
