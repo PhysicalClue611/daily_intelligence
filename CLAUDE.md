@@ -424,6 +424,7 @@ Issue #19已关闭（关闭条件B：核心防护done，issue #47单独跟踪残
   ```
 - **push 命令**: `git push origin main`（`origin` 已配置为 `git@github-physicalclue611:...`，与裸 URL 等价——但必须用 remote 名而非完整 URL push，否则本地 `origin/main` 追踪指针不会更新，会让其他 session/工具用 `origin/main..HEAD` 误判为"未 push"，见 2026-07-16 踩坑：GitHub 上其实已经真更新，只是本地指针滞后，另一个 Grok session 因此误报工作区有未 push 改动）
 - **Issues 追踪**: 未解决技术债、观察中功能均记录为 GitHub Issues
+- **Issue 标准格式**（2026-09-21 起，固化自 Portfonia）：Summary/In scope/Out of scope/Links 写 body，Requirements/Reasons/Exploration/Design/Contract constraints 各开一条 comment，body 末尾用锚点链接串起 5 条 comment。简单单一根因 bug 可用旧的 2 段式（问题描述在 body + 排查权衡一条 comment + 设计契约一条 comment）。完整规范和创建顺序见 `docs/playbooks/github_issue_format.md`。
 - **`gh` CLI 鉴权（issue/PR 操作，2026-07-15）**：本项目禁止切换全局 `gh auth login`。`.env` 中 `GITHUB_TOKEN`（physicalclue611 PAT）通过 `GH_TOKEN="$GITHUB_TOKEN" gh <command>` 单次注入鉴权，与 git push 的 SSH alias 是两条独立通道，不要混用。
 - **由 Claude Code 负责 commit 和 push**（用户不需手动操作）
 
