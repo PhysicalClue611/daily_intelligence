@@ -376,11 +376,44 @@ _TRUSTED_DOMAINS = [
 _VIDEO_PATH_RE = re.compile(r"/(?:video|watch|gallery|live-blog)/", re.IGNORECASE)
 
 
+def _drop_stale_dated_results(
+    results: list[dict],
+    now: datetime,
+    max_age_days: int = 7,
+) -> list[dict]:
+    """Drop dated hits older than max_age_days relative to `now`.
+
+    Used only on anomaly-attribution searches (issue #72). Undated results
+    pass through. Age is measured against the report clock, not wall clock.
+    """
+    kept = []
+    dropped = 0
+    for r in results:
+        pub = r.get("published_date", "")
+        if not pub:
+            kept.append(r)
+            continue
+        try:
+            from dateutil import parser as _dp
+            pub_dt = _dp.parse(pub).astimezone(ET)
+        except Exception:
+            kept.append(r)
+            continue
+        if (now - pub_dt).days > max_age_days:
+            dropped += 1
+            continue
+        kept.append(r)
+    if dropped:
+        logger.info(f"anomaly fence: dropped {dropped} stale (>{max_age_days}d) result(s)")
+    return kept
+
+
 def score_and_filter(
     results: list[dict],
     anomaly_tickers: list[str],
     geo_keywords: dict[str, list[str]],
     top_n: int = 8,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Score, deduplicate (exact URL + near-duplicate title within a time window),
     and return top_n search results by composite score.
@@ -414,7 +447,8 @@ def score_and_filter(
     # anchoring paths stay in sync.
     keywords = build_keyword_set(anomaly_tickers, geo_keywords)
 
-    now = datetime.now(ET)
+    if now is None:
+        now = datetime.now(ET)
     scored: list[tuple[float, dict, "datetime | None"]] = []
     seen: set[str] = set()
 
@@ -931,6 +965,7 @@ USER_PROMPT_TEMPLATE = """今日日期（ET）：{date}
 - days 默认使用上方搜索窗口值，宏观趋势背景可用 days=3
 - max_results 统一填 12
 - 对单个持仓 ticker 的个股查询，在 query 中加 site:stockanalysis.com 或 site:macrotrends.net 可显著提升数据密度（例："NVDA site:stockanalysis.com"）
+{anomaly_tickers_note}
 
 请输出以下JSON（不要附加任何其他文字）：
 {{
@@ -1235,7 +1270,37 @@ def _build_cognitive_upgrade_query(ticker: str, today_et: str) -> str:
     )
 
 
-def _rotation_search_job(today_et: str) -> dict | None:
+def _anomaly_search_jobs(
+    anomalies: list,
+    run_slot: str,
+    today_et: str,
+    query_days: int,
+    finnhub_covers: bool,
+) -> list[dict]:
+    """One Tavily job per top-3 mover by |change_pct| (issue #72)."""
+    if not anomalies or finnhub_covers:
+        return []
+    top3 = sorted(anomalies, key=lambda r: abs(r.change_pct), reverse=True)[:3]
+    jobs = []
+    session_word = "premarket" if run_slot == "am" else "afterhours"
+    days = min(int(query_days), 7)
+    for r in top3:
+        direction = "surge" if r.change_pct > 0 else "drop"
+        anomaly_q = (
+            f"{r.ticker} stock {direction} {abs(r.change_pct):.1f}% "
+            f"{session_word} reason {today_et}"
+        )
+        jobs.append({
+            "query": anomaly_q,
+            "search_depth": "basic",
+            "days": days,
+            "max_results": 15,
+            "_anomaly_query": True,
+        })
+    return jobs
+
+
+def _rotation_search_job(today_et: str, anomaly_tickers: set[str] | None = None) -> dict | None:
     """Pick one core holding for today via date.toordinal() % N — self-correcting
     if the holding list changes, no persisted state to go stale."""
     core_tickers = _get_core_holding_tickers()
@@ -1247,6 +1312,11 @@ def _rotation_search_job(today_et: str) -> dict | None:
     except ValueError:
         return None
     ticker = core_tickers[idx]
+    if anomaly_tickers and ticker in anomaly_tickers:
+        logger.info(
+            f"Issue #33 rotation skipped: {ticker} already covered by anomaly query"
+        )
+        return None
     return {
         "query": _build_cognitive_upgrade_query(ticker, today_et),
         "search_depth": "basic",
@@ -1480,6 +1550,15 @@ def _main_body():
     # bypasses MemPalace). No-op most of the time until entries accumulate.
     calibration_notes = _load_recent_calibration_notes() if run_slot == "am" else ""
 
+    if anomaly_ticker_syms:
+        anomaly_tickers_note = (
+            "以下标的已被系统识别为今日异动并自动生成追因查询，不需要你重复建议同名 ticker 的查询："
+            + ", ".join(anomaly_ticker_syms)
+            + "。Pass1 的 query 配额应优先给地缘/宏观话题或非异动个股。"
+        )
+    else:
+        anomaly_tickers_note = ""
+
     prompt = USER_PROMPT_TEMPLATE.format(
         date=today_et,
         now_str=now_et.strftime("%Y-%m-%d %H:%M %Z"),
@@ -1499,6 +1578,7 @@ def _main_body():
         kb_section=kb_section,
         calibration_notes=calibration_notes,
         verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P1 if run_slot == "am" else "",
+        anomaly_tickers_note=anomaly_tickers_note,
     )
     result = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
     llm_meta_p1 = result.get("_llm_meta", {})
@@ -1514,16 +1594,18 @@ def _main_body():
 
     if anomalies:
         finnhub_covers_anomalies = run_slot == "pm" and bool(finnhub_news_section)
-        if not finnhub_covers_anomalies:
-            anomaly_q = " ".join(r.ticker for r in anomalies[:5]) + " stock news earnings"
-            all_search_jobs.append({
-                "query": anomaly_q,
-                "search_depth": "basic",  # Extract will provide depth
-                "days": query_days,
-                "max_results": 15,
-            })
-        else:
+        if finnhub_covers_anomalies:
             logger.info("PM slot: skipping anomaly Tavily query — Finnhub AH news available")
+        else:
+            all_search_jobs.extend(
+                _anomaly_search_jobs(
+                    anomalies,
+                    run_slot=run_slot,
+                    today_et=today_et,
+                    query_days=query_days,
+                    finnhub_covers=False,
+                )
+            )
 
     for qobj in result.get("tavily_queries", []):
         if not isinstance(qobj, dict) or not qobj.get("query"):
@@ -1534,7 +1616,7 @@ def _main_body():
     # Issue #33: one core-holding cognitive-upgrade rotation query/day, appended
     # last so it only spends leftover Tavily budget (anomaly/geo/LLM queries above
     # take priority — this is a proactive fill-in, not a real signal yet).
-    rotation_job = _rotation_search_job(today_et)
+    rotation_job = _rotation_search_job(today_et, anomaly_tickers=set(anomaly_ticker_syms))
     if rotation_job:
         all_search_jobs.append(rotation_job)
         logger.info(f"Issue #33 rotation query: {rotation_job['_rotation_ticker']}")
@@ -1558,6 +1640,8 @@ def _main_body():
             start_date=job.get("start_date", search_start),
             end_date=job.get("end_date", search_end),
         )
+        if job.get("_anomaly_query"):
+            results = _drop_stale_dated_results(results, now=now_et, max_age_days=7)
         raw_results.extend(results)
 
     if raw_results:
@@ -1567,6 +1651,7 @@ def _main_body():
             anomaly_ticker_syms,
             wl["geo_keywords"],
             top_n=15,
+            now=now_et,
         )
 
         # Layer 2b — semantic ranking: supply-chain aware → top 10
