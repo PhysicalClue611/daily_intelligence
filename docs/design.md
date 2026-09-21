@@ -2,7 +2,7 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-08-13（issue #67/PR #68：主路径 `fetch_prices` 的 8d/2d `yf.download` 拉取期间压低 yfinance ERROR；日线缺价重试一次并按列合并，不整表覆盖。详见 §5.1 与文末变更记录）
+> **最后更新**：2026-09-21（issue #72/PR #73，已合并 `4a54d39`：Digitimes RSS；异动追因 query 前 3 大逐条；7 天围栏仅异动 job、相对 `now_et`。详见 §5.2 与文末变更记录）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -49,7 +49,7 @@ Daily Intelligence 是一套面向**个人主动投资者**的每日财经情报
       ┌─────────────────┼──────────────────────┐
       ▼                 ▼                       ▼
 fetch_prices        fetch_news            memory_context
-三层路由：           14 RSS + Guardian     (bridge REST)
+三层路由：           15 RSS + Guardian     (bridge REST)
 yfinance（主）       API（14源）           MemPalace
 → IBKR gateway       NYT/BBC/FT/CNBC      Layer B 持仓框架
 → Finnhub（fallback） Reuters/AP/WSJ等
@@ -272,7 +272,7 @@ yfinance 字段按时段选择：`preMarketPrice`（04:00-09:29）/ `regularMark
 
 `# FUTURE`：待 IBKR gateway 稳定后翻转优先级，改为 IBKR 全时段主力。代码中已用注释标出两处修改点。
 
-**新闻（RSS 14个源 + Guardian API）**：
+**新闻（RSS 15个源 + Guardian API）**：
 
 | 源 | 定位 |
 |---|---|
@@ -287,6 +287,7 @@ yfinance 字段按时段选择：`preMarketPrice`（04:00-09:29）/ `regularMark
 | Reuters（via Google News RSS） | 综合/财经，<1h 延迟 |
 | AP（via Google News RSS） | 综合新闻 |
 | WSJ（via Google News RSS） | 专业财经 |
+| Digitimes | 台湾/大陆半导体供应链贸易媒体（issue #72） |
 | Guardian API | 国际/财经/政治，结构化 JSON，20条/次 |
 
 过去 24h，按地缘政治关键词分类。Guardian API（`content.guardianapis.com/search`）fail-open，`GUARDIAN_API_KEY` 控制，结果合并进 RSS 统一时间排序。不可达：Politico（403）；Reuters/AP/WSJ 直连受阻，已通过 Google News 代理覆盖。
@@ -441,9 +442,10 @@ if not anomalies and not triggered_geo_topics:
 - `query_days = max(1, min(3, 距上次报告天数))`，周末 / 节假日后自动扩展窗口
 
 **搜索（条件触发）**：
-- 执行顺序：代码生成的异动查询（优先）→ LLM 建议查询 → 核心持仓认知提升轮询查询（最后，issue #33）
-- **认知提升轮询查询**（`_rotation_search_job()`，2026-07-08 issue #33）：现有搜索完全由异动/地缘触发，核心持仓（AMKR/INTC/NVDA/QCOM/TSLA）没异动的日子完全不会被主动查。新增每日按 `date.toordinal() % 标的数` 确定性轮询选中一个标的（无需状态文件），生成聚焦 Investment Operating Manual 第6节认知提升三条标准的查询，30天窗口，追加在其他查询之后——预算耗尽就自然被跳过，不抢占真实异动/地缘信号的额度。
-- search_depth：AM 异动查询用 advanced（2 credits）；PM slot 所有查询强制 basic（1 credit）；LLM 建议：异动 ticker advanced，地缘/宏观 basic
+- 执行顺序：代码生成的异动追因查询（优先）→ LLM 建议查询 → 核心持仓认知提升轮询查询（最后，issue #33）
+- **异动追因查询**（`_anomaly_search_jobs()`，issue #72）：按 `|change_pct|` 降序取前 3，每个 ticker 一条独立 basic query（`{ticker} stock surge|drop {pct}% premarket|afterhours reason {date}`），不再合并多标的、不再锚定 earnings。`days=min(query_days, 7)`。PM 且 Finnhub AH 新闻可用时跳过（旧规则保留）。搜完后 `_drop_stale_dated_results(now=now_et, max_age_days=7)` 只过滤这批结果；无 `published_date` 放行。Pass1 prompt 注入 `{anomaly_tickers_note}`，禁止再建议同名 ticker。
+- **认知提升轮询查询**（`_rotation_search_job()`，2026-07-08 issue #33）：核心持仓按 `date.toordinal() % N` 每天一只，30 天窗口，追加在其他查询之后。issue #72：候选 ticker 已在当天 `anomalies` 中则跳过（日志 `Issue #33 rotation skipped`）。**已知污染（issue #74，未改）**：rotation 命中仍与异动结果进入同一 `tavily_section`，Pass 2 可能拿 30 天窗内旧事实解释当日 [!]。
+- search_depth：异动/Pass1/rotation 均为 basic；PM+Finnhub 覆盖时跳过异动 Tavily
 - 每次调用前预检 budget_remaining ≥ credits_needed，不足则停止循环
 - max_results=12（原 8）
 - Tavily 断连自动 fallback SerpApi；两者均耗尽则跳过搜索继续生成基础报告
@@ -1257,3 +1259,13 @@ LLM 调用层的容错设计一直是"网络错误/5xx 重试，4xx 不重试"�
 **决策**：quiet 扩到主路径两次 download；日线缺价再拉一次，按列合并回第一帧（不整表覆盖，避免更差的 retry 丢掉 Finnhub 补不上的商品/FX）；取值必须列名对得上，防止坍缩单列把幸存者价格写到别的 ticker。
 
 **实现**：`scripts/fetch_prices.py`；测试 `scripts/test_fetch_prices_yfinance_noise.py` 10/10。两轮 review 后 squash `df36a78`，issue #67 关闭。无需重启 TG bot。
+
+## 变更记录追加：2026-09-21 — Digitimes RSS + 异动追因 query + 7 天围栏（issue #72/PR #73，已合并 `4a54d39`）
+
+**触发**：2026-09-21 AM INTC 盘前 +5.47% 正确标记异动，未检索到 Digitimes 英特尔-友达 Micro LED 包装新闻；Tavily 被 `INTC CL=F stock news earnings` 导向过时 Q2 财报；INTC 被异动/Pass1/rotation 各查一次。
+
+**实现**：Digitimes 加入 `RSS_FEEDS`；`_anomaly_search_jobs` 前 3 大 `|change_pct|` 各一条追因 query；7 天围栏只作用于 `_anomaly_query` job，年龄相对 `now_et`；rotation 与当天异动 ticker 去重；Pass1 `{anomaly_tickers_note}`。
+
+**Review**：初版围栏打在 pooled `score_and_filter`（砍 rotation 30 天窗）且用墙钟（FORCE_DATE 补跑误删）。已修。测试 `test_issue72_anomaly_search.py` 9/9。
+
+**未改**：rotation 命中仍进同一 `tavily_section`（issue #74）。
