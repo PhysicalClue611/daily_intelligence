@@ -32,6 +32,14 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-09-22，issue #76 / PR #77，已合并 `07e3bd1`）
+
+**PM 异动追因不再被 Finnhub 短路（issue #76 / PR #77，squash `07e3bd1`）**。2026-09-21 PM：INTC +11.86% 是全表最大异动，日志是 `PM slot: skipping anomaly Tavily query — Finnhub AH news available`，同时 Pass1 的 `anomaly_tickers_note` 和 rotation 都把 INTC 当成已覆盖，专属追因搜索为 0。这是 2026-05-12 的「PM 有 Finnhub AH 新闻就跳过异动 Tavily」（当时 3 个异动、人均约 13 条标题，验证过够用）撞上 issue #72 的去重。
+
+实现：① 删除短路和 `finnhub_covers`，AM/PM 都对前 3 大 `|change_pct|` 跑 `_anomaly_search_jobs()`。② `fetch_finnhub_news()` 每个 ticker 留最近 5 条再合并；`seen` 留在外层，且只记下实际留下的 5 条，避免先扫到、后被 cap 丢掉的标题把别的 ticker 的同一条稿件一起吞掉。③ `TAVILY_DAILY_LIMIT` 20→25。测试 `scripts/test_issue76_finnhub_skip.py` 4/4，`test_issue72_anomaly_search.py` 9/9。不改 `telegram_commands.py` 逻辑，按契约不重启 TG bot（常驻进程里的用量分母要等下次进程启动才变成 25）。
+
+---
+
 ## 当前系统状态（2026-09-21，issue #72 / PR #73，已合并 `4a54d39`）
 
 **异动归因搜索精度（issue #72 / PR #73，squash `4a54d39`）**。2026-09-21 AM 正确把 INTC 盘前 +5.47% 标为异动，但 Pass 2 只能引用 Sonar 泛化归因；真实驱动是 Digitimes 首发的英特尔-友达 Micro LED 先进封装。三处缺口：RSS 无台湾半导体贸易媒体；异动 query 是 `"{tickers} stock news earnings"` 且多标的合并；INTC 被异动 / Pass1 / rotation 各查一次。
@@ -549,7 +557,7 @@ OBSIDIAN_PATH="~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview
 
 ## Tavily 预算
 
-- 上限：20 credits/日，`finance_tavily_budget.json` 按 ET 日期自动重置（从 10→15→20 逐步调整）
+- 上限：25 credits/日，`finance_tavily_budget.json` 按 ET 日期自动重置（从 10→15→20→25 逐步调整，25 起于 issue #76）
 - Search：basic=1cr，advanced=2cr（已弃用，全部改 basic）；Extract：**5 URLs = 1 credit**（`math.ceil(n/5)`），最多 10 URLs = 2cr
 - 主报告：AM/PM 全 basic search（3-4cr）+ 1次 Extract（1-2cr）≈ 5-6cr；budget 不足时按层降级
 - TG 追问不消耗 Tavily（Sonar 内建搜索）
@@ -781,6 +789,7 @@ _Tavily: N/10_
 12. **真实成本核算**（issue #60 遗留缺口）：`gpt-5.6-luna` 与 `deepseek-v4-pro`/`deepseek-v4-flash` 的实际生产量级成本差异尚未核算，观察一段时间后可用 OR 账单核实
 13. **issue #67/PR #68 生产观察**（2026-08-13 起，主路径已并入 #63 的 quiet logger）：下次 AM/PM 后 `grep -E "possibly delisted|yfinance daily bulk" /tmp/daily_intelligence.log`——期望不再出现 yfinance `possibly delisted` ERROR；bulk 抖时可见 `yfinance daily bulk incomplete` WARNING（及可选 `retry recovered` INFO），报告仍发出。52 周路径仍走同一套 `_quiet_yfinance_logs()`
 14. **issue #72 生产观察**（2026-09-21 起）：Digitimes 触发命中率；前 3 大异动各一条 + rotation 去重后 Tavily 日消耗是否持平或下降；`anomaly fence: dropped` 与 `Issue #33 rotation skipped` 日志。
+14b. **issue #76 生产观察**（2026-09-22 起）：PM 日志不再出现 `skipping anomaly Tavily query`；前 3 大异动各有一条 afterhours reason query；`Finnhub news:` 行的条数约为「ticker 数 × 最多 5」而不是全局 15。日上限 25。
 15. **issue #74**（未实现）：rotation 30 天材料与异动证据同池，污染【价格异动】归因。改善方向见该 issue，不在 #72 范围。
 
 ---
