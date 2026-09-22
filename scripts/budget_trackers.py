@@ -27,7 +27,7 @@ from quota_store import load_quota, save_quota, remaining
 _PROJ_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
 
 BUDGET_PATH           = _PROJ_DIR / "finance_tavily_budget.json"
-TAVILY_DAILY_LIMIT     = 20
+TAVILY_DAILY_LIMIT     = 25
 SERPAPI_BUDGET_PATH    = _PROJ_DIR / "finance_serpapi_budget.json"
 SERPAPI_MONTHLY_LIMIT  = 250
 ADANOS_BUDGET_PATH     = _PROJ_DIR / "finance_adanos_budget.json"

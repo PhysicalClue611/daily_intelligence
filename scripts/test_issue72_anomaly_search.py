@@ -53,7 +53,6 @@ def test_anomaly_jobs_are_per_ticker_no_earnings_anchor():
     ]
     jobs = rf._anomaly_search_jobs(
         anomalies, run_slot="am", today_et=TODAY, query_days=2,
-        finnhub_covers=False,
     )
     queries = [j["query"] for j in jobs]
     assert len(jobs) == 3
@@ -69,23 +68,19 @@ def test_anomaly_jobs_are_per_ticker_no_earnings_anchor():
 def test_anomaly_jobs_cap_days_at_7():
     jobs = rf._anomaly_search_jobs(
         [_row("INTC", 5.47)], run_slot="am", today_et=TODAY,
-        query_days=30, finnhub_covers=False,
+        query_days=30,
     )
     assert jobs[0]["days"] == 7
 
 
-def test_anomaly_jobs_pm_afterhours_and_skip_when_finnhub():
+def test_anomaly_jobs_pm_afterhours_wording():
     jobs = rf._anomaly_search_jobs(
         [_row("INTC", -4.2)], run_slot="pm", today_et=TODAY,
-        query_days=1, finnhub_covers=False,
+        query_days=1,
     )
     assert "afterhours" in jobs[0]["query"]
     assert "drop" in jobs[0]["query"]
-    skipped = rf._anomaly_search_jobs(
-        [_row("INTC", -4.2)], run_slot="pm", today_et=TODAY,
-        query_days=1, finnhub_covers=True,
-    )
-    assert skipped == []
+    assert rf._anomaly_search_jobs([], run_slot="pm", today_et=TODAY, query_days=1) == []
 
 
 def test_rotation_skips_when_ticker_already_an_anomaly(caplog=None):
@@ -169,7 +164,7 @@ def test_anomaly_fence_uses_report_date_not_wall_clock():
 def test_anomaly_jobs_are_marked_for_fence():
     jobs = rf._anomaly_search_jobs(
         [_row("INTC", 5.47)], run_slot="am", today_et=TODAY,
-        query_days=2, finnhub_covers=False,
+        query_days=2,
     )
     assert jobs and all(j.get("_anomaly_query") for j in jobs)
 
@@ -179,7 +174,7 @@ def run():
         test_digitimes_feed_registered,
         test_anomaly_jobs_are_per_ticker_no_earnings_anchor,
         test_anomaly_jobs_cap_days_at_7,
-        test_anomaly_jobs_pm_afterhours_and_skip_when_finnhub,
+        test_anomaly_jobs_pm_afterhours_wording,
         test_rotation_skips_when_ticker_already_an_anomaly,
         test_pass1_prompt_tells_model_not_to_requery_anomalies,
         test_score_and_filter_keeps_rotation_window_hits,

@@ -531,9 +531,12 @@ def fetch_finnhub_news(tickers: list[str], hours: int = 24) -> str:
     from datetime import timezone
     today_s = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     from_s  = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d")
-    items: list[tuple[int, str]] = []
+    all_lines: list[tuple[int, str]] = []
+    # Cross-ticker dedup stays outside the per-ticker loop. Splitting `seen`
+    # per ticker would reprint the same Finnhub wire under every symbol.
     seen: set[str] = set()
     for ticker in tickers[:8]:
+        ticker_items: list[tuple[int, str]] = []
         try:
             r = None
             for _attempt in range(2):
@@ -549,11 +552,12 @@ def fetch_finnhub_news(tickers: list[str], hours: int = 24) -> str:
                         time.sleep(3)
                     else:
                         raise
+            local_seen: set[str] = set()
             for n in (r.json() or [])[:15]:
                 headline = (n.get("headline") or "").strip()
-                if not headline or headline in seen:
+                if not headline or headline in seen or headline in local_seen:
                     continue
-                seen.add(headline)
+                local_seen.add(headline)
                 ts = n.get("datetime", 0)
                 pub_et = datetime.fromtimestamp(ts, tz=ET).strftime("%m-%d %H:%M %Z") if ts else "?"
                 source  = n.get("source", "Finnhub")
@@ -561,16 +565,21 @@ def fetch_finnhub_news(tickers: list[str], hours: int = 24) -> str:
                 line = f"[{pub_et}][{ticker}] {headline} ({source})"
                 if summary:
                     line += f" — {summary}"
-                items.append((ts, line))
+                ticker_items.append((ts, line, headline))
             time.sleep(0.05)  # stay within 60 req/min
         except Exception as e:
             logger.warning(f"Finnhub news {ticker}: {e}")
-    if not items:
+            continue
+        ticker_items.sort(key=lambda x: x[0], reverse=True)
+        for ts, line, headline in ticker_items[:5]:
+            seen.add(headline)
+            all_lines.append((ts, line))
+    if not all_lines:
         return ""
-    items.sort(key=lambda x: x[0], reverse=True)
+    all_lines.sort(key=lambda x: x[0], reverse=True)
     lines = [f"## Finnhub 即时新闻（ticker定向，过去{hours}h，来源 Finnhub）"]
-    lines += [item[1] for item in items[:15]]
-    logger.info(f"Finnhub news: {len(items)} items for {len(tickers)} tickers")
+    lines += [item[1] for item in all_lines]
+    logger.info(f"Finnhub news: {len(all_lines)} items for {len(tickers)} tickers")
     return "\n".join(lines) + "\n\n"
 
 
