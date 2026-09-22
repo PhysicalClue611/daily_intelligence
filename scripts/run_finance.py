@@ -1275,10 +1275,9 @@ def _anomaly_search_jobs(
     run_slot: str,
     today_et: str,
     query_days: int,
-    finnhub_covers: bool,
 ) -> list[dict]:
     """One Tavily job per top-3 mover by |change_pct| (issue #72)."""
-    if not anomalies or finnhub_covers:
+    if not anomalies:
         return []
     top3 = sorted(anomalies, key=lambda r: abs(r.change_pct), reverse=True)[:3]
     jobs = []
@@ -1296,8 +1295,28 @@ def _anomaly_search_jobs(
             "days": days,
             "max_results": 15,
             "_anomaly_query": True,
+            "_anomaly_ticker": r.ticker,
         })
     return jobs
+
+
+def _anomaly_tickers_from_jobs(jobs: list[dict]) -> list[str]:
+    """Return only tickers that actually received a dedicated anomaly job."""
+    return list(dict.fromkeys(
+        job["_anomaly_ticker"]
+        for job in jobs
+        if job.get("_anomaly_ticker")
+    ))
+
+
+def _build_anomaly_tickers_note(covered_tickers: list[str]) -> str:
+    if not covered_tickers:
+        return ""
+    return (
+        "以下标的已被系统识别为今日异动并自动生成追因查询，不需要你重复建议同名 ticker 的查询："
+        + ", ".join(covered_tickers)
+        + "。Pass1 的 query 配额应优先给地缘/宏观话题或非异动个股。"
+    )
 
 
 def _rotation_search_job(today_et: str, anomaly_tickers: set[str] | None = None) -> dict | None:
@@ -1458,6 +1477,16 @@ def _main_body():
         query_days = 1
     logger.info(f"Query window: {query_days} day(s) since last report ({last_date})")
 
+    # Build these before Pass1 so its de-duplication note and the rotation query
+    # share the exact set of tickers that received a dedicated top-3 search.
+    anomaly_search_jobs = _anomaly_search_jobs(
+        anomalies,
+        run_slot=run_slot,
+        today_et=today_et,
+        query_days=query_days,
+    )
+    covered_anomaly_tickers = _anomaly_tickers_from_jobs(anomaly_search_jobs)
+
     # 6b. Finnhub ticker-specific news (free, no quota cost)
     # AM: anomaly tickers first + watchlist fill-up, cap 8, window = query_days * 24h (up to 48h)
     # PM: anomaly tickers only (AH movers matter most), cap 5, window = 8h (covers AH 4 PM–midnight)
@@ -1550,14 +1579,7 @@ def _main_body():
     # bypasses MemPalace). No-op most of the time until entries accumulate.
     calibration_notes = _load_recent_calibration_notes() if run_slot == "am" else ""
 
-    if anomaly_ticker_syms:
-        anomaly_tickers_note = (
-            "以下标的已被系统识别为今日异动并自动生成追因查询，不需要你重复建议同名 ticker 的查询："
-            + ", ".join(anomaly_ticker_syms)
-            + "。Pass1 的 query 配额应优先给地缘/宏观话题或非异动个股。"
-        )
-    else:
-        anomaly_tickers_note = ""
+    anomaly_tickers_note = _build_anomaly_tickers_note(covered_anomaly_tickers)
 
     prompt = USER_PROMPT_TEMPLATE.format(
         date=today_et,
@@ -1585,27 +1607,12 @@ def _main_body():
 
     # 8. Build search job list — all basic (Extract provides the depth)
     # AM anomaly: downgraded to basic (saves 1cr vs old advanced; Extract compensates)
-    # PM anomaly: skipped when Finnhub AH news available
-    all_search_jobs: list[dict] = []
+    # PM and AM anomaly jobs both run; Finnhub is supplemental context only.
+    all_search_jobs: list[dict] = list(anomaly_search_jobs)
 
     # Precise date range for Tavily (replaces days=N)
     search_start = last_date if last_date != "N/A（首次运行）" else None
     search_end   = today_et
-
-    if anomalies:
-        finnhub_covers_anomalies = run_slot == "pm" and bool(finnhub_news_section)
-        if finnhub_covers_anomalies:
-            logger.info("PM slot: skipping anomaly Tavily query — Finnhub AH news available")
-        else:
-            all_search_jobs.extend(
-                _anomaly_search_jobs(
-                    anomalies,
-                    run_slot=run_slot,
-                    today_et=today_et,
-                    query_days=query_days,
-                    finnhub_covers=False,
-                )
-            )
 
     for qobj in result.get("tavily_queries", []):
         if not isinstance(qobj, dict) or not qobj.get("query"):
@@ -1616,7 +1623,9 @@ def _main_body():
     # Issue #33: one core-holding cognitive-upgrade rotation query/day, appended
     # last so it only spends leftover Tavily budget (anomaly/geo/LLM queries above
     # take priority — this is a proactive fill-in, not a real signal yet).
-    rotation_job = _rotation_search_job(today_et, anomaly_tickers=set(anomaly_ticker_syms))
+    rotation_job = _rotation_search_job(
+        today_et, anomaly_tickers=set(covered_anomaly_tickers)
+    )
     if rotation_job:
         all_search_jobs.append(rotation_job)
         logger.info(f"Issue #33 rotation query: {rotation_job['_rotation_ticker']}")
