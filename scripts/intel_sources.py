@@ -552,11 +552,12 @@ def fetch_finnhub_news(tickers: list[str], hours: int = 24) -> str:
                         time.sleep(3)
                     else:
                         raise
+            local_seen: set[str] = set()
             for n in (r.json() or [])[:15]:
                 headline = (n.get("headline") or "").strip()
-                if not headline or headline in seen:
+                if not headline or headline in seen or headline in local_seen:
                     continue
-                seen.add(headline)
+                local_seen.add(headline)
                 ts = n.get("datetime", 0)
                 pub_et = datetime.fromtimestamp(ts, tz=ET).strftime("%m-%d %H:%M %Z") if ts else "?"
                 source  = n.get("source", "Finnhub")
@@ -564,13 +565,15 @@ def fetch_finnhub_news(tickers: list[str], hours: int = 24) -> str:
                 line = f"[{pub_et}][{ticker}] {headline} ({source})"
                 if summary:
                     line += f" — {summary}"
-                ticker_items.append((ts, line))
+                ticker_items.append((ts, line, headline))
             time.sleep(0.05)  # stay within 60 req/min
         except Exception as e:
             logger.warning(f"Finnhub news {ticker}: {e}")
             continue
         ticker_items.sort(key=lambda x: x[0], reverse=True)
-        all_lines.extend(ticker_items[:5])
+        for ts, line, headline in ticker_items[:5]:
+            seen.add(headline)
+            all_lines.append((ts, line))
     if not all_lines:
         return ""
     all_lines.sort(key=lambda x: x[0], reverse=True)

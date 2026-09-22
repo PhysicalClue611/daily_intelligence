@@ -411,7 +411,7 @@ Layer 3.5 — 信源置信度打标（issue #19，2026-06-30）
 | 场景 | 旧流程 | 新流程 |
 |---|---|---|
 | AM 有异动 | 1 advanced(2) + 3 basic(3) = **5cr** | 4 basic(4) + 1 extract(2) = **6cr**，但全文 |
-| PM 有异动 | 4 basic(4) = **4cr** | 3 basic(3) + 1 extract(2) = **5cr**，Finnhub 已覆盖异动层 |
+| PM 有异动 | 4 basic(4) = **4cr** | 最多 3 条异动 basic + Pass1/rotation + 1 extract。Finnhub 不再代替异动追因（issue #76） |
 | 仅 geo，无异动 | 3 basic(3) = **3cr** | 2 basic(2) + 1 extract(2) = **4cr** |
 
 在 25cr/日预算下（issue #76，2026-09-22，自 20 上调），全天 AM+PM 总消耗留有余量。PM 有异动时最多再增加 3 条 basic search。

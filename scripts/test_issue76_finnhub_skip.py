@@ -129,6 +129,50 @@ def test_finnhub_keeps_five_per_ticker_and_cross_ticker_dedup():
     assert "[INTC]" in intc_line
 
 
+def test_dedup_does_not_burn_a_headline_the_first_ticker_drops():
+    """INTC fetches SHARED but it ranks outside INTC's newest 5. QCOM's
+    newest item is the same headline and must still be injected."""
+    shared = "Shared wire outside first ticker top 5"
+    intc = []
+    for n in range(10):
+        intc.append({
+            "headline": shared if n == 7 else f"INTC only {n}",
+            "datetime": 1_800_000_000 - n,
+            "source": "Reuters",
+            "summary": "x",
+        })
+    qcom = [{
+        "headline": shared,
+        "datetime": 1_700_000_000,
+        "source": "Reuters",
+        "summary": "y",
+    }]
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def _get(url, params=None, timeout=None):
+        return _Resp(intc if params["symbol"] == "INTC" else qcom)
+
+    orig_get, orig_sleep, orig_key = ins.httpx.get, ins.time.sleep, ins.FINNHUB_API_KEY
+    ins.httpx.get = _get
+    ins.time.sleep = lambda *_a, **_k: None
+    ins.FINNHUB_API_KEY = "test-key"
+    try:
+        text = ins.fetch_finnhub_news(["INTC", "QCOM"], hours=8)
+    finally:
+        ins.httpx.get, ins.time.sleep, ins.FINNHUB_API_KEY = orig_get, orig_sleep, orig_key
+
+    assert text.count(shared) == 1, text
+    assert "[QCOM]" in next(ln for ln in text.splitlines() if shared in ln)
+    assert "INTC only 4" in text
+    assert "INTC only 5" not in text
+
+
 def test_tavily_daily_limit_is_25_and_remaining_uses_it():
     assert bt.TAVILY_DAILY_LIMIT == 25
     assert bt.budget_remaining({"used": 3}) == 22
@@ -140,6 +184,7 @@ def run():
     tests = [
         test_pm_finnhub_coverage_still_queues_top3_anomaly_jobs,
         test_finnhub_keeps_five_per_ticker_and_cross_ticker_dedup,
+        test_dedup_does_not_burn_a_headline_the_first_ticker_drops,
         test_tavily_daily_limit_is_25_and_remaining_uses_it,
     ]
     failed = []
