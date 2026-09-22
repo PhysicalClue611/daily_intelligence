@@ -534,6 +534,7 @@ def fetch_finnhub_news(tickers: list[str], hours: int = 24) -> str:
     items: list[tuple[int, str]] = []
     seen: set[str] = set()
     for ticker in tickers[:8]:
+        ticker_items: list[tuple[int, str]] = []
         try:
             r = None
             for _attempt in range(2):
@@ -561,15 +562,18 @@ def fetch_finnhub_news(tickers: list[str], hours: int = 24) -> str:
                 line = f"[{pub_et}][{ticker}] {headline} ({source})"
                 if summary:
                     line += f" — {summary}"
-                items.append((ts, line))
+                ticker_items.append((ts, line))
             time.sleep(0.05)  # stay within 60 req/min
         except Exception as e:
             logger.warning(f"Finnhub news {ticker}: {e}")
+            continue
+        ticker_items.sort(key=lambda x: x[0], reverse=True)
+        items.extend(ticker_items[:5])
     if not items:
         return ""
     items.sort(key=lambda x: x[0], reverse=True)
     lines = [f"## Finnhub 即时新闻（ticker定向，过去{hours}h，来源 Finnhub）"]
-    lines += [item[1] for item in items[:15]]
+    lines += [item[1] for item in items]
     logger.info(f"Finnhub news: {len(items)} items for {len(tickers)} tickers")
     return "\n".join(lines) + "\n\n"
 
@@ -649,5 +653,4 @@ def fetch_brave_news(tickers: list[str], geo_topics: list[str], budget: dict,
     lines += [item[1] for item in items[:12]]
     logger.info(f"Brave News: {len(items)} items for {len(queries)} queries")
     return "\n".join(lines) + "\n\n"
-
 
