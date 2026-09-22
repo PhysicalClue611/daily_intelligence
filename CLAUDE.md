@@ -32,6 +32,14 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-09-22，issue #76 / PR #79）
+
+**PM 异动追因覆盖 + Finnhub 公平截取**。AM/PM 现在都会为按 `|change_pct|` 排序的前 3 大异动生成独立 Tavily basic query；Finnhub 仅作为补充信息源，不再短路 PM 异动搜索。每个 anomaly job 带 `_anomaly_ticker`，Pass1 `{anomaly_tickers_note}` 与 issue #33 rotation 去重只使用实际生成 job 的 ticker 集合，而不是全量异动列表，因此第 4 名及以后异动仍可由 Pass1 或 rotation 搜索。
+
+`fetch_finnhub_news()` 保留跨 ticker headline 去重与单 ticker 原始 15 条上限，改为每 ticker 各取最近 5 条后再合并展示；AM 最多请求 8 个 ticker、PM 最多 5 个不变。`TAVILY_DAILY_LIMIT` 从 20 提至 25。回归测试覆盖 6 个 PM 异动、第四名 NVDA 不被误标覆盖、Finnhub 5×5 公平截取/跨 ticker 去重和预算常量；全仓库 99/99 测试通过。未改 issue #74 的 rotation 结果同池问题。
+
+---
+
 ## 当前系统状态（2026-09-21，issue #72 / PR #73，已合并 `4a54d39`）
 
 **异动归因搜索精度（issue #72 / PR #73，squash `4a54d39`）**。2026-09-21 AM 正确把 INTC 盘前 +5.47% 标为异动，但 Pass 2 只能引用 Sonar 泛化归因；真实驱动是 Digitimes 首发的英特尔-友达 Micro LED 先进封装。三处缺口：RSS 无台湾半导体贸易媒体；异动 query 是 `"{tickers} stock news earnings"` 且多标的合并；INTC 被异动 / Pass1 / rotation 各查一次。
@@ -497,7 +505,7 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
 10. LLM pass 1（deepseek-v4-flash）注入 price_table + RSS + finnhub_news + kb_section + triggered_geo_topics
     → 输出：{report_md, tavily_queries:[{query, search_depth, days, max_results}]}
     （网络/5xx 错误自动重试 2 次，间隔 2s/4s；4xx 和 JSON parse 不重试）
-11. 构建搜索任务列表：代码生成异动追因 query（`_anomaly_search_jobs`：前 3 大 `|change_pct|` 各一条 basic，PM+Finnhub 覆盖则跳过）→ Pass1 `tavily_queries` → issue #33 rotation（当天已是异动 ticker 则跳过）
+11. 构建搜索任务列表：代码生成异动追因 query（`_anomaly_search_jobs`：AM/PM 均为前 3 大 `|change_pct|` 各一条 basic；Finnhub 只作补充）→ Pass1 `tavily_queries` → issue #33 rotation（候选 ticker 已在实际 anomaly job 集合中才跳过）
 12. 顺序执行搜索任务，每次预检 budget；异动 job 搜完后 `_drop_stale_dated_results(..., now=now_et, max_age_days=7)`；Tavily 断连自动 fallback SerpApi
 13. 有搜索结果 → LLM pass 2（deepseek-v4-pro）合并生成最终报告（同样含 finnhub_news_section）
 14. PM slot：替换报告标题为「夜盘动向」
@@ -549,7 +557,7 @@ OBSIDIAN_PATH="~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview
 
 ## Tavily 预算
 
-- 上限：20 credits/日，`finance_tavily_budget.json` 按 ET 日期自动重置（从 10→15→20 逐步调整）
+- 上限：25 credits/日，`finance_tavily_budget.json` 按 ET 日期自动重置（从 10→15→20→25 逐步调整）
 - Search：basic=1cr，advanced=2cr（已弃用，全部改 basic）；Extract：**5 URLs = 1 credit**（`math.ceil(n/5)`），最多 10 URLs = 2cr
 - 主报告：AM/PM 全 basic search（3-4cr）+ 1次 Extract（1-2cr）≈ 5-6cr；budget 不足时按层降级
 - TG 追问不消耗 Tavily（Sonar 内建搜索）
@@ -780,7 +788,7 @@ _Tavily: N/10_
 11. **issue #60/PR #62 生产观察**（2026-08-05 起，已实施+已合并，见上方状态章节）：`tg_followup`/`report_pass2` 均已切至 `gpt-5.6-luna`+`reasoning.effort=high`，2026-08-04 当晚已用真实生产双跑验证过一次（质量优于旧模型，见上方状态章节完整记录）；后续观察 `grep "LLM tokens \[report_pass2/openai/gpt-5.6-luna\]\|Step 4 tokens \[openai/gpt-5.6-luna\]" /tmp/daily_intelligence.log /tmp/finance_telegram.log`，确认 `finish_reason=stop` 持续成立、`provider=OpenAI` 稳定路由（硬 pin 不允许 fallback，需要留意是否出现非429 4xx 导致的静默降级到 Pass1-only report_md，PR #62 review 已识别此风险并记入 `llm_client.py` 注释，未做代码修复）
 12. **真实成本核算**（issue #60 遗留缺口）：`gpt-5.6-luna` 与 `deepseek-v4-pro`/`deepseek-v4-flash` 的实际生产量级成本差异尚未核算，观察一段时间后可用 OR 账单核实
 13. **issue #67/PR #68 生产观察**（2026-08-13 起，主路径已并入 #63 的 quiet logger）：下次 AM/PM 后 `grep -E "possibly delisted|yfinance daily bulk" /tmp/daily_intelligence.log`——期望不再出现 yfinance `possibly delisted` ERROR；bulk 抖时可见 `yfinance daily bulk incomplete` WARNING（及可选 `retry recovered` INFO），报告仍发出。52 周路径仍走同一套 `_quiet_yfinance_logs()`
-14. **issue #72 生产观察**（2026-09-21 起）：Digitimes 触发命中率；前 3 大异动各一条 + rotation 去重后 Tavily 日消耗是否持平或下降；`anomaly fence: dropped` 与 `Issue #33 rotation skipped` 日志。
+14. **issue #72/#76 生产观察**（2026-09-21 起）：Digitimes 触发命中率；AM/PM 前 3 大异动各一条、Finnhub 仅补充、rotation 只与实际 anomaly job ticker 去重后 Tavily 日消耗；`anomaly fence: dropped` 与 `Issue #33 rotation skipped` 日志。
 15. **issue #74**（未实现）：rotation 30 天材料与异动证据同池，污染【价格异动】归因。改善方向见该 issue，不在 #72 范围。
 
 ---
