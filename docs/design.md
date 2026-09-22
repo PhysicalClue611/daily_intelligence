@@ -2,7 +2,7 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-09-21（issue #72/PR #73，已合并 `4a54d39`：Digitimes RSS；异动追因 query 前 3 大逐条；7 天围栏仅异动 job、相对 `now_et`。详见 §5.2 与文末变更记录）
+> **最后更新**：2026-09-22（issue #76：PM 不再因 Finnhub 跳过异动追因；Finnhub 每 ticker 最近 5 条；Tavily 日上限 25。issue #72 的 Digitimes / 前 3 大逐条 / 7 天围栏仍有效。）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -303,7 +303,7 @@ system prompt 注入 portfolio 快照实现个人化。~$0.005/次，fail-open�
 
 **防过时/防幻觉加固（issue #24，2026-07-02）**：Sonar 是搜索+合成模型，不是行情 feed，曾在同一份报告中与实时价格直接矛盾（声称 WTI 破 $100，实际价格 $68.58）。三重加固：① OR payload 加 `search_recency_filter: "day"`（实测确认 OpenRouter 会透传给 Perplexity，不会被静默丢弃），限制底层搜索只召回过去24小时发布的源；② 把 pipeline 中已经算好的 `price_table`（fetch_prices 输出）注入 system prompt 作为权威真实数据，要求若搜索结果与之冲突则以注入价格为准并明确标注冲突；③ prompt 要求每条具体断言必须带时间戳，若某话题无近 24 小时更新必须明说，不得拿旧信息冒充当前。`telegram_commands.py` 的 `_sonar_research()`（TG 追问流水线的 Sonar fallback，同模型同风险）同步加了 `search_recency_filter`。
 
-**Finnhub 即时新闻（step 6b，常态注入）**：`fetch_finnhub_news()` 对 watchlist 股票（异动标的优先，最多8个）调 Finnhub `/company-news`，时间窗口 `min(query_days×24, 48)h`，注入 Pass 1/Pass 2 prompt 的 RSS 与 Tavily 之间。免费，无配额，专注 ticker 级公司新闻，补充 RSS 的宏观视角。fail-open，单 ticker 失败不阻断整体。
+**Finnhub 即时新闻（step 6b，常态注入）**：`fetch_finnhub_news()` 对 watchlist 股票（异动标的优先，最多8个）调 Finnhub `/company-news`，时间窗口 `min(query_days×24, 48)h`（PM 调用点仍是 8h、最多 5 个异动 ticker）。每个 ticker 取最近 5 条再合并，headline 跨 ticker 去重（`seen` 在外层），不再把全体 ticker 混池后只留全局 15 条（issue #76）。单 ticker 原始拉取仍最多 15 条，摘要仍截 100 字。注入 Pass 1/Pass 2 prompt 的 RSS 与 Tavily 之间。免费，无配额。fail-open，单 ticker 失败不阻断整体。
 
 **FRED 流动性水位快照（step 6e，AM+PM，issue #26，2026-07-02）**：`fetch_liquidity_snapshot()` 拉取银行准备金（`WRESBAL`）、SOFR（`SOFR`）、ON RRP 授予利率（`RRPONTSYAWARD`，注意不是 `RRPONTSYD`——后者是隔多逆回购**交易量**不是利率，实测数值差异巨大才发现搭错）、TGA余额（`WTREGEN`），按 `Hermes/Daily Intelligence/市场见顶预警指标.md` 的阈值分类【正常/观察/警戒】，整体取最高档，折进现有 `social_sentiment_section` 注入槽（不新增模板变量）。SRF用量 FRED 无对应序列，不自动化，留作文档里的人工检查项。选型理由：FRED 是比 Sonar 搜索更可靠的精确数据源（呼应 issue #24 的教训——LLM 搜索对精确数值不可靠，能用结构化权威数据源就不该靠 LLM 猜）。Pass 2 prompt 新增分析要求第⑥条，约束 LLM 只能给出与档位匹配的克制建议，不得因此单独触发清仓建议。
 
@@ -414,7 +414,7 @@ Layer 3.5 — 信源置信度打标（issue #19，2026-06-30）
 | PM 有异动 | 4 basic(4) = **4cr** | 3 basic(3) + 1 extract(2) = **5cr**，Finnhub 已覆盖异动层 |
 | 仅 geo，无异动 | 3 basic(3) = **3cr** | 2 basic(2) + 1 extract(2) = **4cr** |
 
-在 20cr/日预算下，全天 AM+PM 总消耗 ≈ 11cr，余量充足。
+在 25cr/日预算下（issue #76，2026-09-22，自 20 上调），全天 AM+PM 总消耗留有余量。PM 有异动时最多再增加 3 条 basic search。
 
 ---
 
@@ -443,9 +443,9 @@ if not anomalies and not triggered_geo_topics:
 
 **搜索（条件触发）**：
 - 执行顺序：代码生成的异动追因查询（优先）→ LLM 建议查询 → 核心持仓认知提升轮询查询（最后，issue #33）
-- **异动追因查询**（`_anomaly_search_jobs()`，issue #72）：按 `|change_pct|` 降序取前 3，每个 ticker 一条独立 basic query（`{ticker} stock surge|drop {pct}% premarket|afterhours reason {date}`），不再合并多标的、不再锚定 earnings。`days=min(query_days, 7)`。PM 且 Finnhub AH 新闻可用时跳过（旧规则保留）。搜完后 `_drop_stale_dated_results(now=now_et, max_age_days=7)` 只过滤这批结果；无 `published_date` 放行。Pass1 prompt 注入 `{anomaly_tickers_note}`，禁止再建议同名 ticker。
+- **异动追因查询**（`_anomaly_search_jobs()`，issue #72）：按 `|change_pct|` 降序取前 3，每个 ticker 一条独立 basic query（`{ticker} stock surge|drop {pct}% premarket|afterhours reason {date}`），不再合并多标的、不再锚定 earnings。`days=min(query_days, 7)`。AM 与 PM 都执行，不再因 Finnhub AH 新闻跳过（issue #76）。搜完后 `_drop_stale_dated_results(now=now_et, max_age_days=7)` 只过滤这批结果；无 `published_date` 放行。Pass1 prompt 注入 `{anomaly_tickers_note}`，禁止再建议同名 ticker。
 - **认知提升轮询查询**（`_rotation_search_job()`，2026-07-08 issue #33）：核心持仓按 `date.toordinal() % N` 每天一只，30 天窗口，追加在其他查询之后。issue #72：候选 ticker 已在当天 `anomalies` 中则跳过（日志 `Issue #33 rotation skipped`）。**已知污染（issue #74，未改）**：rotation 命中仍与异动结果进入同一 `tavily_section`，Pass 2 可能拿 30 天窗内旧事实解释当日 [!]。
-- search_depth：异动/Pass1/rotation 均为 basic；PM+Finnhub 覆盖时跳过异动 Tavily
+- search_depth：异动/Pass1/rotation 均为 basic
 - 每次调用前预检 budget_remaining ≥ credits_needed，不足则停止循环
 - max_results=12（原 8）
 - Tavily 断连自动 fallback SerpApi；两者均耗尽则跳过搜索继续生成基础报告

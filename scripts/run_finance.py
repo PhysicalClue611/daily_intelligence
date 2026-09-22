@@ -1275,10 +1275,9 @@ def _anomaly_search_jobs(
     run_slot: str,
     today_et: str,
     query_days: int,
-    finnhub_covers: bool,
 ) -> list[dict]:
     """One Tavily job per top-3 mover by |change_pct| (issue #72)."""
-    if not anomalies or finnhub_covers:
+    if not anomalies:
         return []
     top3 = sorted(anomalies, key=lambda r: abs(r.change_pct), reverse=True)[:3]
     jobs = []
@@ -1298,6 +1297,22 @@ def _anomaly_search_jobs(
             "_anomaly_query": True,
         })
     return jobs
+
+
+def _queue_anomaly_search_jobs(
+    anomalies: list,
+    *,
+    run_slot: str,
+    today_et: str,
+    query_days: int,
+) -> list[dict]:
+    """Top-3 anomaly Tavily jobs. AM and PM both run them (issue #76)."""
+    return _anomaly_search_jobs(
+        anomalies,
+        run_slot=run_slot,
+        today_et=today_et,
+        query_days=query_days,
+    )
 
 
 def _rotation_search_job(today_et: str, anomaly_tickers: set[str] | None = None) -> dict | None:
@@ -1584,28 +1599,21 @@ def _main_body():
     llm_meta_p1 = result.get("_llm_meta", {})
 
     # 8. Build search job list — all basic (Extract provides the depth)
-    # AM anomaly: downgraded to basic (saves 1cr vs old advanced; Extract compensates)
-    # PM anomaly: skipped when Finnhub AH news available
+    # Anomaly jobs: top 3 by |change_pct|, AM and PM (issue #76 dropped the PM Finnhub skip)
     all_search_jobs: list[dict] = []
 
     # Precise date range for Tavily (replaces days=N)
     search_start = last_date if last_date != "N/A（首次运行）" else None
     search_end   = today_et
 
-    if anomalies:
-        finnhub_covers_anomalies = run_slot == "pm" and bool(finnhub_news_section)
-        if finnhub_covers_anomalies:
-            logger.info("PM slot: skipping anomaly Tavily query — Finnhub AH news available")
-        else:
-            all_search_jobs.extend(
-                _anomaly_search_jobs(
-                    anomalies,
-                    run_slot=run_slot,
-                    today_et=today_et,
-                    query_days=query_days,
-                    finnhub_covers=False,
-                )
-            )
+    all_search_jobs.extend(
+        _queue_anomaly_search_jobs(
+            anomalies,
+            run_slot=run_slot,
+            today_et=today_et,
+            query_days=query_days,
+        )
+    )
 
     for qobj in result.get("tavily_queries", []):
         if not isinstance(qobj, dict) or not qobj.get("query"):
