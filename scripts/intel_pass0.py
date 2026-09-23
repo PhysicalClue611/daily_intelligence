@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an issue #87 Pass 0 ledger in shadow or historical replay mode.
+"""Build an issue #87 Pass 0 intelligence snapshot in shadow or historical replay mode.
 
 Replay never imports the report entrypoint and has no report/Obsidian-write,
 Telegram, email, Tavily, or Pass 2 path. It writes only local archives.
@@ -42,7 +42,7 @@ def _move_from_row(row, multi: tuple[float | None, float | None], window_start: 
             "d3": d3, "d5": d5, "flags": flags, **({"window_start": window_start} if window_start else {})}
 
 
-def build_ledger(wl: dict, as_of: datetime, slot: str, *, price_rows: list = (),
+def build_intel_snapshot(wl: dict, as_of: datetime, slot: str, *, price_rows: list = (),
                  multiday_moves: dict | None = None, window_starts: dict[str, str] | None = None,
                  held: set[str] | None = None, weights: dict[str, float] | None = None,
                  replay: bool = False, only_tickers: list[str] | None = None,
@@ -68,24 +68,24 @@ def build_ledger(wl: dict, as_of: datetime, slot: str, *, price_rows: list = (),
             row["seen_before"] = collect.normalize_title(row["title"]) in previous[entity["ticker"]]
         if entity["ticker"] in alias_errors:
             entity["coverage"]["errors"].append(alias_errors[entity["ticker"]])
-    ledger = {"schema_version": 1, "date": as_of.astimezone(ET).date().isoformat(), "slot": slot,
+    intel_snapshot = {"schema_version": 1, "date": as_of.astimezone(ET).date().isoformat(), "slot": slot,
               "as_of": as_of.isoformat(), "replay": replay, "entities": entities, "macro_digest": macro}
-    path = (collect.archive_ledger(ledger, archive_root) if archive else
-            archive_root / ledger["date"].replace("-", "")[:6] /
-            f"{ledger['date']}-{slot}-ledger.json")
-    return ledger, path
+    path = (collect.archive_intel_snapshot(intel_snapshot, archive_root) if archive else
+            archive_root / intel_snapshot["date"].replace("-", "")[:6] /
+            f"{intel_snapshot['date']}-{slot}-intel-snapshot.json")
+    return intel_snapshot, path
 
 
-def render_summary(ledger: dict) -> str:
-    lines = [f"# Pass 0 ledger — {ledger['date']} {ledger['slot']}"]
-    for entity in ledger["entities"]:
+def render_summary(intel_snapshot: dict) -> str:
+    lines = [f"# Pass 0 intelligence snapshot — {intel_snapshot['date']} {intel_snapshot['slot']}"]
+    for entity in intel_snapshot["entities"]:
         coverage = entity["coverage"]
         lines.append(f"- {entity['ticker']}: {len(entity['items'])} items, "
                      f"move={entity['move']}; "
                      f"Finnhub={coverage['finnhub']}, Google News={coverage['google_news']}, "
                      f"RSS={coverage['rss']}, Guardian={coverage['guardian']}; "
                      f"errors={'; '.join(coverage['errors']) or 'none'}")
-    lines.append(f"\nMacro items: {len(ledger['macro_digest']['items'])}")
+    lines.append(f"\nMacro items: {len(intel_snapshot['macro_digest']['items'])}")
     return "\n".join(lines) + "\n"
 
 
@@ -243,13 +243,13 @@ def replay(date: str, slot: str, *, tickers: list[str] | None = None,
         days = 5 if d5 is not None and abs(d5) >= 20 else (3 if d3 is not None and abs(d3) >= 15 else 0)
         if days:
             window_starts[ticker] = _unexplained_publication_window(date, days, slot)[0]
-    ledger, path = build_ledger(wl, as_of, slot, price_rows=prices, replay=True,
+    intel_snapshot, path = build_intel_snapshot(wl, as_of, slot, price_rows=prices, replay=True,
                                 multiday_moves=multiday_moves, window_starts=window_starts,
                                 only_tickers=candidates, archive_root=archive_root)
-    ledger["replay_price_source"] = price_source
-    collect.archive_ledger(ledger, archive_root)
-    path.with_suffix(".md").write_text(render_summary(ledger), encoding="utf-8")
-    return ledger, path
+    intel_snapshot["replay_price_source"] = price_source
+    collect.archive_intel_snapshot(intel_snapshot, archive_root)
+    path.with_suffix(".md").write_text(render_summary(intel_snapshot), encoding="utf-8")
+    return intel_snapshot, path
 
 
 if __name__ == "__main__":

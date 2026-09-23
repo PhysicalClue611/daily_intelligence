@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from recent_coverage import build_recent_coverage_section
-from pass2_context import changed_background, current_state, read_previous_ledger_state
+from pass2_context import changed_background, current_state, read_previous_intel_snapshot_state
 
 
 class RecentCoverageTest(unittest.TestCase):
@@ -114,7 +114,7 @@ class BackgroundChangeTest(unittest.TestCase):
         self.assertEqual(changed_background("FRED 正常", current, {}), ("", ""))
         self.assertEqual(changed_background("", {}, current), ("", ""))
 
-    def test_previous_state_comes_from_latest_earlier_ledger(self):
+    def test_previous_state_comes_from_latest_earlier_intel_snapshot(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "202609").mkdir()
@@ -122,11 +122,16 @@ class BackgroundChangeTest(unittest.TestCase):
                    "context_state": {"liquidity_tier": "正常"}}
             new = {"as_of": "2026-09-18T08:30:00-04:00",
                    "context_state": {"liquidity_tier": "观察"}}
-            (root / "202609" / "2026-09-17-am-ledger.json").write_text(__import__('json').dumps(old))
-            (root / "202609" / "2026-09-18-am-ledger.json").write_text(__import__('json').dumps(new))
+            (root / "202609" / "2026-09-17-am-intel-snapshot.json").write_text(__import__('json').dumps(old))
+            (root / "202609" / "2026-09-18-am-intel-snapshot.json").write_text(__import__('json').dumps(new))
             from datetime import datetime
             before = datetime.fromisoformat("2026-09-18T09:00:00-04:00")
-            self.assertEqual(read_previous_ledger_state(root, before)["liquidity_tier"], "观察")
+            self.assertEqual(read_previous_intel_snapshot_state(root, before)["liquidity_tier"], "观察")
+            legacy = root / "202609" / "2026-09-18-am-ledger.json"
+            legacy.write_text(__import__('json').dumps(old))
+            self.assertEqual(read_previous_intel_snapshot_state(root, before)["liquidity_tier"], "观察")
+            (root / "202609" / "2026-09-18-am-intel-snapshot.json").unlink()
+            self.assertEqual(read_previous_intel_snapshot_state(root, before)["liquidity_tier"], "正常")
 
     def test_temporary_missing_sources_do_not_erase_previous_state(self):
         previous = {"liquidity_tier": "观察", "weights": {"INTC": 14.8},
@@ -154,7 +159,7 @@ class PromptContractTest(unittest.TestCase):
         import run_finance as rf
         template = rf.USER_PROMPT_TEMPLATE_P2
         self.assertIn("{recent_coverage_section}", template)
-        self.assertIn("{ledger_section}", template)
+        self.assertIn("{intel_snapshot_section}", template)
         self.assertNotIn("{news_text}", template)
         self.assertIn("## 持仓与观察标的", template)
         self.assertIn("一个主题一个段落", template)
@@ -166,7 +171,7 @@ class PromptContractTest(unittest.TestCase):
         self.assertNotIn("驱动因素归类（能力圈内外）", template)
         self.assertIn("FRED 档位变化或52周新高/新低，也允许写仓位小节", template)
         fields = {name: "" for _, name, _, _ in Formatter().parse(template) if name}
-        fields.update(date="2026-09-18", ledger_section="### INTC\n- [news.example] Intel new deal",
+        fields.update(date="2026-09-18", intel_snapshot_section="### INTC\n- [news.example] Intel new deal",
                       recent_coverage_section="## 近 5 个交易日已报道（同一标的）\n### INTC\n[09-17 PM] Intel update",
                       verifiable_signals_rule="## 可验证信号")
         rendered = template.format(**fields)

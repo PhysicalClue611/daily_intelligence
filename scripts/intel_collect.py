@@ -1,4 +1,4 @@
-"""Issue #87 Pass 0: free source collection and entity ledgers.
+"""Issue #87 Pass 0: free source collection and per-entity intelligence snapshots.
 
 Leaf module: no report entrypoint imports. Network failures are recorded per
 source; the old report path never depends on this shadow result.
@@ -289,18 +289,25 @@ def _atomic_json(path: Path, data: object) -> None:
         Path(tmp).unlink(missing_ok=True)
 
 
-def archive_ledger(ledger: dict, root: Path = ROOT / "archives") -> Path:
-    date, slot = ledger["date"], ledger["slot"]
+def archive_intel_snapshot(intel_snapshot: dict, root: Path = ROOT / "archives") -> Path:
+    date, slot = intel_snapshot["date"], intel_snapshot["slot"]
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) or slot not in ("am", "pm"):
-        raise ValueError("invalid ledger date or slot")
-    path = root / (date[:4] + date[5:7]) / f"{date}-{slot}-ledger.json"
-    _atomic_json(path, ledger)
+        raise ValueError("invalid intelligence snapshot date or slot")
+    path = root / (date[:4] + date[5:7]) / f"{date}-{slot}-intel-snapshot.json"
+    _atomic_json(path, intel_snapshot)
     return path
 
 
+def archived_intel_snapshot_paths(root: Path) -> list[Path]:
+    """Newest first, preferring the current name over a same-slot legacy archive."""
+    root = Path(root)
+    paths = [*root.glob("*/*-intel-snapshot.json"), *root.glob("*/*-ledger.json")]
+    return sorted(paths, key=lambda path: (path.name[:13], path.name.endswith("-intel-snapshot.json")),
+                  reverse=True)
+
+
 def previous_event_titles(root: Path, before: datetime, ticker: str) -> list[str]:
-    paths = sorted(root.glob("*/*-ledger.json"), reverse=True)
-    for path in paths:
+    for path in archived_intel_snapshot_paths(root):
         try:
             data = json.loads(path.read_text())
             if datetime.fromisoformat(data["as_of"]) >= before:

@@ -65,11 +65,11 @@ def write_context_log(
     triggered_geo_topics: list,
     sonar_macro_section: str,
     all_search_jobs: list,
-    ledger: dict | None = None,
+    intel_snapshot: dict | None = None,
 ) -> None:
     """Append structured context snapshot to monthly context log in Obsidian (gets mined).
     Contains: price table, geo-triggered news headlines, Sonar macro, search queries.
-    Does not duplicate archived ledger full text. Fail-open.
+    Does not duplicate archived intelligence snapshot full text. Fail-open.
     """
     try:
         ym_display = date_str[:7]
@@ -91,9 +91,9 @@ def write_context_log(
         lines.append(price_table.strip())
         lines.append("")
 
-        if ledger is not None:
-            lines.append("### 标的账本摘要")
-            for entity in ledger.get("entities", []):
+        if intel_snapshot is not None:
+            lines.append("### 标的情报摘要")
+            for entity in intel_snapshot.get("entities", []):
                 move = entity.get("move") or {}
                 coverage = entity.get("coverage") or {}
                 lead = (entity.get("items") or [{}])[0].get("title") or "无标题线索"

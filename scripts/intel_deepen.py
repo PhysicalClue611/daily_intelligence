@@ -75,16 +75,16 @@ def _direct_leads(entity: dict) -> list[tuple[str, dict]]:
     return leads
 
 
-def _search_bounds(ledger: dict, entity: dict) -> tuple[str, str]:
-    day = date.fromisoformat(ledger["date"])
+def _search_bounds(intel_snapshot: dict, entity: dict) -> tuple[str, str]:
+    day = date.fromisoformat(intel_snapshot["date"])
     move_start = (entity.get("move") or {}).get("window_start")
-    start = move_start or (day - timedelta(days=2 if ledger["slot"] == "am" else 1)).isoformat()
+    start = move_start or (day - timedelta(days=2 if intel_snapshot["slot"] == "am" else 1)).isoformat()
     return start, day.isoformat()
 
 
-def deepen_ledger(ledger: dict, *, search, extract, remaining) -> dict:
-    """Mutate a newly built ledger; at most 3 searches and 10 Extract URLs/2cr."""
-    selected = candidate_entities(ledger.get("entities", []))
+def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining) -> dict:
+    """Mutate a newly built intelligence snapshot; at most 3 searches and 10 Extract URLs/2cr."""
+    selected = candidate_entities(intel_snapshot.get("entities", []))
     jobs = []
     urls = []
     owners = {}
@@ -102,7 +102,7 @@ def deepen_ledger(ledger: dict, *, search, extract, remaining) -> dict:
                 continue
             direction = _move_direction(entity)
             query = f"Why is {entity.get('name') or ticker} stock {direction}"
-            start, end = _search_bounds(ledger, entity)
+            start, end = _search_bounds(intel_snapshot, entity)
             jobs.append({"ticker": ticker, "query": query, "start_date": start, "end_date": end})
             search_count += 1
             try:
@@ -156,9 +156,9 @@ def deepen_ledger(ledger: dict, *, search, extract, remaining) -> dict:
                                        "text": body[:1200],
                                        "confidence_tags": _source_confidence_tags(url, body, candidates, [])})
             status[entity["ticker"]] = "extracted"
-    ledger["deepen_status"] = status
-    ledger["search_jobs"] = jobs
-    ledger["search_count"] = search_count
-    ledger["extract_url_count"] = len(urls)
-    ledger["extract_success_count"] = len(successful_urls)
-    return ledger
+    intel_snapshot["deepen_status"] = status
+    intel_snapshot["search_jobs"] = jobs
+    intel_snapshot["search_count"] = search_count
+    intel_snapshot["extract_url_count"] = len(urls)
+    intel_snapshot["extract_success_count"] = len(successful_urls)
+    return intel_snapshot

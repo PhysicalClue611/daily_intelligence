@@ -1,4 +1,4 @@
-"""Offline contracts for issue #87 ledger-driven report switch."""
+"""Offline contracts for issue #87 intelligence snapshot report switch."""
 import sys
 import unittest
 import os
@@ -10,8 +10,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from intel_deepen import candidate_entities, deepen_ledger, resolve_article_url
-from intel_render import emergency_ledger, render_ledger_context, render_fallback_report, should_report, filter_social_lines
+from intel_deepen import candidate_entities, deepen_intel_snapshot, resolve_article_url
+from intel_render import emergency_intel_snapshot, render_intel_snapshot_context, render_fallback_report, should_report, filter_social_lines
 from fetch_news import _classify_topics
 
 
@@ -34,22 +34,22 @@ class SwitchTest(unittest.TestCase):
         import intel_pass0 as pass0
         with patch.object(pass0.collect, "resolve_aliases", return_value=({"INTC": ["Intel", "INTC"]}, {})), \
              patch.object(pass0.collect, "collect", return_value=([entity("INTC", d1=5)], {"items": [], "geo_topics_hit": []})), \
-             patch.object(pass0.collect, "archive_ledger", side_effect=AssertionError("early archive")):
-            ledger, path = pass0.build_ledger({"stocks": ["INTC"]},
+             patch.object(pass0.collect, "archive_intel_snapshot", side_effect=AssertionError("early archive")):
+            intel_snapshot, path = pass0.build_intel_snapshot({"stocks": ["INTC"]},
                                                datetime(2026, 9, 21, 12, tzinfo=timezone.utc),
                                                "am", archive=False, archive_root=Path("/tmp/scratch"))
-        self.assertEqual(ledger["entities"][0]["ticker"], "INTC")
-        self.assertEqual(path.name, "2026-09-21-am-ledger.json")
+        self.assertEqual(intel_snapshot["entities"][0]["ticker"], "INTC")
+        self.assertEqual(path.name, "2026-09-21-am-intel-snapshot.json")
 
     def test_geo_topic_matching_uses_boundaries(self):
         self.assertEqual(_classify_topics("Warner reports", "", {"war": ["war"]}), [])
         self.assertEqual(_classify_topics("War escalates", "", {"war": ["War"]}), ["war"])
 
-    def test_main_uses_ledger_and_only_active_llm_stages(self):
+    def test_main_uses_intel_snapshot_and_only_active_llm_stages(self):
         import run_finance as rf
         from fetch_prices import PriceRow
         row = PriceRow("INTC", "Intel", 100, 90, 11, 25, True, "$", slot="pm")
-        ledger = {"date": "2026-09-21", "slot": "pm", "as_of": "2026-09-21T23:00:00-04:00",
+        intel_snapshot = {"date": "2026-09-21", "slot": "pm", "as_of": "2026-09-21T23:00:00-04:00",
                   "entities": [entity("INTC", d1=11, items=[item("INTC Intel deal", "news.example", "https://news.example/a")])],
                   "macro_digest": {"items": [], "geo_topics_hit": []}}
         stages, prompts, written, alerts = [], [], [], []
@@ -65,14 +65,14 @@ class SwitchTest(unittest.TestCase):
             "load_budget": {"used": 0}, "load_serpapi_budget": {"used": 0},
             "fetch_prices": [row], "format_price_table": "INTC +11%",
             "_get_core_holding_tickers": [], "_get_portfolio_weights": {},
-            "build_ledger": (ledger, Path("/tmp/ledger.json")),
+            "build_intel_snapshot": (intel_snapshot, Path("/tmp/intel_snapshot.json")),
             "get_finance_context": "", "_sonar_macro_brief": "", "load_adanos_budget": {"used": 0},
             "_polymarket_brief": "", "_adanos_x_sentiment": "", "save_adanos_budget": None,
             "load_apify_budget": {"used": 0}, "_reddit_sentiment_brief": "", "save_apify_budget": None,
             "fetch_liquidity_snapshot": "", "build_recent_coverage_section": "",
-            "read_previous_ledger_state": {}, "_load_personal_context": "",
+            "read_previous_intel_snapshot_state": {}, "_load_personal_context": "",
             "_load_recent_calibration_notes": "", "write_sas_candidate_log": None,
-            "archive_ledger": None, "_mempalace_add_daily_drawer": None,
+            "archive_intel_snapshot": None, "_mempalace_add_daily_drawer": None,
             "write_context_log": None, "send_report": True, "send_telegram_report": True,
             "finance_footer": "",
         }
@@ -80,7 +80,7 @@ class SwitchTest(unittest.TestCase):
             stack.enter_context(patch.dict(os.environ, {"FINANCE_FORCE_DATE": "2026-09-21", "FINANCE_FORCE_SLOT": "pm"}))
             for name, value in replacements.items():
                 stack.enter_context(patch.object(rf, name, return_value=value))
-            stack.enter_context(patch.object(rf, "deepen_ledger", side_effect=lambda ledger, **_: ledger))
+            stack.enter_context(patch.object(rf, "deepen_intel_snapshot", side_effect=lambda intel_snapshot, **_: intel_snapshot))
             stack.enter_context(patch.object(rf, "call_llm", side_effect=fake_llm))
             stack.enter_context(patch.object(rf, "evaluate_am_calibration", side_effect=lambda *args: args[-1]))
             stack.enter_context(patch.object(rf, "write_report", side_effect=lambda *args: written.append(args[2])))
@@ -116,9 +116,9 @@ class SwitchTest(unittest.TestCase):
         landing = {rows[0]["url"]: None, rows[1]["url"]: "https://a.example/one",
                    rows[2]["url"]: "https://b.example/two"}
         extracted = []
-        ledger = {"date": "2026-09-21", "slot": "pm", "entities": [entity("INTC", d1=8, items=rows)]}
+        intel_snapshot = {"date": "2026-09-21", "slot": "pm", "entities": [entity("INTC", d1=8, items=rows)]}
         with patch("intel_deepen.resolve_article_url", side_effect=lambda url: landing[url]):
-            deepen_ledger(ledger, search=lambda *_: self.fail("searched despite direct leads"),
+            deepen_intel_snapshot(intel_snapshot, search=lambda *_: self.fail("searched despite direct leads"),
                           extract=lambda urls, _: extracted.extend(urls) or [], remaining=lambda: 25)
         self.assertEqual(extracted, ["https://a.example/one", "https://b.example/two"])
 
@@ -144,7 +144,7 @@ class SwitchTest(unittest.TestCase):
         other = item("INTC Intel results", "b.example", "https://b.example/3")
         entities = [entity("INTC", d1=10, items=[direct, duplicate, other])]
         entities += [entity(f"T{i}", d1=9-i) for i in range(4)]
-        ledger = {"date": "2026-09-21", "slot": "pm", "entities": entities,
+        intel_snapshot = {"date": "2026-09-21", "slot": "pm", "entities": entities,
                   "macro_digest": {"items": [], "geo_topics_hit": []}}
         searched, extracted = [], []
         def search(query, start, end):
@@ -153,7 +153,7 @@ class SwitchTest(unittest.TestCase):
         def extract(urls, query):
             extracted.extend(urls)
             return [{"url": url, "chunks": [{"content": "Full article about company."}]} for url in urls]
-        result = deepen_ledger(ledger, search=search, extract=extract, remaining=lambda: 25)
+        result = deepen_intel_snapshot(intel_snapshot, search=search, extract=extract, remaining=lambda: 25)
         self.assertLessEqual(len(searched), 3)
         self.assertLessEqual(len(extracted), 10)
         self.assertIn("https://a.example/1", extracted)
@@ -162,29 +162,29 @@ class SwitchTest(unittest.TestCase):
         self.assertEqual(len(result["entities"][0]["fulltext"]), 2)
 
     def test_budget_exhaustion_stops_spend_and_keeps_items(self):
-        ledger = {"date": "2026-09-21", "slot": "am", "entities": [entity("INTC", d1=6)],
+        intel_snapshot = {"date": "2026-09-21", "slot": "am", "entities": [entity("INTC", d1=6)],
                   "macro_digest": {"items": [], "geo_topics_hit": []}}
         with patch("intel_deepen.httpx.head", side_effect=AssertionError("no links")):
-            result = deepen_ledger(ledger, search=lambda *_: self.fail("spent search"),
+            result = deepen_intel_snapshot(intel_snapshot, search=lambda *_: self.fail("spent search"),
                                    extract=lambda *_: self.fail("spent extract"), remaining=lambda: 0)
         self.assertEqual(result["entities"][0]["items"], [])
         self.assertIn("budget", result["deepen_status"]["INTC"])
 
     def test_multiday_direction_uses_triggered_move(self):
         e = entity("INTC", d1=1.0, d3=-18.0)
-        ledger = {"date": "2026-09-21", "slot": "pm", "entities": [e]}
+        intel_snapshot = {"date": "2026-09-21", "slot": "pm", "entities": [e]}
         queries = []
-        deepen_ledger(ledger, search=lambda query, *_: queries.append(query) or [],
+        deepen_intel_snapshot(intel_snapshot, search=lambda query, *_: queries.append(query) or [],
                       extract=lambda *_: [], remaining=lambda: 25)
         self.assertIn("stock down", queries[0])
 
-    def test_emergency_ledger_preserves_multiday_publication_start(self):
+    def test_emergency_intel_snapshot_preserves_multiday_publication_start(self):
         row = SimpleNamespace(ticker="INTC", change_pct=1.0, is_anomaly=False)
-        ledger = emergency_ledger("2026-09-21", "pm", datetime(2026, 9, 21, tzinfo=timezone.utc),
+        intel_snapshot = emergency_intel_snapshot("2026-09-21", "pm", datetime(2026, 9, 21, tzinfo=timezone.utc),
                                   [row], {"stocks": ["INTC"]}, {"INTC": (-17.0, None)},
                                   "collector failure", window_starts={"INTC": "2026-09-14"})
         dates = []
-        deepen_ledger(ledger, search=lambda _q, start, end: dates.append((start, end)) or [],
+        deepen_intel_snapshot(intel_snapshot, search=lambda _q, start, end: dates.append((start, end)) or [],
                       extract=lambda *_: [], remaining=lambda: 25)
         self.assertEqual(dates, [("2026-09-14", "2026-09-21")])
 
@@ -200,18 +200,18 @@ class SwitchTest(unittest.TestCase):
         rows[1].is_anomaly = True
         self.assertEqual(_move_from_row(rows[1], (None, None))["flags"], ["anomaly"])
 
-    def test_ledger_render_caps_and_fallback_reports_coverage(self):
+    def test_intel_snapshot_render_caps_and_fallback_reports_coverage(self):
         rows = [item(f"INTC story {i}", f"s{i}.example", f"https://s{i}.example/x") for i in range(30)]
-        ledger = {"date": "2026-09-21", "slot": "pm", "entities": [entity("INTC", d1=8, items=rows), entity("NVDA", held=False)],
+        intel_snapshot = {"date": "2026-09-21", "slot": "pm", "entities": [entity("INTC", d1=8, items=rows), entity("NVDA", held=False)],
                   "macro_digest": {"items": [], "geo_topics_hit": []}}
-        text = render_ledger_context(ledger, {})
+        text = render_intel_snapshot_context(intel_snapshot, {})
         self.assertIn("INTC", text)
         self.assertNotIn("INTC story 25", text)
         self.assertIn("无异动观察标的：NVDA", text)
-        fallback = render_fallback_report(ledger, "夜盘收市速报")
+        fallback = render_fallback_report(intel_snapshot, "夜盘收市速报")
         self.assertIn("Finnhub 4", fallback)
         self.assertIn("INTC story 0", fallback)
-        self.assertTrue(should_report(ledger))
+        self.assertTrue(should_report(intel_snapshot))
         self.assertFalse(should_report({"entities": [entity("INTC")], "macro_digest": {"items": []}}))
         self.assertFalse(should_report({"entities": [entity("INTC")], "macro_digest": {"items": [item("generic", "x", "https://x/a")], "geo_topics_hit": []}}))
         self.assertTrue(should_report({"entities": [entity("INTC")], "macro_digest": {"items": [], "geo_topics_hit": ["Middle East"]}}))
@@ -225,8 +225,8 @@ class SwitchTest(unittest.TestCase):
                   for i in range(8)]
         exclusive = [item(f"Hormuz exclusive {i}", "news.example", f"https://news.example/e{i}")
                      for i in range(8)]
-        ledger = {"entities": [], "macro_digest": {"items": shared + exclusive}}
-        rendered = render_ledger_context(ledger, {"Iran": ["Iran"], "Hormuz": ["Hormuz"]})
+        intel_snapshot = {"entities": [], "macro_digest": {"items": shared + exclusive}}
+        rendered = render_intel_snapshot_context(intel_snapshot, {"Iran": ["Iran"], "Hormuz": ["Hormuz"]})
         self.assertIn("Hormuz exclusive 7", rendered)
         self.assertEqual(sum("Hormuz exclusive" in line for line in rendered.splitlines()), 8)
 
