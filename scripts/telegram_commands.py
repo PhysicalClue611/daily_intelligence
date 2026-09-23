@@ -738,7 +738,7 @@ def _followup_system() -> str:
     fw = _load_framework()
     base = (
         "你是 Daily Intelligence 财经情报助手。\n"
-        "实际数据来源：yfinance 实时价格、NYT/BBC/FT RSS 新闻、Parallel.ai 全文检索（Sonar/Exa fallback）。\n"
+        "实际数据来源：yfinance 实时价格、FT/CNBC/Reuters/Digitimes 等 RSS 新闻、Parallel.ai 全文检索（Sonar/Exa fallback）。\n"
         "严禁声称拥有未实现的能力（Bloomberg实时、SEC文件、期权监测等）。\n"
         "回答规则：\n"
         "1. 若问题包含具体事件前提（如【XX在某日大涨】），先用联网搜索核实该前提是否属实，再回答。\n"

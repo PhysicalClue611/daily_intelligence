@@ -49,10 +49,10 @@ Daily Intelligence 是一套面向**个人主动投资者**的每日财经情报
       ┌─────────────────┼──────────────────────┐
       ▼                 ▼                       ▼
 fetch_prices        fetch_news            memory_context
-三层路由：           15 RSS + Guardian     (bridge REST)
-yfinance（主）       API（14源）           MemPalace
-→ IBKR gateway       NYT/BBC/FT/CNBC      Layer B 持仓框架
-→ Finnhub（fallback） Reuters/AP/WSJ等
+三层路由：           7 RSS + Guardian      (bridge REST)
+yfinance（主）       API                   MemPalace
+→ IBKR gateway       FT/CNBC/Digitimes    Layer B 持仓框架
+→ Finnhub（fallback） Reuters(GN)等
 价格+异动检测
       │                 │                       │
       └─────────────────┼───────────────────────┘
@@ -272,23 +272,20 @@ yfinance 字段按时段选择：`preMarketPrice`（04:00-09:29）/ `regularMark
 
 `# FUTURE`：待 IBKR gateway 稳定后翻转优先级，改为 IBKR 全时段主力。代码中已用注释标出两处修改点。
 
-**新闻（RSS 15个源 + Guardian API）**：
+**新闻（RSS 7个源 + Guardian API）**：
 
 | 源 | 定位 |
 |---|---|
-| NYT Business/World/Politics | 财经综合 |
-| BBC Business/World | 财经/国际 |
 | FT World | 专业财经 |
 | CNBC | 快速财经/市场速报 |
 | MarketWatch | 市场数据驱动 |
 | Foreign Policy | 地缘战略深度 |
-| Al Jazeera | 中东/非西方视角 |
 | Seeking Alpha | 个股机构分析 |
 | Reuters（via Google News RSS） | 综合/财经，<1h 延迟 |
-| AP（via Google News RSS） | 综合新闻 |
-| WSJ（via Google News RSS） | 专业财经 |
 | Digitimes | 台湾/大陆半导体供应链贸易媒体（issue #72） |
 | Guardian API | 国际/财经/政治，结构化 JSON，20条/次 |
+
+**停用（issue #85）**：NYT Business/World/Politics、BBC Business/World、Al Jazeera、AP、WSJ（后两者经 Google News RSS）移入 `RSS_FEEDS_DISABLED`，不再抓取，URL 保留以便恢复。2026-09-23 实测这五个源占 RSS 总量 57%，与持仓/科技/宏观相关的只有约 10%；在子串匹配打地缘标签、每个话题桶只留最新 5 条的情况下，它们把持仓相关新闻挤出了 prompt。停用后地缘面由 FT、Reuters、Foreign Policy、Guardian API 和 Sonar 宏观快照覆盖。
 
 过去 24h，按地缘政治关键词分类。Guardian API（`content.guardianapis.com/search`）fail-open，`GUARDIAN_API_KEY` 控制，结果合并进 RSS 统一时间排序。不可达：Politico（403）；Reuters/AP/WSJ 直连受阻，已通过 Google News 代理覆盖。
 
