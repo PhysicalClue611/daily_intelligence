@@ -118,6 +118,7 @@ def test_pass1_prompt_tells_model_not_to_requery_anomalies():
         calibration_notes="",
         verifiable_signals_rule="",
         anomaly_tickers_note="以下标的已被系统识别为今日异动并自动生成追因查询，不需要你重复建议同名 ticker 的查询：INTC, CL=F",
+        unexplained_move_note="",
     )
     assert "INTC" in filled
     assert "不需要你重复建议同名 ticker" in filled

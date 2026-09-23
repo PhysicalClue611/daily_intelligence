@@ -43,13 +43,16 @@ import json
 import logging
 import math
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import httpx
 
-from fetch_prices import fetch_prices, format_price_table, get_anomalies, fetch_52week_stats
+from fetch_prices import (
+    fetch_prices, format_price_table, get_anomalies, fetch_52week_stats,
+    multiday_return_pct,
+)
 from fetch_news import fetch_rss, fetch_guardian_news, format_news_for_prompt
 from memory_context_finance import get_finance_context
 
@@ -966,6 +969,7 @@ USER_PROMPT_TEMPLATE = """今日日期（ET）：{date}
 - max_results 统一填 12
 - 对单个持仓 ticker 的个股查询，在 query 中加 site:stockanalysis.com 或 site:macrotrends.net 可显著提升数据密度（例："NVDA site:stockanalysis.com"）
 {anomaly_tickers_note}
+{unexplained_move_note}
 
 请输出以下JSON（不要附加任何其他文字）：
 {{
@@ -1319,6 +1323,174 @@ def _build_anomaly_tickers_note(covered_tickers: list[str]) -> str:
     )
 
 
+# Issue #80. Commodities, FX, and index ETFs never reached 15%/20% in the
+# 9-month backtest. AAOI is a watchlist observer, not an IB holding, and
+# its own 3-day >=15% rate was 51/186 — same thresholds would fire most weeks.
+# Same-day anomaly search still covers AAOI.
+_EXCLUDED_UNEXPLAINED_MOVE_TICKERS = frozenset({
+    "GC=F", "CL=F", "^TNX",
+    "USDCNY=X", "USDJPY=X", "DX-Y.NYB",
+    "QQQM", "VOO", "EWJ",
+    "AAOI",
+})
+
+
+def _closes_before_report(series, report_date):
+    """Daily closes strictly before report_date. Drops a stale 'today' bar."""
+    import pandas as pd
+    s = series.dropna()
+    if len(s) == 0:
+        return s
+    if getattr(s.index, "tz", None) is not None:
+        s = s.copy()
+        s.index = s.index.tz_convert("America/New_York").tz_localize(None)
+    report_ts = pd.Timestamp(report_date)
+    return s[s.index.normalize() < report_ts]
+
+
+def _compute_multiday_moves(
+    price_rows: list,
+    closes_daily: dict | None = None,
+    report_date=None,
+    slot: str = "pm",
+) -> dict[str, tuple[float | None, float | None]]:
+    """{ticker: (pct_3d, pct_5d)} for names this mechanism is allowed to chase.
+
+    None means that window does not have enough prior sessions. Do not fill
+    it from week_change_pct: that field still falls back to the oldest close
+    for the price table. No persisted 'already explained' flag.
+    """
+    out: dict[str, tuple[float | None, float | None]] = {}
+    for r in price_rows:
+        if r.ticker in _EXCLUDED_UNEXPLAINED_MOVE_TICKERS:
+            continue
+        if closes_daily and report_date is not None and r.ticker in closes_daily:
+            pre = _closes_before_report(closes_daily[r.ticker], report_date)
+            if slot == "am":
+                if len(pre) < 2:
+                    continue
+                numerator = float(pre.iloc[-1])
+                before = pre.iloc[:-1]
+            else:
+                numerator = float(r.price)
+                before = pre
+            pct_3d = multiday_return_pct(numerator, before, 3, allow_short=False)
+            pct_5d = multiday_return_pct(numerator, before, 5, allow_short=False)
+        else:
+            pct_3d = getattr(r, "change_3d_pct", None)
+            pct_5d = getattr(r, "change_5d_pct", None)
+            pct_3d = None if pct_3d is None else float(pct_3d)
+            pct_5d = None if pct_5d is None else float(pct_5d)
+        out[r.ticker] = (pct_3d, pct_5d)
+    return out
+
+
+def _session_anchor(today_et: str, sessions_back: int):
+    """Date of the close `sessions_back` NYSE sessions before today_et."""
+    today = datetime.strptime(today_et, "%Y-%m-%d").date()
+    try:
+        import exchange_calendars as xcals
+        nyse = xcals.get_calendar("XNYS")
+        start = today - timedelta(days=sessions_back * 3 + 14)
+        sessions = nyse.sessions_in_range(str(start), str(today - timedelta(days=1)))
+        if len(sessions) >= sessions_back:
+            return sessions[-sessions_back].date()
+    except Exception as e:
+        logger.warning(f"NYSE session walk failed ({e}); using a longer calendar fallback")
+    return today - timedelta(days=sessions_back + 4)
+
+
+def _unexplained_publication_window(today_et: str, window_days: int, slot: str) -> tuple[str, str, int]:
+    """Published-date window covering the move's first session plus 2 calendar days.
+
+    AM's numerator is the previous close, so its anchor is one session further
+    back than the same window on a PM run. query_days is not an input: capping
+    by the gap since the last report is what dropped the 09-21 catalyst.
+    """
+    sessions_back = window_days + (1 if slot == "am" else 0)
+    anchor = _session_anchor(today_et, sessions_back)
+    start = anchor - timedelta(days=2)
+    end = datetime.strptime(today_et, "%Y-%m-%d").date()
+    days = max((end - start).days, window_days + 2)
+    return start.isoformat(), end.isoformat(), days
+
+
+def _job_search_bounds(job: dict, default_start, default_end, default_days):
+    """Bounds the search loop actually sends. A job key wins over the default."""
+    return (
+        job.get("start_date", default_start),
+        job.get("end_date", default_end),
+        job.get("days", default_days),
+    )
+
+
+def _should_skip_no_signal(has_anomaly: bool, geo_topics, unexplained_jobs) -> bool:
+    """Quiet same-day book still runs when a multi-day move needs a catalyst query."""
+    return not has_anomaly and not geo_topics and not unexplained_jobs
+
+
+def _unexplained_move_search_jobs(
+    price_rows: list,
+    multiday_moves: dict,
+    covered_tickers: set[str],
+    run_slot: str,
+    today_et: str,
+    query_days: int,
+    max_jobs: int = 2,
+) -> list[dict]:
+    """Catalyst queries for multi-day moves today's anomaly jobs did not cover.
+
+    Fires even when that ticker's same-day change is under the anomaly
+    threshold. 3-day >= 15% wins over 5-day >= 20%. At most max_jobs per run.
+    `query_days` is accepted and ignored: the published-date window is the
+    move plus a 2-day buffer, not the gap since the last report.
+    """
+    del query_days
+    candidates = []
+    for r in price_rows:
+        if r.ticker in covered_tickers or r.ticker in _EXCLUDED_UNEXPLAINED_MOVE_TICKERS:
+            continue
+        pct_3d, pct_5d = multiday_moves.get(r.ticker, (None, None))
+        if pct_3d is not None and abs(pct_3d) >= 15.0:
+            candidates.append((r.ticker, 3, pct_3d))
+        elif pct_5d is not None and abs(pct_5d) >= 20.0:
+            candidates.append((r.ticker, 5, pct_5d))
+    candidates.sort(key=lambda c: abs(c[2]), reverse=True)
+    jobs = []
+    for ticker, window_days, pct in candidates[:max_jobs]:
+        direction = "surged" if pct > 0 else "dropped"
+        query = (
+            f"{ticker} stock {direction} {abs(pct):.1f}% over {window_days} "
+            f"trading days reason catalyst {today_et}"
+        )
+        start_date, end_date, days = _unexplained_publication_window(
+            today_et, window_days, run_slot,
+        )
+        jobs.append({
+            "query": query,
+            "search_depth": "basic",
+            "days": days,
+            "start_date": start_date,
+            "end_date": end_date,
+            "max_results": 15,
+            "_unexplained_move_ticker": ticker,
+        })
+    if jobs:
+        names = ", ".join(j["_unexplained_move_ticker"] for j in jobs)
+        logger.info(f"Issue #80 unexplained-move queries ({run_slot}): {names}")
+    return jobs
+
+
+def _build_unexplained_move_note(covered_tickers: list[str]) -> str:
+    if not covered_tickers:
+        return ""
+    return (
+        "以下标的近3日或5日累计涨跌已超过阈值，系统已自动生成追因查询，不需要你重复建议同名 ticker 的查询："
+        + ", ".join(covered_tickers)
+        + "。"
+    )
+
+
 def _rotation_search_job(today_et: str, anomaly_tickers: set[str] | None = None) -> dict | None:
     """Pick one core holding for today via date.toordinal() % N — self-correcting
     if the holding list changes, no persisted state to go stale."""
@@ -1456,8 +1628,35 @@ def _main_body():
     geo_topics_str = ", ".join(triggered_geo_topics) if triggered_geo_topics else "（无）"
     logger.info(f"Triggered geo topics: {geo_topics_str}")
 
-    if not has_anomaly and not triggered_geo_topics:
-        logger.info("No price anomalies, no geo/macro RSS hits — skipping")
+    # 7. Query window, then anomaly jobs and multi-day jobs. The skip below
+    # has to see the multi-day jobs; a quiet same-day book can still carry one.
+    last_date = get_last_report_date()
+    try:
+        last_dt = datetime.strptime(last_date, "%Y-%m-%d").date()
+        query_days = max(1, min(3, (datetime.now(ET).date() - last_dt).days + 1))
+    except (ValueError, TypeError):
+        query_days = 1
+    logger.info(f"Query window: {query_days} day(s) since last report ({last_date})")
+
+    anomaly_search_jobs = _anomaly_search_jobs(
+        anomalies,
+        run_slot=run_slot,
+        today_et=today_et,
+        query_days=query_days,
+    )
+    covered_anomaly_tickers = _anomaly_tickers_from_jobs(anomaly_search_jobs)
+    multiday_moves = _compute_multiday_moves(price_rows, slot=run_slot)
+    unexplained_jobs = _unexplained_move_search_jobs(
+        price_rows,
+        multiday_moves,
+        covered_tickers=set(covered_anomaly_tickers),
+        run_slot=run_slot,
+        today_et=today_et,
+        query_days=query_days,
+    )
+
+    if _should_skip_no_signal(has_anomaly, triggered_geo_topics, unexplained_jobs):
+        logger.info("No price anomalies, no geo/macro RSS hits, no multi-day move — skipping")
         sys.exit(0)
 
     # 6. Fetch personal knowledge base context (fail-open)
@@ -1467,25 +1666,6 @@ def _main_body():
         geo_topics=list(wl["geo_keywords"].keys()),
     )
     kb_section = f"\n## 个人知识库上下文\n{kb_context}\n" if kb_context else ""
-
-    # 7. Compute query window (needed by 6b and LLM prompt)
-    last_date = get_last_report_date()
-    try:
-        last_dt = datetime.strptime(last_date, "%Y-%m-%d").date()
-        query_days = max(1, min(3, (datetime.now(ET).date() - last_dt).days + 1))
-    except (ValueError, TypeError):
-        query_days = 1
-    logger.info(f"Query window: {query_days} day(s) since last report ({last_date})")
-
-    # Build these before Pass1 so its de-duplication note and the rotation query
-    # share the exact set of tickers that received a dedicated top-3 search.
-    anomaly_search_jobs = _anomaly_search_jobs(
-        anomalies,
-        run_slot=run_slot,
-        today_et=today_et,
-        query_days=query_days,
-    )
-    covered_anomaly_tickers = _anomaly_tickers_from_jobs(anomaly_search_jobs)
 
     # 6b. Finnhub ticker-specific news (free, no quota cost)
     # AM: anomaly tickers first + watchlist fill-up, cap 8, window = query_days * 24h (up to 48h)
@@ -1580,6 +1760,9 @@ def _main_body():
     calibration_notes = _load_recent_calibration_notes() if run_slot == "am" else ""
 
     anomaly_tickers_note = _build_anomaly_tickers_note(covered_anomaly_tickers)
+    unexplained_move_note = _build_unexplained_move_note(
+        [j["_unexplained_move_ticker"] for j in unexplained_jobs]
+    )
 
     prompt = USER_PROMPT_TEMPLATE.format(
         date=today_et,
@@ -1601,6 +1784,7 @@ def _main_body():
         calibration_notes=calibration_notes,
         verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P1 if run_slot == "am" else "",
         anomaly_tickers_note=anomaly_tickers_note,
+        unexplained_move_note=unexplained_move_note,
     )
     result = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
     llm_meta_p1 = result.get("_llm_meta", {})
@@ -1608,7 +1792,10 @@ def _main_body():
     # 8. Build search job list — all basic (Extract provides the depth)
     # AM anomaly: downgraded to basic (saves 1cr vs old advanced; Extract compensates)
     # PM and AM anomaly jobs both run; Finnhub is supplemental context only.
+    # Priority: anomaly, then multi-day moves that were not in that top 3,
+    # then Pass 1's own queries, then issue #33 rotation.
     all_search_jobs: list[dict] = list(anomaly_search_jobs)
+    all_search_jobs.extend(unexplained_jobs)
 
     # Precise date range for Tavily (replaces days=N)
     search_start = last_date if last_date != "N/A（首次运行）" else None
@@ -1641,13 +1828,16 @@ def _main_body():
         if budget_remaining(budget) < 1:
             logger.info("Tavily budget exhausted, stopping search")
             break
+        start_date, end_date, days = _job_search_bounds(
+            job, search_start, search_end, query_days,
+        )
         results = _do_search(
             job["query"], budget, serpapi_budget,
-            days=job.get("days", query_days),
+            days=days,
             search_depth="basic",
             max_results=job.get("max_results", 12),
-            start_date=job.get("start_date", search_start),
-            end_date=job.get("end_date", search_end),
+            start_date=start_date,
+            end_date=end_date,
         )
         if job.get("_anomaly_query"):
             results = _drop_stale_dated_results(results, now=now_et, max_age_days=7)
