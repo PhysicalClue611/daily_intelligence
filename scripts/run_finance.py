@@ -386,8 +386,9 @@ def _drop_stale_dated_results(
 ) -> list[dict]:
     """Drop dated hits older than max_age_days relative to `now`.
 
-    Used only on anomaly-attribution searches (issue #72). Undated results
-    pass through. Age is measured against the report clock, not wall clock.
+    Applied to anomaly-attribution and unexplained multi-day queries
+    (issues #72 and #82). Undated results pass through. Age is measured
+    against the report clock, not wall clock.
     """
     kept = []
     dropped = 0
@@ -409,6 +410,131 @@ def _drop_stale_dated_results(
     if dropped:
         logger.info(f"anomaly fence: dropped {dropped} stale (>{max_age_days}d) result(s)")
     return kept
+
+
+# Issue #82. Open-discovery hits still compete in score_and_filter.
+# Anomaly (max 3) and unexplained-move (max 2) tickers each keep one Extract
+# URL chosen inside their own result subset. Tavily Extract accepts up to 20
+# URLs per request; this code still sends at most 10 per call (2 credits).
+# A 15-URL open pool therefore takes a second open batch. Reserved URLs go
+# out first so a short budget still extracts the must-answer tickers.
+OPEN_POOL_PRESCREEN_TOP_N = 25
+OPEN_POOL_SEMANTIC_TOP_N = 15
+
+
+def _source_quality_adjustment(
+    url: str,
+    published_date: str,
+    now: datetime,
+) -> tuple[float, datetime | None]:
+    """domain_bonus + recency_bonus + video_penalty. No keyword term."""
+    domain = url.split("/")[2] if "//" in url else ""
+    domain_bonus = 0.15 if any(d in domain for d in _TRUSTED_DOMAINS) else 0.0
+    video_penalty = -0.08 if url and _VIDEO_PATH_RE.search(url) else 0.0
+    recency_bonus = 0.0
+    pub_dt = None
+    if published_date:
+        try:
+            from dateutil import parser as _dp
+            pub_dt = _dp.parse(published_date).astimezone(ET)
+            age_h = (now - pub_dt).total_seconds() / 3600
+            recency_bonus = 0.10 if age_h <= 24 else (0.05 if age_h <= 72 else 0.0)
+        except Exception:
+            pass
+    return domain_bonus + recency_bonus + video_penalty, pub_dt
+
+
+def _reserved_candidate_score(result: dict, now: datetime) -> float:
+    url = result.get("url") or ""
+    adjustment, _pub_dt = _source_quality_adjustment(
+        url, result.get("published_date") or "", now,
+    )
+    return float(result.get("score") or 0) + adjustment
+
+
+def _select_reserved_results(
+    raw_results: list[dict],
+    must_answer_tickers: list[str],
+    now: datetime | None = None,
+) -> dict[str, dict]:
+    """One best hit per must-answer ticker, scored only inside that ticker.
+
+    Relevance is already decided by the dedicated query. Keyword bonus is
+    not applied. An empty subset reserves nothing.
+    """
+    if now is None:
+        now = datetime.now(ET)
+    reserved: dict[str, dict] = {}
+    for ticker in must_answer_tickers:
+        if not ticker or ticker in reserved:
+            continue
+        subset = [
+            r for r in raw_results
+            if r.get("_source_ticker") == ticker and r.get("url")
+        ]
+        if not subset:
+            continue
+        reserved[ticker] = max(subset, key=lambda r: _reserved_candidate_score(r, now))
+    return reserved
+
+
+def _plan_reserved_and_open(
+    raw_results: list[dict],
+    must_answer_tickers: list[str],
+    anomaly_tickers: list[str],
+    geo_keywords: dict,
+    now: datetime,
+) -> tuple[dict[str, dict], list[dict]]:
+    """Reserve must-answer hits, then rank everything else for the open pool."""
+    reserved = _select_reserved_results(raw_results, must_answer_tickers, now=now)
+    reserved_urls = {r["url"] for r in reserved.values()}
+    open_input = [r for r in raw_results if r.get("url") not in reserved_urls]
+    prescreened = score_and_filter(
+        open_input,
+        anomaly_tickers,
+        geo_keywords,
+        top_n=OPEN_POOL_PRESCREEN_TOP_N,
+        now=now,
+    )
+    return reserved, prescreened
+
+
+def _annotate_job_results(job: dict, results: list[dict], now: datetime) -> list[dict]:
+    """7-day fence for must-answer jobs, then stamp `_source_ticker`."""
+    if job.get("_anomaly_query") or job.get("_unexplained_move_ticker"):
+        results = _drop_stale_dated_results(results, now=now, max_age_days=7)
+    source_ticker = job.get("_anomaly_ticker") or job.get("_unexplained_move_ticker")
+    for result in results:
+        result["_source_ticker"] = source_ticker
+    return results
+
+
+def _extract_url_batches(urls: list[str], batch_size: int = 10) -> list[list[str]]:
+    clean: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        if url and url not in seen:
+            seen.add(url)
+            clean.append(url)
+    if not clean:
+        return []
+    return [clean[i:i + batch_size] for i in range(0, len(clean), batch_size)]
+
+
+def _extract_reserved_then_open(
+    reserved_urls: list[str],
+    open_urls: list[str],
+    query: str,
+    budget: dict,
+    extract_fn=None,
+) -> list[dict]:
+    """Extract reserved URLs first, then the open pool, 10 URLs per call."""
+    extract_fn = extract_fn or tavily_extract
+    extracted: list[dict] = []
+    batches = _extract_url_batches(reserved_urls) + _extract_url_batches(open_urls)
+    for batch in batches:
+        extracted.extend(extract_fn(batch, query, budget) or [])
+    return extracted
 
 
 def score_and_filter(
@@ -462,26 +588,13 @@ def score_and_filter(
         seen.add(url)
 
         s = float(r.get("score") or 0)
-        domain = url.split("/")[2] if "//" in url else ""
-        domain_bonus = 0.15 if any(d in domain for d in _TRUSTED_DOMAINS) else 0
-        video_penalty = -0.08 if _VIDEO_PATH_RE.search(url) else 0
-
-        recency_bonus = 0.0
-        pub_dt = None
         pub = r.get("published_date", "")
-        if pub:
-            try:
-                from dateutil import parser as _dp
-                pub_dt = _dp.parse(pub).astimezone(ET)
-                age_h = (now - pub_dt).total_seconds() / 3600
-                recency_bonus = 0.10 if age_h <= 24 else (0.05 if age_h <= 72 else 0)
-            except Exception:
-                pass
+        adjustment, pub_dt = _source_quality_adjustment(url, pub, now)
 
         text = (r.get("title", "") + " " + (r.get("content") or "")).lower()
         kw_bonus = 0.05 * sum(1 for k in keywords if k and k in text)
 
-        scored.append((s + domain_bonus + recency_bonus + kw_bonus + video_penalty, r, pub_dt))
+        scored.append((s + adjustment + kw_bonus, r, pub_dt))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -1839,39 +1952,54 @@ def _main_body():
             start_date=start_date,
             end_date=end_date,
         )
-        if job.get("_anomaly_query"):
-            results = _drop_stale_dated_results(results, now=now_et, max_age_days=7)
+        results = _annotate_job_results(job, results, now_et)
         raw_results.extend(results)
 
+    reserved_results: dict[str, dict] = {}
     if raw_results:
-        # Layer 2a — Script pre-screen: score + deduplicate → top 15 candidates
-        prescreened = score_and_filter(
+        # Layer 2 — reserved must-answer slots, then open-pool ranking.
+        # keyword_bonus still ranks geopolitics / rotation. It no longer
+        # decides whether an anomaly or unexplained-move ticker is seen.
+        must_answer_tickers = (
+            [j["_anomaly_ticker"] for j in anomaly_search_jobs if j.get("_anomaly_ticker")]
+            + [j["_unexplained_move_ticker"] for j in unexplained_jobs if j.get("_unexplained_move_ticker")]
+        )
+        reserved_results, prescreened = _plan_reserved_and_open(
             raw_results,
+            must_answer_tickers,
             anomaly_ticker_syms,
             wl["geo_keywords"],
-            top_n=15,
-            now=now_et,
+            now_et,
         )
+        if reserved_results:
+            logger.info(
+                "Issue #82 reserved extract slots: "
+                + ", ".join(reserved_results)
+            )
 
-        # Layer 2b — semantic ranking: supply-chain aware → top 10
-        # Considers upstream/downstream/macro, not just direct ticker mentions
+        # Layer 2b — semantic ranking of the open pool only → about 15
         filtered, sem_filter_meta = _semantic_relevance_filter(
             prescreened,
             anomaly_ticker_syms,
             list(wl["geo_keywords"].keys()),
             portfolio_tickers=wl["stocks"],
-            top_n=10,
+            top_n=OPEN_POOL_SEMANTIC_TOP_N,
         )
 
-        # Layer 3 — Extract: 10 URLs = 2cr (1cr per 5 URLs)
-        extract_urls = [r["url"] for r in filtered[:10] if r.get("url")]
-        extract_cost = math.ceil(len(extract_urls) / 5) if extract_urls else 0
-        if extract_urls and budget_remaining(budget) >= extract_cost:
-            extract_q = (
-                " ".join(anomaly_ticker_syms[:3])
-                + " " + geo_topics_str[:80]
-            ).strip()
-            extract_results = tavily_extract(extract_urls, extract_q, budget)
+        # Layer 3 — reserved batch, then open batches of 10. Each call checks budget.
+        reserved_urls = [r["url"] for r in reserved_results.values() if r.get("url")]
+        reserved_url_set = set(reserved_urls)
+        open_urls = [
+            r["url"] for r in filtered
+            if r.get("url") and r["url"] not in reserved_url_set
+        ][:OPEN_POOL_SEMANTIC_TOP_N]
+        extract_q = (
+            " ".join(anomaly_ticker_syms[:3])
+            + " " + geo_topics_str[:80]
+        ).strip()
+        extract_results = _extract_reserved_then_open(
+            reserved_urls, open_urls, extract_q, budget,
+        )
 
         # split_phrases=False (scoring_utils.py): corroboration needs a narrower
         # keyword set than score_and_filter's ranking bonus — a single generic
@@ -1880,19 +2008,35 @@ def _main_body():
         # review); literal curated keywords are still enough to fix the original
         # 2026-07-17 miss.
         corroboration_keywords = build_keyword_set([], wl["geo_keywords"], split_phrases=False)
+        extract_candidates = list(reserved_results.values()) + [
+            r for r in prescreened if r.get("url") not in reserved_url_set
+        ]
         if extract_results:
             tavily_section = format_extract_results(
-                extract_results, candidates=prescreened, extra_keywords=corroboration_keywords
+                extract_results, candidates=extract_candidates, extra_keywords=corroboration_keywords
             )
             logger.info(f"Using Extract chunks for Pass 2 ({len(extract_results)} sources)")
-        elif filtered:
-            tavily_section = format_tavily_results(filtered)
-            logger.info(f"Extract unavailable, using search summaries ({len(filtered)} results)")
+        elif filtered or reserved_results:
+            tavily_section = format_tavily_results(
+                list(reserved_results.values()) + list(filtered)
+            )
+            logger.info(
+                f"Extract unavailable, using search summaries "
+                f"({len(reserved_results) + len(filtered)} results)"
+            )
 
     # 9b. Archive cleaned Extract full text to local disk (outside Obsidian, never mined)
+    archive_candidates = list(reserved_results.values()) + [
+        r for r in filtered if r.get("url") not in {item["url"] for item in reserved_results.values()}
+    ]
     write_extract_archive(
-        today_et, run_slot, now_et, all_search_jobs, filtered, extract_results,
+        today_et, run_slot, now_et, all_search_jobs, archive_candidates, extract_results,
         extra_keywords=corroboration_keywords,
+        reserved_by_url={
+            item["url"]: ticker
+            for ticker, item in reserved_results.items()
+            if item.get("url")
+        },
     )
 
     # 10. If Tavily added new data, do a second LLM pass to incorporate it

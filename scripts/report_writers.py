@@ -147,6 +147,14 @@ def write_context_log(
         logger.warning(f"Context log write failed (non-fatal): {e}")
 
 
+def _candidate_origin_label(url: str, reserved_by_url: dict | None) -> str:
+    """`预留:TICKER` for a reserved Extract slot, otherwise `开放池`."""
+    ticker = (reserved_by_url or {}).get(url)
+    if ticker:
+        return f"预留:{ticker}"
+    return "开放池"
+
+
 def write_extract_archive(
     date_str: str,
     slot: str,
@@ -155,6 +163,7 @@ def write_extract_archive(
     filtered: list,
     extract_results: list,
     extra_keywords: list | None = None,
+    reserved_by_url: dict | None = None,
 ) -> None:
     """Write cleaned Tavily Extract full text to local archive outside Obsidian.
     Never mined by MemPalace. Preserves original intelligence for audit/mid-term review.
@@ -163,9 +172,10 @@ def write_extract_archive(
     corroboration fingerprint used by format_extract_results() so both draw on the
     same keyword vocabulary (issue #19 follow-up). Note this does NOT mean the two
     always report identical corroboration counts for the same URL: this function is
-    called with the Layer 2b `filtered` pool (top 10, post-Haiku) while
-    format_extract_results() is called with the wider `prescreened` pool (top 15,
-    pre-Haiku) — pre-existing split, not something this parameter changes.
+    called with the archive candidate list (reserved slots plus the open pool)
+    while format_extract_results() is called with that same reserved set plus
+    the wider prescreened open pool. `reserved_by_url` maps a URL to the
+    must-answer ticker that held it out of the global ranking (issue #82).
     """
     if not extract_results and not filtered:
         return
@@ -188,12 +198,13 @@ def write_extract_archive(
 
         # Layer 2b filtered candidates (with score + URL)
         if filtered:
-            lines.append("## 搜索结果候选（Layer 2b 过滤后，进入 Extract 的10条）")
+            lines.append("## 搜索结果候选（预留名额 + 开放池）")
             for i, r in enumerate(filtered, 1):
                 title = (r.get("title") or r.get("url") or "")[:100]
                 url = r.get("url", "")
                 score = float(r.get("score") or 0)
-                lines.append(f"{i}. [score:{score:.2f}] {title}")
+                origin = _candidate_origin_label(url, reserved_by_url)
+                lines.append(f"{i}. [{origin}] [score:{score:.2f}] {title}")
                 lines.append(f"   {url}")
             lines.append("")
 
