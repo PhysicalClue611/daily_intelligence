@@ -167,6 +167,12 @@ peer closed connection / Server disconnected / SSL UNEXPECTED_EOF 等瞬时错�
 
 **未修**：rotation 材料仍进同一 Pass 2 证据池（issue #74）。
 
+### 94. 必须解释的 ticker 被下游各自重拼，新增一类就漏一处（issue #82）
+
+（2026-09-23）未解释大涨先是没进 keyword bonus，后来预留 URL 进了 Extract，重排 query 仍只拼异动 ticker。Tavily 用这条 query 重排 chunk，页面可以进 Extract 而催化剂进不了 Pass 2。根因是围栏、打分和 Extract query 各自拼名单。
+
+**修复**：job 写 `_must_answer_ticker`。`_must_answer_tickers()` 在搜索前组装一次。围栏、开放池 keyword bonus、两次 Extract query 只读这份。
+
 ### 78. Sonar 宏观快照报告过时/幻觉信息，未限定检索时间窗且未锚定实时价格
 （2026-07-02 发现修复，issue #24）2026-07-02 AM 报告的 Sonar 宏观快照声称"原油飙破 $100、黄金下跌、美元走强"（典型滞涨初期画面），但同一份报告的实际价格数据显示 WTI 跌破 $70（$68.58，-2.13%），黄金 ETF 盘前涨 1.30%——与 Sonar 描述完全相反。Pass 2 LLM 靠自己核对价格数据发现了矛盾并在报告里做了修正说明，但这只是运气好被下游 LLM 接住，机制上没有防线——用户明确要求：严格限定 Sonar 情报的检索时间窗，或找别的办法拿到新情报；至少要求返回信息带时间戳。
 
