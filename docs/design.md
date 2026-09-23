@@ -2,7 +2,7 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-09-23（issue #80/PR #81，已合并 `9a05d3f`：个股 3 日绝对涨跌 ≥15% 或 5 日 ≥20% 时，即使当天不是单日异动也生成追因 query，每次最多 2 条；发布日期窗口覆盖行情起点再往前 2 个自然日。详见 §5.2 与文末变更记录）
+> **最后更新**：2026-09-23（issue #82/PR #83，已合并 `cf9cc33`：必须解释的 ticker 预留 Extract 名额；开放池预筛 25、语义过滤约 15；Extract 分批，合计最多约 20 URL / 4cr。名单只由 `_must_answer_tickers()` 组装。详见 §5.1b）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -346,7 +346,7 @@ system prompt 注入 portfolio 快照实现个人化。~$0.005/次，fail-open�
 
 **Haiku 语义过滤的非显然价値**：Haiku prompt 要求考虑上下游供应链和宏观传导，而非仅 ticker 名字命中。例：TSMC 产能收缩新闻即使不提 INTC，也与 INTC 高度相关。纯脚本关键词匹配覆盖不到这类语义关联。
 
-当前实现：两阶层评分——脚本预筛选（`score_and_filter`，15条）+ DeepSeek V4 Flash 语义排序（`_haiku_relevance_filter`，函数名保留，模型 `deepseek/deepseek-v4-flash` via OR/Novita），识别上下游供应链、宏观传导渠道，而非仅匹配 ticker 名称。
+当前实现（issue #82）：必须解释的 ticker 先各留一条 Extract URL。开放池脚本预筛选（`score_and_filter`，25条）+ 语义排序约 15 条。keyword bonus 的 ticker 来自 `_must_answer_tickers()`，不是另一份异动列表。
 
 #### 三层流程设计
 
@@ -355,21 +355,18 @@ Layer 1 — Discovery（basic search × 2-4，每条 1cr）
   全部为 basic（不再使用 advanced，Extract 来补深度）
   合并原始结果 raw_results（20-60 条）
 
-Layer 2a — Script pre-screen（纯脚本，0cr）
-  score_and_filter: N条 → 15条，去重 + 综合评分
-  小于 1ms，无额外成本
+Layer 2a — 开放池脚本预筛（纯脚本，0cr）
+  score_and_filter: 开放池 → 25条
+  必须解释的 URL 已预留，不进这个池
 
-Layer 2b — DeepSeek V4 Flash 语义过滤（DeepSeek直连，~$0.000035/次）
-  _haiku_relevance_filter: 15条 → 10条（函数名保留以减少改动范围）
-  识别直接催化剂、上下游供应链、宏观传导渠道
-  不仅匹配 ticker 名称，语义理解业务影响
-  thinking: disabled；fail-open：失败则回退到 script top-10
+Layer 2b — 语义过滤
+  开放池 25条 → 约15条
+  fail-open：失败则回退到 script top-15
 
-Layer 3 — Extract（1cr/5 URLs，10 URLs = 2cr）
-  tavily_extract(10 URLs, query, chunks_per_source=2)
-  每个 URL 返回 2 个高相关 chunk（600字/chunk，基于 query 对齐）
-  Pass 2 LLM 拿到完整正文而非摘要
-  计费公式：1cr/5 URLs，应以 5 的倍数提交（5/10）
+Layer 3 — Extract（单次最多 10 URL = 2cr；一次运行最多约 4cr）
+  预留批次先发，query 为整份 must-answer 名单
+  开放池再按 10 个一批，query 为同一份名单加地缘词
+  chunks_per_source=2
 
 Layer 3.5 — 信源置信度打标（issue #19，2026-06-30）
   每条 Extract 结果附加 [信源类型 | 发布时间 | 交叉印证] 标签行：
@@ -1286,3 +1283,7 @@ LLM 调用层的容错设计一直是"网络错误/5xx 重试，4xx 不重试"�
 **实现**：3 日绝对涨跌 ≥15% 或 5 日 ≥20% 生成 basic 追因 query，与异动 job 去重，每次最多 2 条。排除商品/FX/指数 ETF 和 AAOI。不持久化“是否已解释”。
 
 **Review**：skip 改到多日检测之后；job 自带发布日期窗口（行情起点再往前 2 个自然日）；日线不足的窗口不触发，价格表短历史回退保留。测试 `test_issue80_unexplained_move.py` 10/10。issue #74 未改。
+
+## 变更记录追加：2026-09-23 — Extract 名额预留（issue #82/PR #83，已合并 `cf9cc33`）
+
+必须解释的 ticker 预留 Extract URL，不参加开放池打分。开放池 25 → 约 15。Extract 分批，最多约 20 URL / 4cr，日上限仍 25。围栏、keyword bonus、Extract query 只读 `_must_answer_tickers()`。测试 `test_issue82_extract_reservation.py` 15/15。不改 Telegram。issue #74 未改。

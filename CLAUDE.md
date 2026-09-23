@@ -32,6 +32,14 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-09-23，issue #82 / PR #83，已合并 `cf9cc33`）
+
+**Extract 名额预留**。异动最多 3 个、未解释大涨最多 2 个，各自预留一条 Extract URL，不参加开放池的 `score_and_filter`。开放池预筛 25、语义过滤约 15。`tavily_extract()` 仍是每次最多 10 个 URL；预留先发，开放池再分批。满载约 20 个 URL、最多 4cr。日上限仍是 25。
+
+必须解释的 ticker 只由 `_must_answer_tickers()` 组装一次。7 天围栏、开放池 keyword bonus、Extract 重排 query 都读这份名单，不再各自拼接类别字段。Extract 预留 query 是整份名单；开放池 query 是同一份名单加地缘词。Tavily 用这条 query 重排 chunk。
+
+测试 `scripts/test_issue82_extract_reservation.py` 15/15，外加 #72/#76/语义过滤/#80。未跑付费报告。不改 `telegram_commands.py`。issue #74 仍未改。
+
 ## 当前系统状态（2026-09-23，issue #80 / PR #81，已合并 `9a05d3f`）
 
 **多日累计涨跌强制追因**。个股 3 个交易日绝对涨跌 ≥15%，或 5 日 ≥20%，即使当天不是单日异动，也生成一条写明真实幅度的 basic Tavily query。与当日异动 job 去重，每次最多 2 条，排在异动之后、Pass 1 之前。不持久化“是否已解释”。商品/FX/指数 ETF（`GC=F`、`CL=F`、`^TNX`、`USDCNY=X`、`USDJPY=X`、`DX-Y.NYB`、`QQQM`、`VOO`、`EWJ`）和观察标的 `AAOI` 不进入这层。发布日期由 job 自己设定：行情第一个交易日再往前 2 个自然日，到报告日；AM 锚点比 PM 同窗口多回一个交易日。日线不足 3 或 5 个交易日时该档为空、不触发；价格表 5 日涨跌仍可用最早收盘价。全市场无单日异动且无地缘命中时，只要这层有 query，运行不退出。`blacktomb42` 三处 REQUEST_CHANGES 已在 `0d2f110` 修入后 squash。不改 `telegram_commands.py`。issue #74 仍未改。
@@ -510,8 +518,9 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
     → 输出：{report_md, tavily_queries:[{query, search_depth, days, max_results}]}
     （网络/5xx 错误自动重试 2 次，间隔 2s/4s；4xx 和 JSON parse 不重试）
 11. 构建搜索任务列表：异动追因（`_anomaly_search_jobs`：AM/PM 前 3 大 `|change_pct|` 各一条 basic；Finnhub 只作补充）→ 多日累计追因（issue #80，`_unexplained_move_search_jobs`，最多 2 条，自带 start/end date）→ Pass1 `tavily_queries` → issue #33 rotation（候选 ticker 已在实际 anomaly job 集合中才跳过；不因多日 query 跳过）
-12. 顺序执行搜索任务，每次预检 budget；异动 job 搜完后 `_drop_stale_dated_results(..., now=now_et, max_age_days=7)`；Tavily 断连自动 fallback SerpApi
-13. 有搜索结果 → LLM pass 2（deepseek-v4-pro）合并生成最终报告（同样含 finnhub_news_section）
+12. 顺序执行搜索任务，每次预检 budget。搜索前用 `_must_answer_tickers()` 定一份名单。名单内 job 打 `_source_ticker` 并过 7 天围栏（`now_et`）。Tavily 断连自动 fallback SerpApi
+12b. 名单内每个 ticker 预留一条 Extract URL（不进开放池打分）。开放池 `score_and_filter` top 25，语义过滤约 15。Extract 预留先发、开放池再按 10 个 URL 一批；两次 query 都用这份名单，开放池另加地缘词
+13. 有搜索结果 → LLM pass 2（openai/gpt-5.6-luna）合并生成最终报告（同样含 finnhub_news_section）
 14. PM slot：替换报告标题为「夜盘动向」
 15. Append 到 Obsidian 月度文件 Daily_Intel_report_YYYYMM.md
 16. 发邮件 → watchlist.md 配置的收件人
@@ -562,8 +571,8 @@ OBSIDIAN_PATH="~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview
 ## Tavily 预算
 
 - 上限：25 credits/日，`finance_tavily_budget.json` 按 ET 日期自动重置（从 10→15→20→25 逐步调整）
-- Search：basic=1cr，advanced=2cr（已弃用，全部改 basic）；Extract：**5 URLs = 1 credit**（`math.ceil(n/5)`），最多 10 URLs = 2cr
-- 主报告：AM/PM 全 basic search（3-4cr）+ 1次 Extract（1-2cr）≈ 5-6cr；budget 不足时按层降级
+- Search：basic=1cr，advanced=2cr（已弃用，全部改 basic）；Extract：**5 URLs = 1 credit**（`math.ceil(n/5)`），单次最多 10 URLs = 2cr
+- 主报告：AM/PM 全 basic search，加上预留 Extract 和开放池分批，Extract 最多约 4cr。日上限仍是 25。某一批余额不够就跳过该批，预留批次先发
 - TG 追问不消耗 Tavily（Sonar 内建搜索）
 - Tavily 断连自动 fallback SerpApi（250次/月）；两者均耗尽则跳过搜索继续生成基础报告
 
@@ -774,6 +783,7 @@ _Tavily: N/10_
 91. KeepAlive 长轮询每轮裸 `httpx.post` 泄漏数百 MB（不是忘关 Client；macOS libmalloc 不还页）→ 详见 `docs/PITFALLS.md#91`
 92. 主路径 `yf.download` 8d/2d 假 delisted ERROR 刷屏（#63 只盖了 52 周）；重试不可整表覆盖、不可把坍缩单列认成别的 ticker → 详见 `docs/PITFALLS.md#92`
 93. 7 天围栏若打在 pooled `score_and_filter` 上会把 issue #33 rotation 的 30 天窗砍成 7 天；年龄必须用 `now_et` 不能用墙钟 → 详见 `docs/PITFALLS.md#93`
+94. 「必须解释的 ticker」若在围栏、keyword bonus、Extract query 各拼一次，新增一类 ticker 会漏改 → 详见 `docs/PITFALLS.md#94`
 
 ---
 
@@ -795,6 +805,7 @@ _Tavily: N/10_
 14. **issue #72/#76 生产观察**（2026-09-21 起）：Digitimes 触发命中率；AM/PM 前 3 大异动各一条、Finnhub 仅补充、rotation 只与实际 anomaly job ticker 去重后 Tavily 日消耗；`anomaly fence: dropped` 与 `Issue #33 rotation skipped` 日志。
 15. **issue #74**（未实现）：rotation 30 天材料与异动证据同池，污染【价格异动】归因。改善方向见该 issue，不在 #72 / #80 范围。
 16. **issue #80 生产观察**（2026-09-23 起）：安静日是否仍为 3 日 ≥15% 或 5 日 ≥20% 的个股发出追因；日志 `Issue #80 unexplained-move queries`；Tavily 日消耗是否仍留在 25cr 内。AAOI 不应出现在这层。
+17. **issue #82 生产观察**（2026-09-23 起）：日志 `Issue #82 reserved extract slots` 是否含未解释大涨 ticker；Extract 存档里该 URL 标为预留；日消耗是否仍在 25cr 内。
 
 ---
 
