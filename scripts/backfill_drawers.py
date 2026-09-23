@@ -31,9 +31,12 @@ _OBSIDIAN = Path(
 REPORTS_DIR = _OBSIDIAN / "Hermes/Daily Intelligence/Daily Reports"
 WRITE_SLEEP = 2.0  # seconds between writes — gives ChromaDB WAL time to flush
 
-# Matches: ## 2026-05-28 开盘前简报  OR  ## 2026-05-28 夜盘动向
+# Matches: ## 2026-05-28 开盘前简报  OR  ## 2026-05-28 夜盘动向  OR  ## 2026-09-21 夜盘收市速报
+# PM slot title was renamed from 夜盘动向 to 夜盘收市速报 at some point after this
+# script was first written (see run_finance.py's slot_label); this regex silently
+# matched zero PM sections for an unknown period until discovered 2026-09-22.
 _SECTION_RE = re.compile(
-    r"^## (\d{4}-\d{2}-\d{2}) (开盘前简报|夜盘动向)\s*$", re.MULTILINE
+    r"^## (\d{4}-\d{2}-\d{2}) (开盘前简报|夜盘动向|夜盘收市速报)\s*$", re.MULTILINE
 )
 
 
