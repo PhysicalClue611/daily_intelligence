@@ -235,9 +235,11 @@ def load_watchlist() -> dict:
 
     logger.info(f"Watchlist loaded: {len(stocks)} stocks, {len(commodities)} commodities, "
                 f"{len(fx)} fx, {len(geo_keywords)} geo topics, {len(recipients)} recipients")
+    from intel_collect import parse_aliases
     return dict(
         stocks=stocks, commodities=commodities, fx=fx,
         geo_keywords=geo_keywords, thresholds=thresholds, recipients=recipients,
+        entity_aliases=parse_aliases(text),
     )
 
 
@@ -1813,6 +1815,23 @@ def _main_body():
     )
     covered_anomaly_tickers = _anomaly_tickers_from_jobs(anomaly_search_jobs)
     multiday_moves = _compute_multiday_moves(price_rows, slot=run_slot)
+    # Issue #87 PR1: build a separate shadow ledger. It cannot affect the
+    # existing search/report/write path, even when a free source or Gemma fails.
+    try:
+        from intel_pass0 import build_ledger
+        _windows = {}
+        for _ticker, (_d3, _d5) in multiday_moves.items():
+            _days = 5 if _d5 is not None and abs(_d5) >= 20 else (3 if _d3 is not None and abs(_d3) >= 15 else 0)
+            if _days:
+                _windows[_ticker] = _unexplained_publication_window(today_et, _days, run_slot)[0]
+        _ledger, _ledger_path = build_ledger(
+            wl, now_et, run_slot, price_rows=price_rows, multiday_moves=multiday_moves,
+            window_starts=_windows, held=set(_get_core_holding_tickers()),
+            weights=_get_portfolio_weights(),
+        )
+        logger.info("Pass0 shadow ledger: %s entities, %s", len(_ledger["entities"]), _ledger_path)
+    except Exception as e:
+        logger.warning("Pass0 shadow ledger failed (report unaffected): %s", e)
     unexplained_jobs = _unexplained_move_search_jobs(
         price_rows,
         multiday_moves,

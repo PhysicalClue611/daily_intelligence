@@ -6,6 +6,8 @@
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
+> **开发中，issue #87 PR1，尚未合并**：旧报告流水线旁新增 Pass 0 影子账本。免费收集层在 `scripts/intel_collect.py`：按标的保留完整 Finnhub company-news、按公司名查询的 Google News RSS、现有 7 源 RSS 与 Guardian；词边界实体匹配、标题去重与每来源覆盖/错误记录。`scripts/intel_triage.py` 的 `intel_triage` / `macro_triage` 使用 `google/gemma-4-31b-it`（OpenInference 优先），标的 JSON 无效时保留条目并记 `triage_failed`。`scripts/intel_pass0.py` 在旧主流程跳过判断前旁路运行，原子归档 `archives/YYYYMM/*-ledger.json`；回放命令只写本地 JSON/Markdown，RSS/Guardian 标为 skipped，历史 AM 日线价格只是近似。新 `entity_alias_cache.json` 与 `finance_pass0_usage.jsonl` 均忽略追踪。旧 Pass 1/Tavily/Pass 2/写出没有在 PR1 切换。验收按 issue #87 R7.2 的 24 条评估集逐条核对：收集 ≥21、初判 ≥18；实际结果在验收运行后记录。Google News RSS 频率至少 1 秒/请求，链接不解码，影子期观察稳定性和重复率。权威 Obsidian 文档由合并后验证方同步。
+
 ---
 
 ## 一、系统定位与设计原则

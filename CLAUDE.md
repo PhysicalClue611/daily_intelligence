@@ -19,6 +19,16 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 开发中：issue #87 PR1（Pass 0 影子账本，尚未合并）
+
+`run_finance.py` 在价格与多日涨跌计算后旁路运行 `intel_pass0.py`，失败只记 WARNING，旧 RSS/Finnhub、Pass 1、Tavily、Pass 2 和报告写出仍照旧。新 `intel_collect.py` 对 watchlist 个股（排除 QQQM/VOO/EWJ/SGOL）按标的收集完整 Finnhub company-news、公司名 Google News RSS、7 个现有 RSS 和 Guardian；词边界匹配与标的内去重，覆盖记录保留原始条数和错误。别名可在 watchlist `## 实体别名` 写 `INTC: Intel, 英特尔`，缺失时 Finnhub profile2 补全并缓存到 gitignore 的 `entity_alias_cache.json`。Google News 请求间隔至少 1 秒；其 RSS 链接只作线索，不解码原文。
+
+`intel_triage.py` 使用两个 Gemma stage（`intel_triage`、`macro_triage`）产生事件与宏观摘要；标的初判失败标为 `triage_failed`。每次影子运行原子写入 `archives/YYYYMM/YYYY-MM-DD-{slot}-ledger.json`，不改变旧报告。`intel_pass0.py --replay YYYY-MM-DD --slot am|pm [--ticker SYMBOL]` 只建本地 JSON/Markdown 账本，不发通知、不写 Obsidian、不用 Tavily 或 Pass 2；历史 AM 价格使用日线近似，RSS/Guardian 明确跳过。24 条回溯评估集和验收入口位于 `scripts/eval/`。Gemma 付费调用审计写入 gitignore 的 `finance_pass0_usage.jsonl`。
+
+这是 PR1 的代码状态说明；R7.2 验收和 PR 状态以实际运行结果为准。合并后的影子观察重点是收集召回、初判主因、`seen_before` 重复率、Google News 稳定性与 Pass 0 耗时。issue #87 D5 的可验证信号与社交舆情选择留给后续决策，PR1 未触及。
+
+---
+
 ## [强制] "打扫战场"必须包含设计文档更新
 
 **背景（2026-07-23 教训）**：全局 `~/.claude/CLAUDE.md` 的"打扫战场"清单第 4 项写的是"Obsidian 设计文档/开发日志"合并为一条，但本项目此前多次收尾只更新了`Daily Intelligence 开发部署日志.md`（叙事型日志），没有同步更新`Daily_Intel设计文档.md`（架构权威参考）——两者分别更新责任被"日志更新了"顺带带过，导致设计文档"最后更新"停留在 2026-07-09，而代码早已新增 Brave News、Polymarket/Adanos/Apify Reddit 三路社交舆情、字段消毒、quota_store 参数化重构、llm_json_utils 迁移、语义过滤模型切换等六个未记录的重大变更，用户发现后要求专项修复（本次已补齐，见文档内 2026-07-23 变更记录）。

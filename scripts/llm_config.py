@@ -82,6 +82,16 @@ _GEMMA_PROVIDERS = {"order": ["OpenInference"], "allow_fallbacks": True}
 
 DEFAULTS: dict[str, dict] = {
     # ── Report pipeline (run_finance.py / calibration.py via llm_client.py) ──
+    "intel_triage": {
+        "gateway": "openrouter", "model": "google/gemma-4-31b-it",
+        "providers": _GEMMA_PROVIDERS, "max_tokens": 2000,
+        "temperature": 0.0, "fallback_model": None,
+    },
+    "macro_triage": {
+        "gateway": "openrouter", "model": "google/gemma-4-31b-it",
+        "providers": _GEMMA_PROVIDERS, "max_tokens": 2000,
+        "temperature": 0.0, "fallback_model": None,
+    },
     "report_pass1": {
         # Not deepseek-v4-flash (issue #59): the comment this replaced claimed
         # "Flash defaults to no-thinking when the key is absent entirely" —
