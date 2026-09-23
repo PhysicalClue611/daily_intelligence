@@ -103,10 +103,9 @@ DEFAULTS: dict[str, dict] = {
         "fallback_model": "google/gemini-3.1-flash-lite",
     },
     "report_pass2": {
-        # openai/gpt-5.6-luna (non-pro) + reasoning.effort=high, not
-        # deepseek-v4-pro+thinking (issue #60): a real side-by-side
-        # comparison on 2026-08-03 PM's actual data (real price table, real
-        # holdings, real Sonar/Tavily context) surfaced a genuine correctness
+        # GPT-5.6 Luna/high replaced deepseek-v4-pro+thinking (issue #60).
+        # A side-by-side comparison on 2026-08-03 PM's actual price table,
+        # holdings, and Sonar/Tavily context surfaced a genuine correctness
         # bug in deepseek-v4-pro's output, not just a formatting/stability
         # difference — it categorized the same ORCL/CACI fact as "生态位验证"
         # in the sas_candidates field but then treated it as "认知提升-战略
@@ -117,13 +116,13 @@ DEFAULTS: dict[str, dict] = {
         # declined to treat it as sufficient (see issue #60 comments for the
         # full excerpt). Also independently noted: deepseek-v4-pro
         # mischaracterized SPCX as an ETF in that same run, gpt-5.6-luna did
-        # not. max_tokens 8000->16000 and provider pinned to OpenAI only,
-        # matching the same treatment already applied to tg_followup.
+        # not. Issue #90 advances this report stage to GPT-6 Luna/xhigh;
+        # provider stays pinned to OpenAI and max_tokens stays at 16000.
         "gateway": "openrouter",
-        "model": "openai/gpt-5.6-luna",
+        "model": "openai/gpt-6-luna",
         "providers": {"order": ["OpenAI"], "allow_fallbacks": False},
         "thinking": None,
-        "reasoning": {"effort": "high"},
+        "reasoning": {"effort": "xhigh"},
         "max_tokens": 16000,
         "temperature": 0.2,
         "fallback_model": "google/gemini-3.5-flash",
@@ -320,7 +319,7 @@ def _v_thinking(v):
 def _v_reasoning(v):
     if v is None:
         return True, None
-    if not isinstance(v, dict) or v.get("effort") not in ("low", "medium", "high"):
+    if not isinstance(v, dict) or v.get("effort") not in ("low", "medium", "high", "xhigh"):
         return False, v
     return True, {"effort": v["effort"]}
 

@@ -36,12 +36,12 @@
       "fallback_model": "google/gemini-3.1-flash-lite"
     },
     "report_pass2": {
-      "_note": "openai/gpt-5.6-luna (non-pro) + reasoning.effort=high, not deepseek-v4-pro+thinking (issue #60) — a real side-by-side comparison on 2026-08-03 PM's actual data surfaced a genuine correctness bug in deepseek-v4-pro's output (categorized the same fact as 生态位验证 in sas_candidates but then treated it as 认知提升-战略节点解锁 in the position-check section of the same response, giving a buy recommendation its own rules say that category can't justify); gpt-5.6-luna's output on the identical prompt stayed internally consistent. Also mischaracterized SPCX as an ETF in that run; gpt-5.6-luna did not. Provider pinned to OpenAI only, same treatment as tg_followup.",
+      "_note": "Issue #90: report Pass 2 uses GPT-6 Luna with xhigh reasoning; the OpenAI provider pin and Gemini fallback remain. See issue #60 for the original GPT-5.6 Luna selection evidence.",
       "gateway": "openrouter",
-      "model": "openai/gpt-5.6-luna",
+      "model": "openai/gpt-6-luna",
       "providers": {"order": ["OpenAI"], "allow_fallbacks": false},
       "thinking": null,
-      "reasoning": {"effort": "high"},
+      "reasoning": {"effort": "xhigh"},
       "max_tokens": 16000,
       "temperature": 0.2,
       "fallback_model": "google/gemini-3.5-flash"

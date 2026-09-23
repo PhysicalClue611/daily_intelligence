@@ -147,7 +147,11 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                         {"role": "user", "content": prompt},
                     ],
                     "max_tokens": max_tokens,
-                    "temperature": cfg["temperature"],
+                    # GPT-6 reasoning requests reject temperature; keep it for
+                    # the older primary models and the separate fallback call.
+                    **({} if model.startswith("openai/gpt-6-") and reasoning_cfg
+                       and reasoning_cfg.get("effort") != "none"
+                       else {"temperature": cfg["temperature"]}),
                     **({"thinking": thinking_cfg} if thinking_cfg else {}),
                     **({"reasoning": reasoning_cfg} if reasoning_cfg else {}),
                 },
@@ -301,4 +305,3 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
     except Exception as e:
         logger.error(f"OR flex fallback failed: {e}")
     return {}
-
