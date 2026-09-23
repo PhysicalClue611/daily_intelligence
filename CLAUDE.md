@@ -32,6 +32,10 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
+## 当前系统状态（2026-09-23，issue #80 / PR #81，已合并 `9a05d3f`）
+
+**多日累计涨跌强制追因**。个股 3 个交易日绝对涨跌 ≥15%，或 5 日 ≥20%，即使当天不是单日异动，也生成一条写明真实幅度的 basic Tavily query。与当日异动 job 去重，每次最多 2 条，排在异动之后、Pass 1 之前。不持久化“是否已解释”。商品/FX/指数 ETF（`GC=F`、`CL=F`、`^TNX`、`USDCNY=X`、`USDJPY=X`、`DX-Y.NYB`、`QQQM`、`VOO`、`EWJ`）和观察标的 `AAOI` 不进入这层。发布日期由 job 自己设定：行情第一个交易日再往前 2 个自然日，到报告日；AM 锚点比 PM 同窗口多回一个交易日。日线不足 3 或 5 个交易日时该档为空、不触发；价格表 5 日涨跌仍可用最早收盘价。全市场无单日异动且无地缘命中时，只要这层有 query，运行不退出。`blacktomb42` 三处 REQUEST_CHANGES 已在 `0d2f110` 修入后 squash。不改 `telegram_commands.py`。issue #74 仍未改。
+
 ## 当前系统状态（2026-09-22，issue #76 / PR #79）
 
 **PM 异动追因覆盖 + Finnhub 公平截取**。AM/PM 现在都会为按 `|change_pct|` 排序的前 3 大异动生成独立 Tavily basic query；Finnhub 仅作为补充信息源，不再短路 PM 异动搜索。每个 anomaly job 带 `_anomaly_ticker`，Pass1 `{anomaly_tickers_note}` 与 issue #33 rotation 去重只使用实际生成 job 的 ticker 集合，而不是全量异动列表，因此第 4 名及以后异动仍可由 Pass1 或 rotation 搜索。
@@ -494,7 +498,7 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
     - PM：日线数据取今日收盘为 price；另拉 1m prepost=True 取 16:00-20:00 ET 最后 bar 为 afterhours_price；is_anomaly = close_anomaly OR ah_anomaly
     - fallback：两级，yfinance失败→Finnhub（无盘前/盘后，记日志）；format_price_table(slot) 输出对应列
 6.  RSS 聚合（15个 feed + Guardian API，过去24小时，含 Digitimes）→ 计算 triggered_geo_topics（RSS 命中的地缘政治主题列表）；Guardian key 存在时合并 Guardian 结果并重排
-7.  代码层 skip：无 anomaly 且无 triggered_geo_topics → 静默退出（不调用 LLM，零成本）
+7.  代码层 skip：无 anomaly、无 triggered_geo_topics、且无多日累计追因 job → 静默退出（不调用 LLM，零成本）。多日 job 在这一步之前算完
 8.  bridge 拉取 KB 上下文（fail-open）：MemPalace + Obsidian → kb_section；字符预算 2000（MP 1200 / Obs 800 独立截断）
 8b. Finnhub 即时新闻（免费，无配额）：异动标的优先 + watchlist 股票补齐，取前8个，
     hours=min(query_days×24, 48)，注入 finnhub_news_section（fail-open）
@@ -505,7 +509,7 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
 10. LLM pass 1（deepseek-v4-flash）注入 price_table + RSS + finnhub_news + kb_section + triggered_geo_topics
     → 输出：{report_md, tavily_queries:[{query, search_depth, days, max_results}]}
     （网络/5xx 错误自动重试 2 次，间隔 2s/4s；4xx 和 JSON parse 不重试）
-11. 构建搜索任务列表：代码生成异动追因 query（`_anomaly_search_jobs`：AM/PM 均为前 3 大 `|change_pct|` 各一条 basic；Finnhub 只作补充）→ Pass1 `tavily_queries` → issue #33 rotation（候选 ticker 已在实际 anomaly job 集合中才跳过）
+11. 构建搜索任务列表：异动追因（`_anomaly_search_jobs`：AM/PM 前 3 大 `|change_pct|` 各一条 basic；Finnhub 只作补充）→ 多日累计追因（issue #80，`_unexplained_move_search_jobs`，最多 2 条，自带 start/end date）→ Pass1 `tavily_queries` → issue #33 rotation（候选 ticker 已在实际 anomaly job 集合中才跳过；不因多日 query 跳过）
 12. 顺序执行搜索任务，每次预检 budget；异动 job 搜完后 `_drop_stale_dated_results(..., now=now_et, max_age_days=7)`；Tavily 断连自动 fallback SerpApi
 13. 有搜索结果 → LLM pass 2（deepseek-v4-pro）合并生成最终报告（同样含 finnhub_news_section）
 14. PM slot：替换报告标题为「夜盘动向」
@@ -789,7 +793,8 @@ _Tavily: N/10_
 12. **真实成本核算**（issue #60 遗留缺口）：`gpt-5.6-luna` 与 `deepseek-v4-pro`/`deepseek-v4-flash` 的实际生产量级成本差异尚未核算，观察一段时间后可用 OR 账单核实
 13. **issue #67/PR #68 生产观察**（2026-08-13 起，主路径已并入 #63 的 quiet logger）：下次 AM/PM 后 `grep -E "possibly delisted|yfinance daily bulk" /tmp/daily_intelligence.log`——期望不再出现 yfinance `possibly delisted` ERROR；bulk 抖时可见 `yfinance daily bulk incomplete` WARNING（及可选 `retry recovered` INFO），报告仍发出。52 周路径仍走同一套 `_quiet_yfinance_logs()`
 14. **issue #72/#76 生产观察**（2026-09-21 起）：Digitimes 触发命中率；AM/PM 前 3 大异动各一条、Finnhub 仅补充、rotation 只与实际 anomaly job ticker 去重后 Tavily 日消耗；`anomaly fence: dropped` 与 `Issue #33 rotation skipped` 日志。
-15. **issue #74**（未实现）：rotation 30 天材料与异动证据同池，污染【价格异动】归因。改善方向见该 issue，不在 #72 范围。
+15. **issue #74**（未实现）：rotation 30 天材料与异动证据同池，污染【价格异动】归因。改善方向见该 issue，不在 #72 / #80 范围。
+16. **issue #80 生产观察**（2026-09-23 起）：安静日是否仍为 3 日 ≥15% 或 5 日 ≥20% 的个股发出追因；日志 `Issue #80 unexplained-move queries`；Tavily 日消耗是否仍留在 25cr 内。AAOI 不应出现在这层。
 
 ---
 

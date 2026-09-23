@@ -2,7 +2,7 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-09-22（issue #76/PR #79：AM/PM 均执行前 3 大异动追因；覆盖集合来自实际 job；Finnhub 每 ticker 取 5 条；Tavily 日预算 25。详见 §5.1b、§5.2 与文末变更记录）
+> **最后更新**：2026-09-23（issue #80/PR #81，已合并 `9a05d3f`：个股 3 日绝对涨跌 ≥15% 或 5 日 ≥20% 时，即使当天不是单日异动也生成追因 query，每次最多 2 条；发布日期窗口覆盖行情起点再往前 2 个自然日。详见 §5.2 与文末变更记录）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -63,7 +63,7 @@ yfinance（主）       API（14源）           MemPalace
               └─────────┬──────────┘
                         │
               ┌─────────▼──────────┐
-              │  代码层 skip 检查   │  无异动+无geo → 退出
+              │  代码层 skip 检查   │  无异动+无geo+无多日大涨跌 → 退出
               └─────────┬──────────┘
                         │
               ┌─────────▼──────────┐
@@ -423,8 +423,8 @@ Tavily 日预算为 25cr；删除 PM Finnhub 短路后，有异动的 PM 最多�
 **代码层 skip（LLM 调用前）**：
 ```python
 triggered_geo_topics = sorted(set(t for item in news_items for t in item.topics))
-if not anomalies and not triggered_geo_topics:
-    sys.exit(0)  # 零 LLM 成本
+if not anomalies and not triggered_geo_topics and not unexplained_jobs:
+    sys.exit(0)  # 零 LLM 成本；unexplained_jobs 在这一行之前已经算出
 ```
 
 **Pass 1（必须）**：
@@ -442,10 +442,11 @@ if not anomalies and not triggered_geo_topics:
 - `query_days = max(1, min(3, 距上次报告天数))`，周末 / 节假日后自动扩展窗口
 
 **搜索（条件触发）**：
-- 执行顺序：代码生成的异动追因查询（优先）→ LLM 建议查询 → 核心持仓认知提升轮询查询（最后，issue #33）
+- 执行顺序：异动追因查询 → 多日累计涨跌追因（issue #80，最多 2 条）→ LLM 建议查询 → 核心持仓认知提升轮询（最后，issue #33）
 - **异动追因查询**（`_anomaly_search_jobs()`，issue #72/#76）：按 `|change_pct|` 降序取前 3，每个 ticker 一条独立 basic query（`{ticker} stock surge|drop {pct}% premarket|afterhours reason {date}`），不再合并多标的、不再锚定 earnings。`days=min(query_days, 7)`。AM/PM 均执行，Finnhub 只作补充、不再短路 PM。每个 job 以 `_anomaly_ticker` 标记实际覆盖 ticker；Pass1 `{anomaly_tickers_note}` 只列这些 job 的 ticker，因此第4名及以后未被误标为已覆盖。搜完后 `_drop_stale_dated_results(now=now_et, max_age_days=7)` 只过滤这批结果；无 `published_date` 放行。
-- **认知提升轮询查询**（`_rotation_search_job()`，2026-07-08 issue #33）：核心持仓按 `date.toordinal() % N` 每天一只，30 天窗口，追加在其他查询之后。issue #76：仅当候选 ticker 已在实际生成的 anomaly job 集合中才跳过（日志 `Issue #33 rotation skipped`）；全量异动列表中第4名及以后仍可被 rotation 选中。**已知污染（issue #74，未改）**：rotation 命中仍与异动结果进入同一 `tavily_section`，Pass 2 可能拿 30 天窗内旧事实解释当日 [!]。
-- search_depth：异动/Pass1/rotation 均为 basic；AM/PM 异动 job 不因 Finnhub 是否有内容而跳过
+- **多日累计涨跌**（`_unexplained_move_search_jobs()`，issue #80）：监控个股（排除商品/FX/指数 ETF：`GC=F`、`CL=F`、`^TNX`、`USDCNY=X`、`USDJPY=X`、`DX-Y.NYB`、`QQQM`、`VOO`、`EWJ`，以及观察标的 `AAOI`）若 `abs(3日)≥15%` 或 `abs(5日)≥20%`，且不在当日异动 job 覆盖集合里，生成一条写明真实幅度的 basic query。3 日达标优先于 5 日。每次运行最多 2 条。不写“是否已解释”状态。日线少于 3 或 5 个交易日时该档为空，不触发；价格表的 5 日涨跌仍可退到最早一根收盘价。`start_date` 是行情第一个交易日再往前 2 个自然日，`end_date` 是报告日。AM 的分子是前一交易日收盘，锚点比 PM 同窗口多回一个交易日。Pass1 `{unexplained_move_note}` 列出已覆盖 ticker。
+- **认知提升轮询查询**（`_rotation_search_job()`，2026-07-08 issue #33）：核心持仓按 `date.toordinal() % N` 每天一只，30 天窗口，追加在其他查询之后。issue #76：仅当候选 ticker 已在实际生成的 anomaly job 集合中才跳过（日志 `Issue #33 rotation skipped`）；全量异动列表中第4名及以后仍可被 rotation 选中。rotation 不因为多日 query 而改。**已知污染（issue #74，未改）**：rotation 命中仍与异动结果进入同一 `tavily_section`，Pass 2 可能拿 30 天窗内旧事实解释当日 [!]。
+- search_depth：异动/多日累计/Pass1/rotation 均为 basic；AM/PM 异动 job 不因 Finnhub 是否有内容而跳过
 - 每次调用前预检 budget_remaining ≥ credits_needed，不足则停止循环
 - max_results=12（原 8）
 - Tavily 断连自动 fallback SerpApi；两者均耗尽则跳过搜索继续生成基础报告
@@ -1277,3 +1278,11 @@ LLM 调用层的容错设计一直是"网络错误/5xx 重试，4xx 不重试"�
 **实现**：AM/PM 均生成前3大异动 job，移除 `finnhub_covers` 死参数；job 携带 `_anomaly_ticker`，Pass1/rotation 只从实际 job 推导覆盖集合。Finnhub 保留跨 ticker 去重，改为每 ticker 各取最近5条后合并。Tavily 日预算 20→25。
 
 **验证**：先写失败回归测试，覆盖 6 个 PM 异动、第四名 NVDA 不进覆盖 note 且 rotation 不跳过、Finnhub 5×5 与跨 ticker 去重、预算常量；实现后定向 13/13、全仓库 99/99、`compileall` 与 `git diff --check` 通过。issue #74 的 rotation 结果同池问题不在本次范围。
+
+## 变更记录追加：2026-09-23 — 多日累计涨跌追因（issue #80/PR #81，已合并 `9a05d3f`）
+
+**触发**：INTC 到 09-21 累计上涨约 30% 后，09-22 当天不再是单日异动，流水线不再追催化剂。
+
+**实现**：3 日绝对涨跌 ≥15% 或 5 日 ≥20% 生成 basic 追因 query，与异动 job 去重，每次最多 2 条。排除商品/FX/指数 ETF 和 AAOI。不持久化“是否已解释”。
+
+**Review**：skip 改到多日检测之后；job 自带发布日期窗口（行情起点再往前 2 个自然日）；日线不足的窗口不触发，价格表短历史回退保留。测试 `test_issue80_unexplained_move.py` 10/10。issue #74 未改。
