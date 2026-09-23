@@ -89,7 +89,7 @@ class SwitchTest(unittest.TestCase):
             fail["pass2"] = True
             rf._main_body()
         self.assertEqual(stages, ["report_pass2", "sas_candidate_extract"] * 2)
-        self.assertIn("按标的收集的情报账本", prompts[0])
+        self.assertIn("标的事实与来源（供分析）", prompts[0])
         self.assertNotIn("过去24小时新闻（RSS）", prompts[0])
         self.assertIn("Pass 2 失败", alerts[0])
         self.assertIn("线索待核实", written[1])

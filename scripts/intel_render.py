@@ -51,7 +51,7 @@ def coverage_line(entity: dict) -> str:
 
 def render_ledger_context(ledger: dict, geo_keywords: dict[str, list[str]]) -> str:
     """All movers, quiet holdings with up to 8 titles, macro latest 8/topic, 40 total."""
-    lines = ["## 按标的收集的情报账本"]
+    lines = ["## 标的事实与来源（供分析）"]
     quiet_observers = []
     for e in ledger.get("entities", []):
         move = e.get("move") or {}
@@ -68,7 +68,7 @@ def render_ledger_context(ledger: dict, geo_keywords: dict[str, list[str]]) -> s
                 price_bits.append(f"{label} {move[key]:+.1f}%")
         role = "持有" if e.get("held") else "观察"
         lines.append(f"### {e['ticker']}（{role}）{'、'.join(price_bits)}")
-        lines.append(f"覆盖：{coverage_line(e)}")
+        lines.append(f"检索范围（仅供核查）：{coverage_line(e)}")
         limit = 25 if active else 8
         for row in rows[:limit]:
             if active:
