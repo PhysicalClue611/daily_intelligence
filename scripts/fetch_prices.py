@@ -61,6 +61,28 @@ class PriceRow:
     afterhours_pct: float = 0.0     # PM only: after-hours change % vs today's close
     session_change_pct: float = 0.0 # AM: prev day close vs open; PM: today close vs today open
     slot: str = "daily"             # "am", "pm", "daily"
+    change_3d_pct: float = 0.0      # 3 trading-day change %; same anchor rule as week_change_pct
+
+
+def multiday_return_pct(numerator: float, closes_before_numerator, n: int) -> float:
+    """Percent change versus the close `n` sessions before `numerator`.
+
+    `closes_before_numerator` does not include the numerator bar. The anchor
+    is iloc[-n], i.e. iloc[-1-n] on a series that appends numerator as the
+    last row. Do not assume the bulk download's last row is today (issue #69).
+    A short history uses the oldest close, matching the previous week_change fallback.
+    """
+    if closes_before_numerator is None or len(closes_before_numerator) == 0:
+        return 0.0
+    if not numerator:
+        return 0.0
+    if len(closes_before_numerator) >= n:
+        anchor = float(closes_before_numerator.iloc[-n])
+    else:
+        anchor = float(closes_before_numerator.iloc[0])
+    if anchor == 0:
+        return 0.0
+    return (float(numerator) - anchor) / anchor * 100.0
 
 
 def _yf_download(yf_mod, tickers, **kwargs):
@@ -513,8 +535,6 @@ def fetch_prices(
                     rows.append(row)
                 continue
 
-            week_start = float(closes_daily.iloc[-6]) if len(closes_daily) >= 6 else float(closes_daily.iloc[0])
-
             # ── Determine threshold / unit ────────────────────────────────────
             if ticker == "^TNX":
                 unit = "%"
@@ -529,6 +549,8 @@ def fetch_prices(
             afterhours_price   = 0.0
             afterhours_pct     = 0.0
             session_change_pct = 0.0
+            week_change_pct    = 0.0
+            change_3d_pct      = 0.0
 
             if slot == "am":
                 # Use only sessions strictly before report_date so this is correct both at
@@ -551,8 +573,9 @@ def fetch_prices(
                 prev_prev_close = float(_closes_pre.iloc[-2])
                 if prev_close == 0 or prev_prev_close == 0:
                     continue
-                week_start      = float(_closes_pre.iloc[-6]) if len(_closes_pre) >= 6 else float(_closes_pre.iloc[0])
-                week_change_pct = (prev_close - week_start) / week_start * 100
+                _before_prev = _closes_pre.iloc[:-1]
+                week_change_pct = multiday_return_pct(prev_close, _before_prev, 5)
+                change_3d_pct = multiday_return_pct(prev_close, _before_prev, 3)
                 # session_change_pct = close vs prior close (Yahoo Finance "day change" for yesterday)
                 session_change_pct = (prev_close - prev_prev_close) / prev_prev_close * 100
                 # premarket price
@@ -611,8 +634,8 @@ def fetch_prices(
                 # week_change_pct: 5 trading days back from _closes_prev (which excludes any
                 # "today" row, present or not) — anchoring to the batch's raw last row would
                 # be off by a day whenever "today" is missing from the batch (issue #69 §4).
-                week_start      = float(_closes_prev.iloc[-5]) if len(_closes_prev) >= 5 else float(_closes_prev.iloc[0])
-                week_change_pct = (price - week_start) / week_start * 100
+                week_change_pct = multiday_return_pct(price, _closes_prev, 5)
+                change_3d_pct = multiday_return_pct(price, _closes_prev, 3)
                 change_pct      = (price - prev_close) / prev_close * 100
                 if today_open:
                     session_change_pct = (price - today_open) / today_open * 100
@@ -627,8 +650,10 @@ def fetch_prices(
                 prev_close = float(closes_daily.iloc[-2])
                 if prev_close == 0:
                     continue
-                week_change_pct = (float(closes_daily.iloc[-1]) - week_start) / week_start * 100
-                price      = float(closes_daily.iloc[-1])
+                price = float(closes_daily.iloc[-1])
+                _before_last = closes_daily.iloc[:-1]
+                week_change_pct = multiday_return_pct(price, _before_last, 5)
+                change_3d_pct = multiday_return_pct(price, _before_last, 3)
                 change_pct = (price - prev_close) / prev_close * 100
 
             # ── Anomaly detection ─────────────────────────────────────────────
@@ -664,6 +689,7 @@ def fetch_prices(
                 afterhours_pct=afterhours_pct,
                 session_change_pct=session_change_pct,
                 slot=slot,
+                change_3d_pct=change_3d_pct,
             ))
         except Exception as e:
             logger.warning(f"{ticker}: {e}")

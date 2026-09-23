@@ -49,7 +49,10 @@ from pathlib import Path
 
 import httpx
 
-from fetch_prices import fetch_prices, format_price_table, get_anomalies, fetch_52week_stats
+from fetch_prices import (
+    fetch_prices, format_price_table, get_anomalies, fetch_52week_stats,
+    multiday_return_pct,
+)
 from fetch_news import fetch_rss, fetch_guardian_news, format_news_for_prompt
 from memory_context_finance import get_finance_context
 
@@ -966,6 +969,7 @@ USER_PROMPT_TEMPLATE = """今日日期（ET）：{date}
 - max_results 统一填 12
 - 对单个持仓 ticker 的个股查询，在 query 中加 site:stockanalysis.com 或 site:macrotrends.net 可显著提升数据密度（例："NVDA site:stockanalysis.com"）
 {anomaly_tickers_note}
+{unexplained_move_note}
 
 请输出以下JSON（不要附加任何其他文字）：
 {{
@@ -1319,6 +1323,122 @@ def _build_anomaly_tickers_note(covered_tickers: list[str]) -> str:
     )
 
 
+# Issue #80. Commodities, FX, and index ETFs never reached 15%/20% in the
+# 9-month backtest. AAOI is a watchlist observer, not an IB holding, and
+# its own 3-day >=15% rate was 51/186 — same thresholds would fire most weeks.
+# Same-day anomaly search still covers AAOI.
+_EXCLUDED_UNEXPLAINED_MOVE_TICKERS = frozenset({
+    "GC=F", "CL=F", "^TNX",
+    "USDCNY=X", "USDJPY=X", "DX-Y.NYB",
+    "QQQM", "VOO", "EWJ",
+    "AAOI",
+})
+
+
+def _closes_before_report(series, report_date):
+    """Daily closes strictly before report_date. Drops a stale 'today' bar."""
+    import pandas as pd
+    s = series.dropna()
+    if len(s) == 0:
+        return s
+    if getattr(s.index, "tz", None) is not None:
+        s = s.copy()
+        s.index = s.index.tz_convert("America/New_York").tz_localize(None)
+    report_ts = pd.Timestamp(report_date)
+    return s[s.index.normalize() < report_ts]
+
+
+def _compute_multiday_moves(
+    price_rows: list,
+    closes_daily: dict | None = None,
+    report_date=None,
+    slot: str = "pm",
+) -> dict[str, tuple[float, float]]:
+    """{ticker: (pct_3d, pct_5d)} for names this mechanism is allowed to chase.
+
+    No persisted 'already explained' flag. The 3-day and 5-day windows age
+    out on their own (issue #80). When closes_daily is omitted, read the
+    anchors fetch_prices already stored on the row.
+    """
+    out: dict[str, tuple[float, float]] = {}
+    for r in price_rows:
+        if r.ticker in _EXCLUDED_UNEXPLAINED_MOVE_TICKERS:
+            continue
+        if closes_daily and report_date is not None and r.ticker in closes_daily:
+            pre = _closes_before_report(closes_daily[r.ticker], report_date)
+            if slot == "am":
+                if len(pre) < 2:
+                    continue
+                numerator = float(pre.iloc[-1])
+                before = pre.iloc[:-1]
+            else:
+                numerator = float(r.price)
+                before = pre
+            pct_3d = multiday_return_pct(numerator, before, 3)
+            pct_5d = multiday_return_pct(numerator, before, 5)
+        else:
+            pct_3d = float(getattr(r, "change_3d_pct", 0.0) or 0.0)
+            pct_5d = float(r.week_change_pct or 0.0)
+        out[r.ticker] = (pct_3d, pct_5d)
+    return out
+
+
+def _unexplained_move_search_jobs(
+    price_rows: list,
+    multiday_moves: dict,
+    covered_tickers: set[str],
+    run_slot: str,
+    today_et: str,
+    query_days: int,
+    max_jobs: int = 2,
+) -> list[dict]:
+    """Catalyst queries for multi-day moves today's anomaly jobs did not cover.
+
+    Fires even when that ticker's same-day change is under the anomaly
+    threshold. 3-day >= 15% wins over 5-day >= 20%. At most max_jobs per run.
+    AM and PM share this rule (`run_slot` is accepted so the call site
+    matches issue #80 and can grow a session word later).
+    """
+    candidates = []
+    for r in price_rows:
+        if r.ticker in covered_tickers or r.ticker in _EXCLUDED_UNEXPLAINED_MOVE_TICKERS:
+            continue
+        pct_3d, pct_5d = multiday_moves.get(r.ticker, (0.0, 0.0))
+        if abs(pct_3d) >= 15.0:
+            candidates.append((r.ticker, 3, pct_3d))
+        elif abs(pct_5d) >= 20.0:
+            candidates.append((r.ticker, 5, pct_5d))
+    candidates.sort(key=lambda c: abs(c[2]), reverse=True)
+    jobs = []
+    for ticker, window_days, pct in candidates[:max_jobs]:
+        direction = "surged" if pct > 0 else "dropped"
+        query = (
+            f"{ticker} stock {direction} {abs(pct):.1f}% over {window_days} "
+            f"trading days reason catalyst {today_et}"
+        )
+        jobs.append({
+            "query": query,
+            "search_depth": "basic",
+            "days": min(int(query_days), window_days + 2),
+            "max_results": 15,
+            "_unexplained_move_ticker": ticker,
+        })
+    if jobs:
+        names = ", ".join(j["_unexplained_move_ticker"] for j in jobs)
+        logger.info(f"Issue #80 unexplained-move queries ({run_slot}): {names}")
+    return jobs
+
+
+def _build_unexplained_move_note(covered_tickers: list[str]) -> str:
+    if not covered_tickers:
+        return ""
+    return (
+        "以下标的近3日或5日累计涨跌已超过阈值，系统已自动生成追因查询，不需要你重复建议同名 ticker 的查询："
+        + ", ".join(covered_tickers)
+        + "。"
+    )
+
+
 def _rotation_search_job(today_et: str, anomaly_tickers: set[str] | None = None) -> dict | None:
     """Pick one core holding for today via date.toordinal() % N — self-correcting
     if the holding list changes, no persisted state to go stale."""
@@ -1580,6 +1700,18 @@ def _main_body():
     calibration_notes = _load_recent_calibration_notes() if run_slot == "am" else ""
 
     anomaly_tickers_note = _build_anomaly_tickers_note(covered_anomaly_tickers)
+    multiday_moves = _compute_multiday_moves(price_rows, slot=run_slot)
+    unexplained_jobs = _unexplained_move_search_jobs(
+        price_rows,
+        multiday_moves,
+        covered_tickers=set(covered_anomaly_tickers),
+        run_slot=run_slot,
+        today_et=today_et,
+        query_days=query_days,
+    )
+    unexplained_move_note = _build_unexplained_move_note(
+        [j["_unexplained_move_ticker"] for j in unexplained_jobs]
+    )
 
     prompt = USER_PROMPT_TEMPLATE.format(
         date=today_et,
@@ -1601,6 +1733,7 @@ def _main_body():
         calibration_notes=calibration_notes,
         verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P1 if run_slot == "am" else "",
         anomaly_tickers_note=anomaly_tickers_note,
+        unexplained_move_note=unexplained_move_note,
     )
     result = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
     llm_meta_p1 = result.get("_llm_meta", {})
@@ -1608,7 +1741,10 @@ def _main_body():
     # 8. Build search job list — all basic (Extract provides the depth)
     # AM anomaly: downgraded to basic (saves 1cr vs old advanced; Extract compensates)
     # PM and AM anomaly jobs both run; Finnhub is supplemental context only.
+    # Priority: anomaly, then multi-day moves that were not in that top 3,
+    # then Pass 1's own queries, then issue #33 rotation.
     all_search_jobs: list[dict] = list(anomaly_search_jobs)
+    all_search_jobs.extend(unexplained_jobs)
 
     # Precise date range for Tavily (replaces days=N)
     search_start = last_date if last_date != "N/A（首次运行）" else None
