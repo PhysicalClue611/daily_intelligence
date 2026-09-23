@@ -82,36 +82,8 @@ _GEMMA_PROVIDERS = {"order": ["OpenInference"], "allow_fallbacks": True}
 
 DEFAULTS: dict[str, dict] = {
     # ── Report pipeline (run_finance.py / calibration.py via llm_client.py) ──
-    "report_pass1": {
-        # Not deepseek-v4-flash (issue #59): the comment this replaced claimed
-        # "Flash defaults to no-thinking when the key is absent entirely" —
-        # false. Two real production failures on 2026-08-03 (AM report: 2
-        # back-to-back finish_reason=length before a third attempt scraped
-        # by; PM calibration reuse of this same stage: 3/3 failed, rescued
-        # only by fallback_model) showed it burns the full max_tokens budget
-        # on hidden reasoning with no thinking key sent at all — the same
-        # failure shape issue #53 fixed for tg_preprocess/tg_gap_detect/
-        # semantic_filter, just never applied here. Verified live
-        # (2026-08-03/04): google/gemma-4-31b-it reproduced
-        # reasoning_tokens=0, finish_reason=stop across 6/6 real calls on
-        # both this stage's actual prompt shape and am_calibration's, using
-        # today's real price/news/signals data, while deepseek-v4-flash
-        # failed 4/4 on the identical reconstructed prompts (confirming the
-        # test faithfully reproduced the production failure). Output quality
-        # checked, not just structural JSON validity: correct 4-section
-        # report_md, correct [!]-ticker identification, schema-compliant
-        # 可验证信号/tavily_queries. providers is _GEMMA_PROVIDERS (not the
-        # DeepSeek DigitalOcean/Venice pin) because gemma isn't routed
-        # through those.
-        "gateway": "openrouter",
-        "model": "google/gemma-4-31b-it",
-        "providers": _GEMMA_PROVIDERS,
-        "max_tokens": 4000,
-        "temperature": 0.2,
-        "fallback_model": "google/gemini-3.1-flash-lite",  # OR service_tier=flex
-    },
     # AM-prediction calibration (calibration.py's _evaluate_am_predictions,
-    # PM slot only). Split out from report_pass1 (issue #59) rather than
+    # PM slot only). Originally split out from the old report_pass1 (issue #59) rather than
     # reusing that stage the way the old code did — same reasoning as "Why
     # gap detection and followup reasoning are separate stages" above: a
     # future tuning change to report_pass1's budget/model for the main
@@ -155,14 +127,6 @@ DEFAULTS: dict[str, dict] = {
         "max_tokens": 16000,
         "temperature": 0.2,
         "fallback_model": "google/gemini-3.5-flash",
-    },
-    "semantic_filter": {
-        "gateway": "openrouter",
-        "model": "google/gemma-4-31b-it",
-        "providers": _GEMMA_PROVIDERS,
-        "max_tokens": 200,
-        "temperature": 0.0,
-        "fallback_model": "google/gemini-3.1-flash-lite",
     },
     "macro_brief": {
         "gateway": "openrouter",

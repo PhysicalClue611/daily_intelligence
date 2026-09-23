@@ -3,7 +3,7 @@
 Regression tests for llm_config.py (issue #11).
 
 No pytest dependency — plain asserts, same style as
-test_intel_sources_sanitize.py / test_run_finance_semantic_filter.py.
+test_intel_sources_sanitize.py.
 
 The point of these is the fail-safe contract: this config file is edited by
 hand, outside code review, and sits in front of the unattended AM/PM report
@@ -70,11 +70,11 @@ def _levels(records, level):
 
 def test_defaults_when_file_missing():
     _load(None)
-    assert llm_config.model("report_pass1") == "google/gemma-4-31b-it"
+    assert llm_config.model("am_calibration") == "google/gemma-4-31b-it"
     assert llm_config.model("am_calibration") == "google/gemma-4-31b-it"
     assert llm_config.model("report_pass2") == "openai/gpt-5.6-luna"
     assert llm_config.stage("report_pass2")["reasoning"] == {"effort": "high"}
-    assert llm_config.model("semantic_filter") == "google/gemma-4-31b-it"
+    assert llm_config.model("sas_candidate_extract") == "google/gemma-4-31b-it"
     assert llm_config.model("tg_followup") == "openai/gpt-5.6-luna"
     assert llm_config.stage("tg_followup")["reasoning"] == {"effort": "high"}
     assert llm_config.stage("tg_followup")["fallback_model"] == "x-ai/grok-4.5"
@@ -101,8 +101,8 @@ def test_valid_override_applies_and_is_logged():
 
 
 def test_flat_form_without_stages_wrapper():
-    _load({"semantic_filter": {"model": "google/gemini-3.1-flash-lite"}})
-    assert llm_config.model("semantic_filter") == "google/gemini-3.1-flash-lite"
+    _load({"sas_candidate_extract": {"model": "google/gemini-3.1-flash-lite"}})
+    assert llm_config.model("sas_candidate_extract") == "google/gemini-3.1-flash-lite"
 
 
 def test_malformed_json_falls_back_to_defaults():
@@ -172,13 +172,13 @@ def test_valid_structural_values_accepted():
             "providers": {"order": ["DeepSeek"], "allow_fallbacks": False},
             "fallback_reasoning": {"effort": "high"},
         },
-        "report_pass1": {"providers": None, "thinking": None},
+        "am_calibration": {"providers": None, "thinking": None},
     }})
     cfg = llm_config.stage("tg_followup")
     assert cfg["thinking"] == {"type": "enabled", "budget_tokens": 5000}
     assert cfg["providers"] == {"order": ["DeepSeek"], "allow_fallbacks": False}
     assert cfg["fallback_reasoning"] == {"effort": "high"}
-    assert llm_config.stage("report_pass1")["providers"] is None
+    assert llm_config.stage("am_calibration")["providers"] is None
 
 
 def test_thinking_budget_without_headroom_reverts_both_fields():
@@ -214,10 +214,10 @@ def test_thinking_budget_with_headroom_is_accepted():
 
 
 def test_thinking_budget_check_skipped_when_thinking_disabled():
-    # report_pass1 has no thinking config — an aggressively small max_tokens
+    # am_calibration has no thinking config — an aggressively small max_tokens
     # there is a different (legitimate) tuning choice, not a starvation risk.
-    records = _load({"stages": {"report_pass1": {"max_tokens": 50}}})
-    assert llm_config.stage("report_pass1")["max_tokens"] == 50
+    records = _load({"stages": {"am_calibration": {"max_tokens": 50}}})
+    assert llm_config.stage("am_calibration")["max_tokens"] == 50
     assert not any("thinking.budget_tokens" in m for m in _levels(records, "WARNING"))
 
 
@@ -226,10 +226,10 @@ def test_provider_pass_through_unknown_keys():
     # data_collection) while still logging "override applied" for order/
     # allow_fallbacks makes an edit look like it took effect when part of it
     # silently vanished.
-    _load({"stages": {"report_pass1": {
+    _load({"stages": {"am_calibration": {
         "providers": {"order": ["DeepSeek"], "allow_fallbacks": True,
                       "data_collection": "deny", "quantizations": ["fp16"]}}}})
-    providers = llm_config.stage("report_pass1")["providers"]
+    providers = llm_config.stage("am_calibration")["providers"]
     assert providers["data_collection"] == "deny"
     assert providers["quantizations"] == ["fp16"]
     assert providers["order"] == ["DeepSeek"]
@@ -241,15 +241,15 @@ def test_stage_returns_are_independent_deep_copies():
     # mutating one stage's returned providers dict corrupt every other stage
     # that still points at the same default — persisting for the life of the
     # long-running Telegram bot process.
-    # report_pass1 and semantic_filter both default to the shared
+    # am_calibration and sas_candidate_extract both default to the shared
     # _GEMMA_PROVIDERS object; report_pass2 and tg_followup each have their
     # own independent OpenAI-pin literal now (issue #60), not a shared one.
     _load(None)
-    a = llm_config.stage("report_pass1")
+    a = llm_config.stage("am_calibration")
     a["providers"]["order"].append("Mutated")
-    b = llm_config.stage("semantic_filter")  # also defaults to the shared _GEMMA_PROVIDERS
+    b = llm_config.stage("sas_candidate_extract")  # also defaults to the shared _GEMMA_PROVIDERS
     assert "Mutated" not in b["providers"]["order"]
-    c = llm_config.stage("report_pass1")
+    c = llm_config.stage("am_calibration")
     assert "Mutated" not in c["providers"]["order"]
 
 
@@ -554,20 +554,16 @@ def test_call_llm_parse_json_false_unwraps_legacy_json_report_md():
     assert out["text"] == "# Report\n\nBody text.", repr(out["text"])
 
 
-def test_calibration_uses_its_own_stage_not_report_pass1():
-    # issue #59: calibration.py used to hardcode stage="report_pass1" (its
-    # justification was "same model/budget as the main report", but that
-    # coupling meant a future report_pass1 tuning change would silently also
-    # change this unrelated judgement call). Verify it now resolves against
-    # its own "am_calibration" stage — overriding report_pass1 alone must not
-    # affect it, and overriding am_calibration must.
+def test_calibration_uses_its_own_stage():
+    # Calibration must continue using am_calibration even if report_pass2 is
+    # independently overridden after removal of the old report_pass1 stage.
     import llm_client
     import calibration
     importlib.reload(llm_client)
     importlib.reload(calibration)
     calibration.OPENROUTER_API_KEY = "test-key"
     _load({"stages": {
-        "report_pass1": {"model": "x-ai/grok-4.5"},
+        "report_pass2": {"model": "x-ai/grok-4.5"},
         "am_calibration": {"model": "google/gemini-3.5-flash"},
     }})
     captured = {}

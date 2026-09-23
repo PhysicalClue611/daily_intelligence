@@ -91,12 +91,9 @@ def _source_name(url: str) -> str:
 
 def _classify_topics(title: str, summary: str, geo_keywords: dict[str, list[str]]) -> list[str]:
     """Return list of geopolitics topic keys that match this article."""
-    text = (title + " " + summary).lower()
-    matched = []
-    for topic, keywords in geo_keywords.items():
-        if any(kw.lower() in text for kw in keywords):
-            matched.append(topic)
-    return matched
+    from intel_collect import match_geo_topics
+    text = title + " " + summary
+    return match_geo_topics(text, geo_keywords)
 
 
 def fetch_rss(
@@ -215,46 +212,3 @@ def fetch_guardian_news(
         ))
     logger.info(f"Guardian API: fetched {len(items)} items")
     return items
-
-
-def format_news_for_prompt(items: list[NewsItem], geo_keywords: dict[str, list[str]]) -> str:
-    """
-    Format news into structured text for LLM consumption.
-    Groups by geopolitics topic first, then uncategorized market news.
-    """
-    if not items:
-        return "_无最新新闻_"
-
-    sections: dict[str, list[NewsItem]] = {topic: [] for topic in geo_keywords}
-    market_items: list[NewsItem] = []
-
-    for item in items:
-        placed = False
-        for topic in item.topics:
-            if topic in sections:
-                sections[topic].append(item)
-                placed = True
-        if not placed:
-            market_items.append(item)
-
-    parts = []
-
-    # Geopolitics sections
-    for topic, topic_items in sections.items():
-        if not topic_items:
-            continue
-        parts.append(f"[{topic}]")
-        for it in topic_items[:5]:
-            ts = it.published.strftime("%m-%d %H:%M UTC")
-            parts.append(f"  • [{ts}] {it.title} ({it.source})")
-            if it.summary:
-                parts.append(f"    {it.summary[:200]}")
-
-    # General market/business news (cap at 20)
-    if market_items:
-        parts.append("[市场财经]")
-        for it in market_items[:20]:
-            ts = it.published.strftime("%m-%d %H:%M UTC")
-            parts.append(f"  • [{ts}] {it.title} ({it.source})")
-
-    return "\n".join(parts)

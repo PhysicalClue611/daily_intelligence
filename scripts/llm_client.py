@@ -19,7 +19,7 @@ generic LLM-calling leaf module. All 3 call sites already pass it
 explicitly or were updated to.
 
 Model/provider/thinking/token choices are no longer literals here: they come
-from llm_config.py stages ("report_pass1"/"report_pass2"), which are runtime
+from llm_config.py stages ("report_pass2" and other active stages), which are runtime
 -overridable via llm_config.json (issue #11). This also retires the old
 `is_pass2 = (model == LLM_MODEL_PASS2)` inference, which coupled "which
 thinking config do I use" to string equality against a constant — that would
@@ -104,7 +104,7 @@ def _resolve_content(msg: dict, finish_reason: str | None) -> str:
 
 
 def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
-             stage: str = "report_pass1", parse_json: bool = True) -> dict:
+             stage: str = "report_pass2", parse_json: bool = True) -> dict:
     """Call the configured model for `stage` via OpenRouter, return a result dict.
 
     Retries on network/5xx/429 errors, then falls back to the stage's
