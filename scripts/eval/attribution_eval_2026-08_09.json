@@ -1,0 +1,170 @@
+[
+  {
+    "date": "2026-08-03",
+    "slot": "pm",
+    "ticker": "ORCL",
+    "driver": "Alphabet/Google AI partnership",
+    "pattern": "Alphabet|Google"
+  },
+  {
+    "date": "2026-08-04",
+    "slot": "pm",
+    "ticker": "PLTR",
+    "driver": "Q2 earnings/guidance",
+    "pattern": "earnings|quarter|guidance|outlook"
+  },
+  {
+    "date": "2026-08-04",
+    "slot": "pm",
+    "ticker": "INTC",
+    "driver": "chip sector rally",
+    "pattern": "chip stocks|chip rally|semiconductor"
+  },
+  {
+    "date": "2026-08-04",
+    "slot": "pm",
+    "ticker": "AMKR",
+    "driver": "Nvidia packaging deal / Q2",
+    "pattern": "Nvidia|earnings|Q2"
+  },
+  {
+    "date": "2026-08-05",
+    "slot": "pm",
+    "ticker": "SPCX",
+    "driver": "AI capex + lockup",
+    "pattern": "capex|spending|lockup|unlock"
+  },
+  {
+    "date": "2026-08-07",
+    "slot": "pm",
+    "ticker": "SPCX",
+    "driver": "Argus upgrade / lockup non-event",
+    "pattern": "Argus|upgrade|lockup|unlock"
+  },
+  {
+    "date": "2026-08-07",
+    "slot": "pm",
+    "ticker": "PLTR",
+    "driver": "BofA bullish",
+    "pattern": "Bank of America|BofA"
+  },
+  {
+    "date": "2026-08-12",
+    "slot": "pm",
+    "ticker": "SPCX",
+    "driver": "Norway SWF stake / IPO price",
+    "pattern": "Norway|sovereign|IPO price"
+  },
+  {
+    "date": "2026-08-18",
+    "slot": "pm",
+    "ticker": "AMKR",
+    "driver": "yields spike sector selloff",
+    "pattern": "yield|Treasury|outlook"
+  },
+  {
+    "date": "2026-08-18",
+    "slot": "pm",
+    "ticker": "INTC",
+    "driver": "$20B offering dilution + selloff",
+    "pattern": "dilution|offering|secondary|fundrais"
+  },
+  {
+    "date": "2026-08-27",
+    "slot": "am",
+    "ticker": "NVDA",
+    "driver": "earnings/guidance",
+    "pattern": "earnings|guidance|forecast"
+  },
+  {
+    "date": "2026-08-27",
+    "slot": "pm",
+    "ticker": "AMKR",
+    "driver": "BofA initiation Buy",
+    "pattern": "BofA|Bank of America|initiat"
+  },
+  {
+    "date": "2026-09-03",
+    "slot": "pm",
+    "ticker": "PLTR",
+    "driver": "PwC alliance",
+    "pattern": "PwC"
+  },
+  {
+    "date": "2026-09-04",
+    "slot": "pm",
+    "ticker": "TSLA",
+    "driver": "Cybercab underwhelms + NHTSA",
+    "pattern": "Cybercab|NHTSA"
+  },
+  {
+    "date": "2026-09-08",
+    "slot": "pm",
+    "ticker": "INTC",
+    "driver": "CPU price hike report + Northland",
+    "pattern": "price (hike|increase)|Northland|Terafab"
+  },
+  {
+    "date": "2026-09-10",
+    "slot": "pm",
+    "ticker": "INTC",
+    "driver": "Piper Sandler neutral / Mizuho",
+    "pattern": "Piper Sandler|Mizuho"
+  },
+  {
+    "date": "2026-09-14",
+    "slot": "pm",
+    "ticker": "AMKR",
+    "driver": "AI slowdown call",
+    "pattern": "Amodei|Anthropic|slow"
+  },
+  {
+    "date": "2026-09-14",
+    "slot": "pm",
+    "ticker": "ASML",
+    "driver": "AI slowdown call",
+    "pattern": "Amodei|Anthropic|slow"
+  },
+  {
+    "date": "2026-09-14",
+    "slot": "pm",
+    "ticker": "AAOI",
+    "driver": "Corning offering / AI slowdown",
+    "pattern": "Corning|offering|Amodei|Anthropic"
+  },
+  {
+    "date": "2026-09-17",
+    "slot": "pm",
+    "ticker": "INTC",
+    "driver": "SK Hynix Ohio talks",
+    "pattern": "Hynix"
+  },
+  {
+    "date": "2026-09-18",
+    "slot": "pm",
+    "ticker": "QCOM",
+    "driver": "profit taking",
+    "pattern": "profit.taking|rally unwinds"
+  },
+  {
+    "date": "2026-09-21",
+    "slot": "pm",
+    "ticker": "QCOM",
+    "driver": "Lumentum/Corning optical + Amazon",
+    "pattern": "Lumentum|Corning|optical|Amazon"
+  },
+  {
+    "date": "2026-09-21",
+    "slot": "am",
+    "ticker": "INTC",
+    "driver": "AUO Micro LED packaging",
+    "pattern": "AUO|Micro ?LED"
+  },
+  {
+    "date": "2026-09-21",
+    "slot": "pm",
+    "ticker": "INTC",
+    "driver": "Meta Muse CPU demand / AUO",
+    "pattern": "Muse|AUO|Micro ?LED"
+  }
+]

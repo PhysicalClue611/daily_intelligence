@@ -54,6 +54,7 @@ from fetch_prices import (
     multiday_return_pct,
 )
 from fetch_news import fetch_rss, fetch_guardian_news, format_news_for_prompt
+from publication_window import _session_anchor, _unexplained_publication_window
 from memory_context_finance import get_finance_context
 
 from finance_email import send_report
@@ -235,9 +236,11 @@ def load_watchlist() -> dict:
 
     logger.info(f"Watchlist loaded: {len(stocks)} stocks, {len(commodities)} commodities, "
                 f"{len(fx)} fx, {len(geo_keywords)} geo topics, {len(recipients)} recipients")
+    from intel_collect import parse_aliases
     return dict(
         stocks=stocks, commodities=commodities, fx=fx,
         geo_keywords=geo_keywords, thresholds=thresholds, recipients=recipients,
+        entity_aliases=parse_aliases(text),
     )
 
 
@@ -1551,36 +1554,6 @@ def _compute_multiday_moves(
     return out
 
 
-def _session_anchor(today_et: str, sessions_back: int):
-    """Date of the close `sessions_back` NYSE sessions before today_et."""
-    today = datetime.strptime(today_et, "%Y-%m-%d").date()
-    try:
-        import exchange_calendars as xcals
-        nyse = xcals.get_calendar("XNYS")
-        start = today - timedelta(days=sessions_back * 3 + 14)
-        sessions = nyse.sessions_in_range(str(start), str(today - timedelta(days=1)))
-        if len(sessions) >= sessions_back:
-            return sessions[-sessions_back].date()
-    except Exception as e:
-        logger.warning(f"NYSE session walk failed ({e}); using a longer calendar fallback")
-    return today - timedelta(days=sessions_back + 4)
-
-
-def _unexplained_publication_window(today_et: str, window_days: int, slot: str) -> tuple[str, str, int]:
-    """Published-date window covering the move's first session plus 2 calendar days.
-
-    AM's numerator is the previous close, so its anchor is one session further
-    back than the same window on a PM run. query_days is not an input: capping
-    by the gap since the last report is what dropped the 09-21 catalyst.
-    """
-    sessions_back = window_days + (1 if slot == "am" else 0)
-    anchor = _session_anchor(today_et, sessions_back)
-    start = anchor - timedelta(days=2)
-    end = datetime.strptime(today_et, "%Y-%m-%d").date()
-    days = max((end - start).days, window_days + 2)
-    return start.isoformat(), end.isoformat(), days
-
-
 def _job_search_bounds(job: dict, default_start, default_end, default_days):
     """Bounds the search loop actually sends. A job key wins over the default."""
     return (
@@ -1699,6 +1672,25 @@ def main():
         LOCK_FILE.unlink(missing_ok=True)
 
 
+def _run_shadow_ledger(wl, now_et, run_slot, price_rows, multiday_moves, today_et):
+    """Collect an independent ledger; source/archive errors cannot block reports."""
+    try:
+        from intel_pass0 import build_ledger
+        windows = {}
+        for ticker, (d3, d5) in multiday_moves.items():
+            days = 5 if d5 is not None and abs(d5) >= 20 else (3 if d3 is not None and abs(d3) >= 15 else 0)
+            if days:
+                windows[ticker] = _unexplained_publication_window(today_et, days, run_slot)[0]
+        ledger, ledger_path = build_ledger(
+            wl, now_et, run_slot, price_rows=price_rows, multiday_moves=multiday_moves,
+            window_starts=windows, held=set(_get_core_holding_tickers()),
+            weights=_get_portfolio_weights(),
+        )
+        logger.info("Pass0 shadow ledger: %s entities, %s", len(ledger["entities"]), ledger_path)
+    except Exception as exc:
+        logger.warning("Pass0 shadow ledger failed (report unaffected): %s", exc)
+
+
 def _main_body():
     # 0. Handle forced overrides (for manual re-runs)
     force_date = os.getenv("FINANCE_FORCE_DATE", "")
@@ -1813,6 +1805,9 @@ def _main_body():
     )
     covered_anomaly_tickers = _anomaly_tickers_from_jobs(anomaly_search_jobs)
     multiday_moves = _compute_multiday_moves(price_rows, slot=run_slot)
+    # Issue #87 PR1: build a separate shadow ledger. It cannot affect the
+    # existing search/report/write path, even when a free source fails.
+    _run_shadow_ledger(wl, now_et, run_slot, price_rows, multiday_moves, today_et)
     unexplained_jobs = _unexplained_move_search_jobs(
         price_rows,
         multiday_moves,
