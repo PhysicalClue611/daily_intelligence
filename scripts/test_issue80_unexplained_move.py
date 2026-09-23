@@ -16,6 +16,7 @@ No pytest. Run:
 """
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 from datetime import date
@@ -116,7 +117,7 @@ def _fetch(slot: str):
     return {r.ticker: r for r in rows}
 
 
-def _row(ticker, change_pct, week=0.0, change_3d=0.0, anomaly=False, price=100.0):
+def _row(ticker, change_pct, week=0.0, change_3d=0.0, change_5d=None, anomaly=False, price=100.0):
     return PriceRow(
         ticker=ticker,
         display=ticker,
@@ -127,6 +128,7 @@ def _row(ticker, change_pct, week=0.0, change_3d=0.0, anomaly=False, price=100.0
         is_anomaly=anomaly,
         unit="$",
         change_3d_pct=change_3d,
+        change_5d_pct=change_5d if change_5d is not None else week,
     )
 
 
@@ -152,9 +154,13 @@ def test_am_20260922_intc_is_quiet_today_but_3day_move_is_queued():
         "INTC stock surged 20.5% over 3 trading days reason catalyst 2026-09-22"
     )
     assert jobs[0]["search_depth"] == "basic"
-    assert jobs[0]["days"] == min(2, 3 + 2)
     assert jobs[0]["max_results"] == 15
     assert "resolved" not in jobs[0]
+    # 3 trading sessions before the 09-21 close, plus 2 calendar days.
+    # Must not collapse to query_days=2, and must not inherit a same-day range.
+    assert jobs[0]["start_date"] == "2026-09-14"
+    assert jobs[0]["end_date"] == "2026-09-22"
+    assert jobs[0]["days"] >= 8
 
 
 def test_pm_20260922_intc_uses_5day_window_when_3day_is_under_15():
@@ -185,7 +191,10 @@ def test_pm_20260922_intc_uses_5day_window_when_3day_is_under_15():
     assert jobs[0]["query"] == (
         "INTC stock surged 27.5% over 5 trading days reason catalyst 2026-09-22"
     )
-    assert jobs[0]["days"] == min(1, 5 + 2)
+    # 5 sessions before 09-22 is 09-15; buffer pushes the published-date start to 09-13.
+    assert jobs[0]["start_date"] == "2026-09-13"
+    assert jobs[0]["end_date"] == "2026-09-22"
+    assert jobs[0]["days"] > 1
 
 
 def test_pm_ignores_a_stale_today_bar_and_uses_the_intraday_close():
@@ -253,6 +262,67 @@ def test_excludes_commodity_fx_index_etf_and_aaoi():
     assert [j["_unexplained_move_ticker"] for j in jobs] == ["INTC"]
 
 
+def test_publication_window_overrides_last_report_range():
+    """The search loop's last-report default must not replace this job's dates."""
+    row = _row("INTC", 1.71, week=27.5, change_3d=13.8, change_5d=27.5, price=_PM_CLOSE)
+    moves = {"INTC": (13.8, 27.5)}
+    jobs = rf._unexplained_move_search_jobs(
+        [row], moves, covered_tickers=set(), run_slot="pm",
+        today_et=TODAY, query_days=1,
+    )
+    start, end, days = rf._job_search_bounds(
+        jobs[0], default_start="2026-09-22", default_end="2026-09-22", default_days=1,
+    )
+    assert start == "2026-09-13"
+    assert end == "2026-09-22"
+    assert days > 1
+    payload_uses_dates = bool(start and end)
+    assert payload_uses_dates
+
+
+def test_quiet_book_still_runs_when_a_multiday_move_is_eligible():
+    row = _row("INTC", -1.28, change_3d=20.5, change_5d=25.3)
+    moves = rf._compute_multiday_moves([row], slot="am")
+    jobs = rf._unexplained_move_search_jobs(
+        [row], moves, covered_tickers=set(), run_slot="am", today_et=TODAY, query_days=1,
+    )
+    assert jobs and jobs[0]["_unexplained_move_ticker"] == "INTC"
+    assert rf._should_skip_no_signal(False, [], jobs) is False
+    assert rf._should_skip_no_signal(False, [], []) is True
+    src = inspect.getsource(rf._main_body)
+    build = src.find("unexplained_jobs = _unexplained_move_search_jobs")
+    gate = src.find("_should_skip_no_signal")
+    assert build != -1 and gate != -1 and build < gate
+
+
+def test_short_history_is_not_labeled_as_a_full_window():
+    from fetch_prices import multiday_return_pct
+    before = pd.Series(
+        [80.0, 90.0],
+        index=pd.to_datetime(["2026-09-18", "2026-09-21"]),
+    )
+    assert multiday_return_pct(100.0, before, 5, allow_short=True) == 25.0
+    assert multiday_return_pct(100.0, before, 3, allow_short=False) is None
+    assert multiday_return_pct(100.0, before, 5, allow_short=False) is None
+
+    # 4 prior closes: 3-day anchor exists and is small; a 5-day fallback to
+    # the oldest close would be +102% and must not become a 5-day trigger.
+    closes = pd.Series(
+        [50.0, 98.0, 99.0, 100.0],
+        index=pd.to_datetime(["2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21"]),
+    )
+    row = _row("INTC", 1.0, week=102.0, change_3d=None, change_5d=None, price=101.0)
+    moves = rf._compute_multiday_moves(
+        [row], closes_daily={"INTC": closes}, report_date=REPORT, slot="pm",
+    )
+    assert moves["INTC"][0] is not None and abs(moves["INTC"][0]) < 15
+    assert moves["INTC"][1] is None
+    jobs = rf._unexplained_move_search_jobs(
+        [row], moves, covered_tickers=set(), run_slot="pm", today_et=TODAY, query_days=1,
+    )
+    assert jobs == []
+
+
 def test_pass1_prompt_names_unexplained_tickers():
     assert "{unexplained_move_note}" in rf.USER_PROMPT_TEMPLATE
     note = rf._build_unexplained_move_note(["INTC"])
@@ -290,6 +360,9 @@ def run():
         test_anomaly_covered_ticker_is_not_queued_again,
         test_max_jobs_is_2_and_largest_abs_move_wins,
         test_excludes_commodity_fx_index_etf_and_aaoi,
+        test_publication_window_overrides_last_report_range,
+        test_quiet_book_still_runs_when_a_multiday_move_is_eligible,
+        test_short_history_is_not_labeled_as_a_full_window,
         test_pass1_prompt_names_unexplained_tickers,
     ]
     failed = []

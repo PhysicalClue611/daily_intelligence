@@ -61,27 +61,38 @@ class PriceRow:
     afterhours_pct: float = 0.0     # PM only: after-hours change % vs today's close
     session_change_pct: float = 0.0 # AM: prev day close vs open; PM: today close vs today open
     slot: str = "daily"             # "am", "pm", "daily"
-    change_3d_pct: float = 0.0      # 3 trading-day change %; same anchor rule as week_change_pct
+    change_3d_pct: float | None = None   # None unless 3 prior sessions exist
+    change_5d_pct: float | None = None   # None unless 5 prior sessions exist; week_change_pct may still show a short-history fallback
 
 
-def multiday_return_pct(numerator: float, closes_before_numerator, n: int) -> float:
+def multiday_return_pct(
+    numerator: float,
+    closes_before_numerator,
+    n: int,
+    allow_short: bool = True,
+) -> float | None:
     """Percent change versus the close `n` sessions before `numerator`.
 
     `closes_before_numerator` does not include the numerator bar. The anchor
     is iloc[-n], i.e. iloc[-1-n] on a series that appends numerator as the
     last row. Do not assume the bulk download's last row is today (issue #69).
-    A short history uses the oldest close, matching the previous week_change fallback.
+
+    `allow_short=True` keeps the price-table fallback: fewer than `n` closes
+    uses the oldest close. Trigger logic passes `allow_short=False` and gets
+    None, so a short series is not labeled as a full 3-day or 5-day move.
     """
     if closes_before_numerator is None or len(closes_before_numerator) == 0:
-        return 0.0
+        return 0.0 if allow_short else None
     if not numerator:
-        return 0.0
+        return 0.0 if allow_short else None
     if len(closes_before_numerator) >= n:
         anchor = float(closes_before_numerator.iloc[-n])
-    else:
+    elif allow_short:
         anchor = float(closes_before_numerator.iloc[0])
+    else:
+        return None
     if anchor == 0:
-        return 0.0
+        return 0.0 if allow_short else None
     return (float(numerator) - anchor) / anchor * 100.0
 
 
@@ -550,7 +561,8 @@ def fetch_prices(
             afterhours_pct     = 0.0
             session_change_pct = 0.0
             week_change_pct    = 0.0
-            change_3d_pct      = 0.0
+            change_3d_pct      = None
+            change_5d_pct      = None
 
             if slot == "am":
                 # Use only sessions strictly before report_date so this is correct both at
@@ -575,7 +587,8 @@ def fetch_prices(
                     continue
                 _before_prev = _closes_pre.iloc[:-1]
                 week_change_pct = multiday_return_pct(prev_close, _before_prev, 5)
-                change_3d_pct = multiday_return_pct(prev_close, _before_prev, 3)
+                change_3d_pct = multiday_return_pct(prev_close, _before_prev, 3, allow_short=False)
+                change_5d_pct = multiday_return_pct(prev_close, _before_prev, 5, allow_short=False)
                 # session_change_pct = close vs prior close (Yahoo Finance "day change" for yesterday)
                 session_change_pct = (prev_close - prev_prev_close) / prev_prev_close * 100
                 # premarket price
@@ -635,7 +648,8 @@ def fetch_prices(
                 # "today" row, present or not) — anchoring to the batch's raw last row would
                 # be off by a day whenever "today" is missing from the batch (issue #69 §4).
                 week_change_pct = multiday_return_pct(price, _closes_prev, 5)
-                change_3d_pct = multiday_return_pct(price, _closes_prev, 3)
+                change_3d_pct = multiday_return_pct(price, _closes_prev, 3, allow_short=False)
+                change_5d_pct = multiday_return_pct(price, _closes_prev, 5, allow_short=False)
                 change_pct      = (price - prev_close) / prev_close * 100
                 if today_open:
                     session_change_pct = (price - today_open) / today_open * 100
@@ -653,7 +667,8 @@ def fetch_prices(
                 price = float(closes_daily.iloc[-1])
                 _before_last = closes_daily.iloc[:-1]
                 week_change_pct = multiday_return_pct(price, _before_last, 5)
-                change_3d_pct = multiday_return_pct(price, _before_last, 3)
+                change_3d_pct = multiday_return_pct(price, _before_last, 3, allow_short=False)
+                change_5d_pct = multiday_return_pct(price, _before_last, 5, allow_short=False)
                 change_pct = (price - prev_close) / prev_close * 100
 
             # ── Anomaly detection ─────────────────────────────────────────────
@@ -690,6 +705,7 @@ def fetch_prices(
                 session_change_pct=session_change_pct,
                 slot=slot,
                 change_3d_pct=change_3d_pct,
+                change_5d_pct=change_5d_pct,
             ))
         except Exception as e:
             logger.warning(f"{ticker}: {e}")
