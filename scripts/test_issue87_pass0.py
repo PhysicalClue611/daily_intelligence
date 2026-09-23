@@ -10,9 +10,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent))
 
 import intel_collect as collect
-import intel_triage as triage
 from eval.evaluate_issue87 import score_case
-from intel_pass0 import _context_price_rows
+from intel_pass0 import _context_price_rows, build_ledger
 
 
 class PassZeroTest(unittest.TestCase):
@@ -44,13 +43,22 @@ class PassZeroTest(unittest.TestCase):
         self.assertEqual(ledger["coverage"]["finnhub"], 1)
         self.assertTrue(any("rss: skipped in replay" in e for e in ledger["coverage"]["errors"]))
 
-    def test_invalid_triage_preserves_items(self):
-        ledger = {"ticker": "INTC", "name": "Intel", "items": [{"id": "i1", "title": "Intel AUO deal"}],
-                  "move": {"flags": ["anomaly"]}}
-        with patch.object(triage, "call_llm", return_value={"move_status": "unexplained", "events": "bad"}):
-            result = triage.triage_entity(ledger, [])
-        self.assertEqual(result["move_status"], "triage_failed")
-        self.assertEqual(result["items"][0]["title"], "Intel AUO deal")
+    def test_shadow_build_only_collects_and_marks_seen_titles(self):
+        now = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
+        story = collect.item("Intel signs AUO partnership!", "", "Finnhub", "a.com", "u", "direct", now)
+        previous = {"as_of": "2026-09-20T12:00:00+00:00", "date": "2026-09-20", "slot": "pm",
+                    "entities": [{"ticker": "INTC", "items": [{"title": "Intel signs AUO partnership"}]}]}
+        with tempfile.TemporaryDirectory() as root:
+            collect.archive_ledger(previous, Path(root))
+            with patch("llm_client.call_llm", side_effect=AssertionError("shadow mode called LLM")), \
+                 patch.object(collect, "resolve_aliases", return_value=({"INTC": ["Intel", "INTC"]}, {})), \
+                 patch.object(collect, "collect", return_value=([collect.assemble_entity(
+                     "INTC", "Intel", ["Intel", "INTC"], True, 4.0, {}, {"finnhub": [story]}, [], now)],
+                     {"items": [], "geo_topics_hit": [], "coverage": {}})):
+                ledger, _ = build_ledger({"stocks": ["INTC"]}, now, "am", archive_root=Path(root))
+        entity = ledger["entities"][0]
+        self.assertTrue(entity["items"][0]["seen_before"])
+        self.assertFalse(set(entity) & {"events", "move_status", "primary_event_ids", "gap_query"})
 
     def test_atomic_archive(self):
         with tempfile.TemporaryDirectory() as root:
@@ -71,31 +79,13 @@ class PassZeroTest(unittest.TestCase):
         self.assertTrue(all(len(row["summary"]) == 300 for row in found))
         self.assertEqual(found[0]["url_kind"], "finnhub_redirect")
 
-    def test_valid_triage_primary_refs(self):
-        ledger = {"ticker": "INTC", "name": "Intel", "aliases": ["Intel"],
-                  "items": [{"id": "i1", "title": "Intel AUO deal"}], "move": {"flags": ["anomaly"]}}
-        answer = {"events": [{"id": "e1", "headline": "Intel AUO partnership", "date": "2026-09-21",
-                              "type": "partnership", "company_specific": True, "item_ids": ["i1"],
-                              "seen_before": False, "need_fulltext": True}],
-                  "move_status": "explained", "primary_event_ids": ["e1"], "gap_query": ""}
-        with patch.object(triage, "call_llm", return_value=answer):
-            result = triage.triage_entity(ledger, [])
-        self.assertEqual(result["move_status"], "explained")
-        self.assertEqual(result["primary_event_ids"], ["e1"])
-
-    def test_acceptance_scores_only_primary_event_and_non_unexplained(self):
+    def test_acceptance_scores_collection_only(self):
         case = {"date": "2026-09-21", "slot": "am", "ticker": "INTC", "driver": "AUO", "pattern": "AUO"}
         entity = {"ticker": "INTC", "items": [{"title": "AUO deal", "summary": ""}],
-                  "events": [{"id": "e1", "headline": "Unrelated"}, {"id": "e2", "headline": "AUO deal"}],
-                  "primary_event_ids": ["e1"], "move_status": "partial", "coverage": {}}
+                  "coverage": {}}
         scored = score_case(case, {"entities": [entity]})
         self.assertTrue(scored["collection_hit"])
-        self.assertFalse(scored["triage_hit"])
-        entity["primary_event_ids"] = ["e2"]
-        entity["move_status"] = "unexplained"
-        self.assertFalse(score_case(case, {"entities": [entity]})["triage_hit"])
-        entity["move_status"] = "partial"
-        self.assertTrue(score_case(case, {"entities": [entity]})["triage_hit"])
+        self.assertNotIn("triage_hit", scored)
 
     def test_replay_uses_original_am_premarket_move(self):
         context = """## [Context] 2026-09-21 开盘前简报

@@ -26,22 +26,6 @@
     "to the fallback model. Keys starting with '_' are ignored (JSON has no comments)."
   ],
   "stages": {
-    "intel_triage": {
-      "gateway": "openrouter",
-      "model": "google/gemma-4-31b-it",
-      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
-      "max_tokens": 2000,
-      "temperature": 0.0,
-      "fallback_model": null
-    },
-    "macro_triage": {
-      "gateway": "openrouter",
-      "model": "google/gemma-4-31b-it",
-      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
-      "max_tokens": 2000,
-      "temperature": 0.0,
-      "fallback_model": null
-    },
     "report_pass1": {
       "_note": "google/gemma-4-31b-it, not deepseek-v4-flash (issue #59) — two real 2026-08-03 production failures showed Flash burns the full max_tokens budget on hidden reasoning even with no thinking key sent; gemma verified 6/6 clean (reasoning_tokens=0, finish_reason=stop) on the real prompt shape. providers pinned to OpenInference (issue #60) — real calls across gemma stages were observed landing on several different providers with no pin; allow_fallbacks stays true.",
       "gateway": "openrouter",

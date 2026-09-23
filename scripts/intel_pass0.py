@@ -23,7 +23,6 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import intel_collect as collect
-import intel_triage as triage
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -61,9 +60,11 @@ def build_ledger(wl: dict, as_of: datetime, slot: str, *, price_rows: list = (),
                                       wl.get("geo_keywords", {}), as_of, slot, replay=replay,
                                       finnhub_key=os.environ.get("FINNHUB_API_KEY", ""),
                                       guardian_key=os.environ.get("GUARDIAN_API_KEY", ""))
-    previous = {ticker: collect.previous_event_titles(archive_root, as_of, ticker) for ticker in tickers}
-    entities, macro = triage.triage_all(entities, macro, previous)
+    previous = {ticker: {collect.normalize_title(title) for title in
+                         collect.previous_event_titles(archive_root, as_of, ticker)} for ticker in tickers}
     for entity in entities:
+        for row in entity["items"]:
+            row["seen_before"] = collect.normalize_title(row["title"]) in previous[entity["ticker"]]
         if entity["ticker"] in alias_errors:
             entity["coverage"]["errors"].append(alias_errors[entity["ticker"]])
     ledger = {"schema_version": 1, "date": as_of.astimezone(ET).date().isoformat(), "slot": slot,
@@ -75,15 +76,13 @@ def build_ledger(wl: dict, as_of: datetime, slot: str, *, price_rows: list = (),
 def render_summary(ledger: dict) -> str:
     lines = [f"# Pass 0 ledger — {ledger['date']} {ledger['slot']}"]
     for entity in ledger["entities"]:
-        primary = set(entity["primary_event_ids"])
-        events = [e["headline"] for e in entity["events"] if e["id"] in primary]
         coverage = entity["coverage"]
-        lines.append(f"- {entity['ticker']}: {entity['move_status']}; "
-                     f"primary={'; '.join(events) or 'none'}; "
+        lines.append(f"- {entity['ticker']}: {len(entity['items'])} items, "
+                     f"move={entity['move']}; "
                      f"Finnhub={coverage['finnhub']}, Google News={coverage['google_news']}, "
                      f"RSS={coverage['rss']}, Guardian={coverage['guardian']}; "
                      f"errors={'; '.join(coverage['errors']) or 'none'}")
-    lines.append(f"\nMacro events: {len(ledger['macro_digest']['events'])}")
+    lines.append(f"\nMacro items: {len(ledger['macro_digest']['items'])}")
     return "\n".join(lines) + "\n"
 
 

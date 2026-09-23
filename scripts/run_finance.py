@@ -1816,7 +1816,7 @@ def _main_body():
     covered_anomaly_tickers = _anomaly_tickers_from_jobs(anomaly_search_jobs)
     multiday_moves = _compute_multiday_moves(price_rows, slot=run_slot)
     # Issue #87 PR1: build a separate shadow ledger. It cannot affect the
-    # existing search/report/write path, even when a free source or Gemma fails.
+    # existing search/report/write path, even when a free source fails.
     try:
         from intel_pass0 import build_ledger
         _windows = {}

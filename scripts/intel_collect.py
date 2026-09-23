@@ -245,6 +245,10 @@ def deduplicate(rows: list[dict]) -> list[dict]:
     return result
 
 
+def normalize_title(title: str) -> str:
+    return " ".join(re.findall(r"\w+", title.casefold()))
+
+
 def assemble_entity(ticker: str, name: str, aliases: list[str], held: bool, weight_pct: float | None,
                     move: dict, source_items: dict[str, list[dict]], errors: dict[str, str] | list[str],
                     as_of: datetime) -> dict:
@@ -256,8 +260,7 @@ def assemble_entity(ticker: str, name: str, aliases: list[str], held: bool, weig
     rows = [row for group in source_items.values() for row in group
             if datetime.fromisoformat(row["published_at"]) <= _utc(as_of)]
     return {"ticker": ticker, "name": name, "aliases": aliases, "held": held, "weight_pct": weight_pct,
-            "move": move, "coverage": coverage, "items": deduplicate(rows), "events": [],
-            "move_status": "triage_pending", "primary_event_ids": [], "gap_query": "", "fulltext": []}
+            "move": move, "coverage": coverage, "items": deduplicate(rows), "fulltext": []}
 
 
 def _atomic_json(path: Path, data: object) -> None:
@@ -284,19 +287,16 @@ def archive_ledger(ledger: dict, root: Path = ROOT / "archives") -> Path:
 
 def previous_event_titles(root: Path, before: datetime, ticker: str) -> list[str]:
     paths = sorted(root.glob("*/*-ledger.json"), reverse=True)
-    selected = []
     for path in paths:
-        if len(selected) == 2:
-            break
         try:
             data = json.loads(path.read_text())
             if datetime.fromisoformat(data["as_of"]) >= before:
                 continue
-            selected.append(data)
         except (OSError, ValueError, KeyError):
             continue
-    return [event.get("headline", "") for data in selected for entity in data.get("entities", [])
-            if entity.get("ticker") == ticker for event in entity.get("events", [])]
+        return [row.get("title", "") for entity in data.get("entities", [])
+                if entity.get("ticker") == ticker for row in entity.get("items", [])]
+    return []
 
 
 def collect(tickers: list[str], aliases: dict[str, list[str]], held: set[str], weights: dict[str, float],
@@ -341,7 +341,7 @@ def collect(tickers: list[str], aliases: dict[str, list[str]], held: set[str], w
     entities = [assemble_entity(ticker, aliases[ticker][0], aliases[ticker], ticker in held, weights.get(ticker),
                                 moves.get(ticker, {}), source[ticker], errors[ticker] + pool_errors, as_of)
                 for ticker in tickers]
-    macro = {"events": [], "geo_topics_hit": sorted({topic for row in macro_items
+    macro = {"geo_topics_hit": sorted({topic for row in macro_items
               for topic in match_geo_topics(row["title"] + " " + row["summary"], geo_keywords)}),
              "items": deduplicate(macro_items), "coverage": {"rss": len([r for r in macro_items if r["source"] == "RSS"]),
                          "guardian": len([r for r in macro_items if r["source"] == "Guardian"]), "errors": pool_errors}}
