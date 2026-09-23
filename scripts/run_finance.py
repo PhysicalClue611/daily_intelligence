@@ -88,12 +88,12 @@ from report_writers import (
     REPORTS_DIR,
 )
 from recent_coverage import build_recent_coverage_section
-from pass2_context import current_state, changed_background, read_previous_ledger_state
-from intel_pass0 import build_ledger
-from intel_collect import archive_ledger
-from intel_deepen import deepen_ledger
+from pass2_context import current_state, changed_background, read_previous_intel_snapshot_state
+from intel_pass0 import build_intel_snapshot
+from intel_collect import archive_intel_snapshot
+from intel_deepen import deepen_intel_snapshot
 from intel_render import (
-    emergency_ledger, should_report, render_ledger_context,
+    emergency_intel_snapshot, should_report, render_intel_snapshot_context,
     render_fallback_report, filter_social_lines,
 )
 from calibration import (
@@ -601,7 +601,7 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 ## 价格数据（{price_data_label}）
 {price_table}
 {price_missing_note}
-{ledger_section}
+{intel_snapshot_section}
 {sonar_macro_section}{social_sentiment_section}{liquidity_section}{kb_section}{calibration_notes}{recent_coverage_section}
 ## 实际持仓与框架
 {personal_context}
@@ -620,7 +620,7 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 
 正文按主题写自然段：一个主题一个段落，信息充足时每段约150–200字，段落之间空一行。不要把一段拆成每行一二十字的短句，也不要用连续的项目符号代替分析。标题、可选的最多3条要点和开盘前简报末尾的可验证信号清单可保留其既定格式；事实不足时写短或省略，不为凑字数补空话。
 
-这是一份私人投资分析。来源和检索范围只用于内部判断，不成为正文的叙述对象；每个主题直接说明事实、投资含义和下一观察点，不写检索步骤、证据缺口清单或自我免责。只有会改变判断的关键不确定性才简短说明一次。除异动原因未找到或检索失败需要交代范围的情形，正文不出现“账本”“覆盖记录”等后台术语。
+这是一份私人投资分析。来源和检索范围只用于内部判断，不成为正文的叙述对象；每个主题直接说明事实、投资含义和下一观察点，不写检索步骤、证据缺口清单或自我免责。只有会改变判断的关键不确定性才简短说明一次。除异动原因未找到或检索失败需要交代范围的情形，正文不出现后台数据结构名或检索范围术语。
 
 有话则长，无话则短；不要套话或凭空设价格触发线。直接输出 Markdown 正文，不要 JSON、代码围栏或附言。
 """
@@ -636,7 +636,7 @@ SAS_CANDIDATE_PROMPT_TEMPLATE = """今日日期（ET）：{date}
 ## 价格数据（{price_data_label}）
 {price_table}
 {price_missing_note}
-{ledger_section}
+{intel_snapshot_section}
 == 持仓 ==
 {personal_context}
 
@@ -673,26 +673,26 @@ fact 为一句话事实摘要（含关键数字/来源，不超过80字）。宁
 
 def build_status_message(today_et: str, slot_label: str, budget: dict,
                          serpapi_budget: dict, tavily_used_before: int,
-                         serpapi_used_before: int, ledger: dict,
+                         serpapi_used_before: int, intel_snapshot: dict,
                          sonar_macro_section: str, polymarket_section: str,
                          adanos_section: str, adanos_budget: dict,
                          reddit_section: str, apify_budget: dict,
                          llm_meta_p2: dict) -> str:
-    """TG-only status aligned with ledger coverage and code-only deepening."""
+    """TG-only status aligned with intelligence snapshot coverage and code-only deepening."""
     lines = [f"**Daily_Intel 运行状态** · {today_et} {slot_label}", "",
              f"Tavily今日剩余: {budget_remaining(budget)}/{TAVILY_DAILY_LIMIT}（本次用 {budget['used'] - tavily_used_before}）"]
     serpapi_used_run = serpapi_budget["used"] - serpapi_used_before
     if serpapi_used_run:
         lines.append(f"SerpApi本月已用: {serpapi_budget['used']}/{SERPAPI_MONTHLY_LIMIT}（本次用 {serpapi_used_run}）")
-    entities = ledger.get("entities", [])
+    entities = intel_snapshot.get("entities", [])
     totals = {key: sum((e.get("coverage") or {}).get(key, 0) for e in entities)
               for key in ("finnhub", "google_news", "rss", "guardian")}
     errors = list(dict.fromkeys(err for e in entities for err in (e.get("coverage") or {}).get("errors", [])))
     lines += ["", "情报来源:",
               f"- Pass 0: {len(entities)} 标的；Finnhub {totals['finnhub']}、Google News {totals['google_news']}、RSS {totals['rss']}、Guardian {totals['guardian']}",
               f"- 来源错误: {'；'.join(errors[:5]) if errors else '无'}",
-              f"- Pass 1（代码）: 搜索 {ledger.get('search_count', 0)}，Extract {ledger.get('extract_success_count', 0)}/{ledger.get('extract_url_count', 0)} URL"]
-    for ticker, status in (ledger.get("deepen_status") or {}).items():
+              f"- Pass 1（代码）: 搜索 {intel_snapshot.get('search_count', 0)}，Extract {intel_snapshot.get('extract_success_count', 0)}/{intel_snapshot.get('extract_url_count', 0)} URL"]
+    for ticker, status in (intel_snapshot.get("deepen_status") or {}).items():
         lines.append(f"  {ticker}: {status}")
     lines.append(f"- Sonar宏观快照: {'成功' if sonar_macro_section else '失败/跳过'}")
     lines.append(f"- Polymarket: {'成功' if polymarket_section else '无相关市场/跳过'}")
@@ -872,7 +872,7 @@ def _main_body():
     )
     pm_afterhours_note = (
         f"注意（夜盘报告）：价格表【盘后涨跌】列反映收盘后截至 {now_et.strftime('%H:%M %Z')} 的最新运行状态。"
-        f"请在【持仓与观察标的】中按账本证据分别说明日内表现与盘后延续/反转情况，"
+        f"请在【持仓与观察标的】中依据所给事实分别说明日内表现与盘后延续/反转情况，"
         f"无盘后数据时注明\"盘后无成交\"。"
         if run_slot == "pm" else ""
     )
@@ -900,7 +900,7 @@ def _main_body():
         if _failed else ""
     )
 
-    # 5. Free-source ledger is now the only article collector. It replaces
+    # 5. The free-source intelligence snapshot is now the only article collector. It replaces
     # duplicate RSS/Finnhub/Brave reads and the LLM-generated Pass 1 draft.
     multiday_moves = _compute_multiday_moves(price_rows, slot=run_slot)
     windows = {}
@@ -909,18 +909,18 @@ def _main_body():
         if days:
             windows[ticker] = _unexplained_publication_window(today_et, days, run_slot)[0]
     try:
-        ledger, _ = build_ledger(
+        intel_snapshot, _ = build_intel_snapshot(
             wl, now_et, run_slot, price_rows=price_rows, multiday_moves=multiday_moves,
             window_starts=windows, held=set(_get_core_holding_tickers()),
             weights=_get_portfolio_weights(), archive=False,
         )
     except Exception as exc:
-        logger.warning("Pass 0 ledger collection failed: %s", exc)
-        ledger = emergency_ledger(today_et, run_slot, now_et, price_rows, wl, multiday_moves,
+        logger.warning("Pass 0 intelligence snapshot collection failed: %s", exc)
+        intel_snapshot = emergency_intel_snapshot(today_et, run_slot, now_et, price_rows, wl, multiday_moves,
                                   f"collector: {type(exc).__name__}",
                                   held=set(_get_core_holding_tickers()), weights=_get_portfolio_weights(),
                                   window_starts=windows)
-    if not should_report(ledger):
+    if not should_report(intel_snapshot):
         logger.info("No entity move, company item, or macro item; skipping")
         return
     anomaly_ticker_syms = [r.ticker for r in anomalies]
@@ -931,7 +931,7 @@ def _main_body():
     kb_section = f"\n## 个人知识库上下文\n{kb_context}\n" if kb_context else ""
 
     # Sonar, social, and FRED collection stay in place; only their injection
-    # is scoped to ledger-relevant entities and changed background states.
+    # is scoped to entities in the intelligence snapshot and changed background states.
     sonar_macro_section = _sonar_macro_brief(
         slot=run_slot, stocks=wl["stocks"], commodities=wl["commodities"],
         fx=wl["fx"], geo_topics=list(wl["geo_keywords"].keys()), now_et=now_et,
@@ -964,8 +964,8 @@ def _main_body():
     # 6. Code-only Pass 1. Search and Extract budgets are enforced both by the
     # planner and the existing HTTP budget helpers; no LLM call occurs here.
     try:
-        ledger = deepen_ledger(
-            ledger,
+        intel_snapshot = deepen_intel_snapshot(
+            intel_snapshot,
             search=lambda query, start, end: _do_search(
                 query, budget, serpapi_budget, search_depth="basic", max_results=2,
                 start_date=start, end_date=end,
@@ -974,21 +974,21 @@ def _main_body():
             remaining=lambda: budget_remaining(budget),
         )
     except Exception as exc:
-        logger.warning("Pass 1 deepening failed, keeping free-source ledger: %s", exc)
-        ledger["deepen_status"] = {"error": type(exc).__name__}
-    previous_context_state = read_previous_ledger_state(_PROJ_DIR / "archives", now_et)
+        logger.warning("Pass 1 deepening failed, keeping free-source intelligence snapshot: %s", exc)
+        intel_snapshot["deepen_status"] = {"error": type(exc).__name__}
+    previous_context_state = read_previous_intel_snapshot_state(_PROJ_DIR / "archives", now_et)
     try:
-        archive_ledger(ledger)
+        archive_intel_snapshot(intel_snapshot)
     except OSError as exc:
-        logger.warning("Ledger archive failed: %s", exc)
-    ledger_section = render_ledger_context(ledger, wl["geo_keywords"])
+        logger.warning("Intelligence snapshot archive failed: %s", exc)
+    intel_snapshot_section = render_intel_snapshot_context(intel_snapshot, wl["geo_keywords"])
     social_section = filter_social_lines(
-        polymarket_section + adanos_section + reddit_section, ledger["entities"]
+        polymarket_section + adanos_section + reddit_section, intel_snapshot["entities"]
     )
 
     # 7. Pass 2 runs even when no paid search result exists. A failed or empty
     # completion still produces a deterministic report and a Telegram alert.
-    coverage_tickers = [e["ticker"] for e in ledger["entities"]
+    coverage_tickers = [e["ticker"] for e in intel_snapshot["entities"]
                         if set((e.get("move") or {}).get("flags", [])) & {"anomaly", "d3", "d5"}]
     try:
         recent_coverage_section = build_recent_coverage_section(
@@ -1011,7 +1011,7 @@ def _main_body():
         date=today_et, now_str=now_et.strftime("%Y-%m-%d %H:%M %Z"),
         pm_afterhours_note=pm_afterhours_note, price_data_label=price_data_label,
         price_table=price_table, price_missing_note=price_missing_note,
-        ledger_section=ledger_section, sonar_macro_section=sonar_macro_section,
+        intel_snapshot_section=intel_snapshot_section, sonar_macro_section=sonar_macro_section,
         social_sentiment_section=social_section, liquidity_section=changed_liquidity,
         kb_section=kb_section, calibration_notes=calibration_notes,
         recent_coverage_section=recent_coverage_section,
@@ -1022,7 +1022,7 @@ def _main_body():
         result2 = call_llm(prompt2, stage="report_pass2", system_prompt=SYSTEM_PROMPT_P2,
                            parse_json=False)
     except Exception as exc:
-        logger.warning("Pass 2 failed, using ledger summary: %s", exc)
+        logger.warning("Pass 2 failed, using intelligence snapshot summary: %s", exc)
         result2 = {}
     if not isinstance(result2, dict):
         result2 = {}
@@ -1031,16 +1031,16 @@ def _main_body():
     report_md = raw_report.strip() if isinstance(raw_report, str) else ""
     pass2_succeeded = bool(report_md)
     if not report_md:
-        report_md = render_fallback_report(ledger, slot_label)
-        send_telegram_alert(f"[!] Daily_Intel {today_et} {slot_label} Pass 2 失败；已发送代码生成的账本摘要。")
+        report_md = render_fallback_report(intel_snapshot, slot_label)
+        send_telegram_alert(f"[!] Daily_Intel {today_et} {slot_label} Pass 2 失败；已发送代码生成的情报摘要。")
 
     # Independent SAS extraction retains its JSON output schema, now sourced
-    # from the same ledger rather than the removed discovery pool.
+    # from the same intelligence snapshot rather than the removed discovery pool.
     try:
         sas_prompt = SAS_CANDIDATE_PROMPT_TEMPLATE.format(
             date=today_et, pm_afterhours_note=pm_afterhours_note,
             price_data_label=price_data_label, price_table=price_table,
-            price_missing_note=price_missing_note, ledger_section=ledger_section,
+            price_missing_note=price_missing_note, intel_snapshot_section=intel_snapshot_section,
             personal_context=sas_personal_context,
         )
         sas_result = call_llm(sas_prompt, stage="sas_candidate_extract",
@@ -1053,19 +1053,19 @@ def _main_body():
         report_md = re.sub(r"^# \[Daily_Intel\] .+", f"# [Daily_Intel] {today_et} {slot_label}",
                            report_md, flags=re.MULTILINE)
     report_md = evaluate_am_calibration(
-        today_et, run_slot, price_table, ledger_section, sonar_macro_section, report_md
+        today_et, run_slot, price_table, intel_snapshot_section, sonar_macro_section, report_md
     )
     write_report(today_et, slot_label, report_md, budget)
     if pass2_succeeded:
-        ledger["context_state"] = context_state
+        intel_snapshot["context_state"] = context_state
         try:
-            archive_ledger(ledger)
+            archive_intel_snapshot(intel_snapshot)
         except OSError as exc:
-            logger.warning("Ledger context state save failed: %s", exc)
+            logger.warning("Intelligence snapshot context state save failed: %s", exc)
     _mempalace_add_daily_drawer(today_et, run_slot, report_md)
     write_context_log(today_et, slot_label, now_et, price_table, [],
-                      (ledger.get("macro_digest") or {}).get("geo_topics_hit", []),
-                      sonar_macro_section, ledger.get("search_jobs", []), ledger=ledger)
+                      (intel_snapshot.get("macro_digest") or {}).get("geo_topics_hit", []),
+                      sonar_macro_section, intel_snapshot.get("search_jobs", []), intel_snapshot=intel_snapshot)
 
     # 12. Send email
     footer = finance_footer(today_et, budget)
@@ -1087,7 +1087,7 @@ def _main_body():
     status_md = build_status_message(
         today_et, slot_label, budget, serpapi_budget,
         tavily_used_before, serpapi_used_before,
-        ledger,
+        intel_snapshot,
         sonar_macro_section, polymarket_section, adanos_section, adanos_budget,
         reddit_section, apify_budget,
         llm_meta_p2,

@@ -2,11 +2,11 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-09-23（issue #87 PR #89：免费账本切换、代码 Pass 1、Pass 2 新输入和降级；部署状态以运行环境为准）
+> **最后更新**：2026-09-23（issue #87 PR #89：免费情报快照切换、代码 Pass 1、Pass 2 新输入和降级；部署状态以运行环境为准）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
-> **issue #87 PR1，PR #88 已合并（历史阶段）**：PR1 当时在旧报告流水线旁新增了只做免费收集的 Pass 0 影子账本，尚未切换旧 Pass 1/Tavily/Pass 2/写出。`scripts/intel_collect.py` 按标的保留完整 Finnhub company-news、按公司名查询的 Google News RSS、现有 7 源 RSS 与 Guardian；拉丁词边界与中文 ASCII 边界实体匹配、标题去重与每来源覆盖/错误记录。Google News 的实际 HTTP 尝试至少间隔 1 秒且与 Finnhub 分池；多日异动时 RSS/Guardian 从所有标的最早起点抓取、再逐标的裁剪；报告与回放共用 `scripts/publication_window.py` 的交易日窗口计算。PR1 时 `scripts/intel_pass0.py` 在旧主流程跳过判断前旁路运行，原子归档 `archives/YYYYMM/*-ledger.json`；条目按上次运行账本的归一化标题标 `seen_before`。回放命令仍只写本地 JSON/Markdown，RSS 标为 skipped、Guardian 用历史日期窗读取；价格优先取当时 context log 的盘前/日内涨跌，读不到才用日线近似，并从历史日线重建 3/5 日阈值。`entity_alias_cache.json` 忽略追踪。PR1 独立回放 22/24、零 LLM 调用。PR #89 将这套收集器接入主报告路径，并由代码深挖和账本驱动的 Pass 2 接续处理；现行架构见下文第二节及 5.1b、5.2 节。权威 Obsidian 文档由合并后验证方同步。
+> **issue #87 PR1，PR #88 已合并（历史阶段）**：PR1 当时在旧报告流水线旁新增了只做免费收集的 Pass 0 影子情报快照，尚未切换旧 Pass 1/Tavily/Pass 2/写出。`scripts/intel_collect.py` 按标的保留完整 Finnhub company-news、按公司名查询的 Google News RSS、现有 7 源 RSS 与 Guardian；拉丁词边界与中文 ASCII 边界实体匹配、标题去重与每来源覆盖/错误记录。Google News 的实际 HTTP 尝试至少间隔 1 秒且与 Finnhub 分池；多日异动时 RSS/Guardian 从所有标的最早起点抓取、再逐标的裁剪；报告与回放共用 `scripts/publication_window.py` 的交易日窗口计算。PR1 时 `scripts/intel_pass0.py` 在旧主流程跳过判断前旁路运行，原子归档 `archives/YYYYMM/*-intel-snapshot.json`；条目按上次运行情报快照的归一化标题标 `seen_before`。回放命令仍只写本地 JSON/Markdown，RSS 标为 skipped、Guardian 用历史日期窗读取；价格优先取当时 context log 的盘前/日内涨跌，读不到才用日线近似，并从历史日线重建 3/5 日阈值。`entity_alias_cache.json` 忽略追踪。PR1 独立回放 22/24、零 LLM 调用。PR #89 将这套收集器接入主报告路径，并由代码深挖和情报快照驱动的 Pass 2 接续处理；现行架构见下文第二节及 5.1b、5.2 节。权威 Obsidian 文档由合并后验证方同步。
 
 ---
 
@@ -38,12 +38,12 @@ Daily Intelligence 是一套面向**个人主动投资者**的每日财经情报
 ```
 launchd AM/PM → run_finance.py（交易日/锁/防重）
   → fetch_prices（价格与当日/多日异动，不变）
-  → intel_pass0.build_ledger（Finnhub、Google News、RSS、Guardian 免费收集）
+  → intel_pass0.build_intel_snapshot（Finnhub、Google News、RSS、Guardian 免费收集）
   → 无异动/实体新闻/地缘话题则跳过
   → intel_deepen（代码选最多 5 个异动标的；直接 URL 优先，最多 3 搜索 + 10 Extract URL）
-  → archive_ledger（原子保存条目、覆盖和正文片段）
+  → archive_intel_snapshot（原子保存条目、覆盖和正文片段）
   → Sonar 宏观 + 社交舆情 + FRED（收集不变，按标的/变化注入）
-  → Pass 2（账本 + 最近 5 交易日已报道 + 持仓框架；失败则代码摘要并 TG 告警）
+  → Pass 2（情报快照 + 最近 5 交易日已报道 + 持仓框架；失败则代码摘要并 TG 告警）
   → SAS 候选独立抽取 + PM 校准（输出契约不变）
   → 月度报告 / Context Log / MemPalace / 邮件 / Telegram（不变）
 ```
@@ -250,17 +250,17 @@ system prompt 注入 portfolio 快照实现个人化。~$0.005/次，fail-open�
 
 **防过时/防幻觉加固（issue #24，2026-07-02）**：Sonar 是搜索+合成模型，不是行情 feed，曾在同一份报告中与实时价格直接矛盾（声称 WTI 破 $100，实际价格 $68.58）。三重加固：① OR payload 加 `search_recency_filter: "day"`（实测确认 OpenRouter 会透传给 Perplexity，不会被静默丢弃），限制底层搜索只召回过去24小时发布的源；② 把 pipeline 中已经算好的 `price_table`（fetch_prices 输出）注入 system prompt 作为权威真实数据，要求若搜索结果与之冲突则以注入价格为准并明确标注冲突；③ prompt 要求每条具体断言必须带时间戳，若某话题无近 24 小时更新必须明说，不得拿旧信息冒充当前。`telegram_commands.py` 的 `_sonar_research()`（TG 追问流水线的 Sonar fallback，同模型同风险）同步加了 `search_recency_filter`。
 
-**Finnhub 公司新闻（issue #87 PR #89）**：主流程改用 `intel_collect.collect()` 每标的一次完整拉取，AM 默认 36h、PM 24h；#80 多日阈值扩展到对应涨跌起点。按实体归入账本，记录来源条数和错误，取代旧 `fetch_finnhub_news()` 最多 5 条的 prompt 注入。
+**Finnhub 公司新闻（issue #87 PR #89）**：主流程改用 `intel_collect.collect()` 每标的一次完整拉取，AM 默认 36h、PM 24h；#80 多日阈值扩展到对应涨跌起点。按实体归入情报快照，记录来源条数和错误，取代旧 `fetch_finnhub_news()` 最多 5 条的 prompt 注入。
 
-**FRED 流动性水位快照（step 6e，AM+PM，issue #26，2026-07-02）**：`fetch_liquidity_snapshot()` 拉取银行准备金（`WRESBAL`）、SOFR（`SOFR`）、ON RRP 授予利率（`RRPONTSYAWARD`，注意不是 `RRPONTSYD`——后者是隔多逆回购**交易量**不是利率，实测数值差异巨大才发现搭错）、TGA余额（`WTREGEN`），按 `Hermes/Daily Intelligence/市场见顶预警指标.md` 的阈值分类【正常/观察/警戒】，整体取最高档；与上次成功报告账本的档位不同才注入 Pass 2。SRF用量 FRED 无对应序列，不自动化，留作文档里的人工检查项。选型理由：FRED 是比 Sonar 搜索更可靠的精确数据源（呼应 issue #24 的教训——LLM 搜索对精确数值不可靠，能用结构化权威数据源就不该靠 LLM 猜）。Pass 2 将它作为背景，不单独触发交易建议。
+**FRED 流动性水位快照（step 6e，AM+PM，issue #26，2026-07-02）**：`fetch_liquidity_snapshot()` 拉取银行准备金（`WRESBAL`）、SOFR（`SOFR`）、ON RRP 授予利率（`RRPONTSYAWARD`，注意不是 `RRPONTSYD`——后者是隔多逆回购**交易量**不是利率，实测数值差异巨大才发现搭错）、TGA余额（`WTREGEN`），按 `Hermes/Daily Intelligence/市场见顶预警指标.md` 的阈值分类【正常/观察/警戒】，整体取最高档；与上次成功报告情报快照的档位不同才注入 Pass 2。SRF用量 FRED 无对应序列，不自动化，留作文档里的人工检查项。选型理由：FRED 是比 Sonar 搜索更可靠的精确数据源（呼应 issue #24 的教训——LLM 搜索对精确数值不可靠，能用结构化权威数据源就不该靠 LLM 猜）。Pass 2 将它作为背景，不单独触发交易建议。
 
-### 5.1b 账本驱动的深挖（issue #87 PR #89，开发中）
+### 5.1b 情报快照驱动的深挖（issue #87 PR #89，开发中）
 
-免费来源标题先按实体别名归入账本；旧 Search+Extract 开放池、脚本评分、语义过滤与预留名额已从本分支主流程移除。代码 Pass 1 按当日/#80 多日阈值选绝对涨跌最大的 5 个标的；每个标的最多 2 条标题命中别名、来源域名不同的 direct/Finnhub 302 链接直接 Extract。没有链接才用公司名和方向发 Tavily basic 搜索（SerpApi fallback）。每次最多 3 次搜索和 10 个 Extract URL，最坏 5 Tavily credit，预算不足依优先顺序截止。正文片段与来源置信度标签回填到账本 JSON；已有 `*-extract.md` 保留，但不再新写。
+免费来源标题先按实体别名归入情报快照；旧 Search+Extract 开放池、脚本评分、语义过滤与预留名额已从本分支主流程移除。代码 Pass 1 按当日/#80 多日阈值选绝对涨跌最大的 5 个标的；每个标的最多 2 条标题命中别名、来源域名不同的 direct/Finnhub 302 链接直接 Extract。没有链接才用公司名和方向发 Tavily basic 搜索（SerpApi fallback）。每次最多 3 次搜索和 10 个 Extract URL，最坏 5 Tavily credit，预算不足依优先顺序截止。正文片段与来源置信度标签回填到情报快照 JSON；已有 `*-extract.md` 保留，但不再新写。
 
 ### 5.2 报告生成（issue #87 PR #89，开发中）
 
-只有标的异动/新闻和宏观地缘话题都没有时才跳过。旧 LLM Pass 1 草稿与 query、异动/多日/轮询三类搜索任务已删除。Pass 2 使用 `openai/gpt-6-luna`（xhigh，issue #90），只读价格表、账本段落、Sonar、相关标的社交舆情、状态变化的背景指标和个人上下文。有异动标的最多 25 条含摘要和覆盖，安静持仓最多 8 个标题，安静观察标的一行，宏观每话题最多 8 条、总计 40 条。归因分已知原因/线索待核实/未找到原因（附覆盖），检索错误写“未能完成检索”；仓位段落只在例外事实出现。最近五个 NYSE 交易日已报道内容按实体提取，每标的最多 600 字，避免同一事件跨日重复。Pass 2 返回空文本或异常则用代码摘要照常写出与发送，并发 TG 告警。
+只有标的异动/新闻和宏观地缘话题都没有时才跳过。旧 LLM Pass 1 草稿与 query、异动/多日/轮询三类搜索任务已删除。Pass 2 使用 `openai/gpt-6-luna`（xhigh，issue #90），只读价格表、情报快照段落、Sonar、相关标的社交舆情、状态变化的背景指标和个人上下文。有异动标的最多 25 条含摘要和覆盖，安静持仓最多 8 个标题，安静观察标的一行，宏观每话题最多 8 条、总计 40 条。归因分已知原因/线索待核实/未找到原因（附覆盖），检索错误写“未能完成检索”；仓位段落只在例外事实出现。最近五个 NYSE 交易日已报道内容按实体提取，每标的最多 600 字，避免同一事件跨日重复。Pass 2 返回空文本或异常则用代码摘要照常写出与发送，并发 TG 告警。
 
 **错误韧性**：Pass 2 的 LLM 调用（`call_llm()`）在遇到网络/5xx 错误时自动重试 2 次（指数退避 2s/4s），4xx 和 JSON 解析错误不重试。`telegram_commands.py` 中 DeepSeek 调用通过 `_deepseek_post()` 直连，Claude/Sonar 调用通过 `_openrouter_post()` 走 OR，均使用相同重试策略（网络/5xx 自动重试 2 次）。
 
@@ -285,16 +285,16 @@ if f"## {today_et} {slot_label}" in monthly_file_content:
 | 输出 | 实现 | 被 mine |
 |---|---|---|
 | Obsidian 月度报告 `Daily_Intel_report_YYYYMM.md` | append section（step 11） | 是 |
-| Obsidian 月度 Context Log `Daily_Intel_context_YYYYMM.md` | append section（step 11b）：价格快照 + 每标的账本摘要/覆盖 + Sonar 宏观原文 + 代码搜索任务列表 | 是 |
-| 账本 `archives/YYYYMM/YYYY-MM-DD-{slot}-ledger.json` | 免费来源条目、覆盖、正文片段、上次状态比较依据；原子写入 | 否 |
+| Obsidian 月度 Context Log `Daily_Intel_context_YYYYMM.md` | append section（step 11b）：价格快照 + 每标的情报快照摘要/覆盖 + Sonar 宏观原文 + 代码搜索任务列表 | 是 |
+| 情报快照 `archives/YYYYMM/YYYY-MM-DD-{slot}-intel-snapshot.json` | 免费来源条目、覆盖、正文片段、上次状态比较依据；原子写入 | 否 |
 | MemPalace per-day drawer | report_md 推送 bridge，wing=paperview, room=finance | — |
 | 邮件 | Gmail API（send+readonly scope） | — |
 | Telegram | Markdown → HTML，超 4096 字符自动分段 | — |
 | TG 独立运行状态消息 | `build_status_message()`（step 13b）：Tavily/SerpApi 本次用量+剩余、情报源状态（RSS/Guardian/Finnhub/Sonar/Tavily搜索+Extract）、LLM/Provider 清单；与正文分开发送，不进邮件/Obsidian | 否 |
 
-**Context Log 与账本的设计分工：**
+**Context Log 与情报快照的设计分工：**
 - Context Log 存 Obsidian → MemPalace 矿化后可语义检索"某日早上市场context是什么"
-- 账本存本地 → 保留完整免费来源条目和 Extract 片段，用于审计和跨次状态比较
+- 情报快照存本地 → 保留完整免费来源条目和 Extract 片段，用于审计和跨次状态比较
 - Extract 全文刻意不进 Obsidian：原始网页抓取含导航/广告碎片，矿化会产生大量低质量向量
 
 ### 5.5 AM 预判校准闭环（issue #10，2026-07-02）
@@ -306,7 +306,7 @@ if f"## {today_et} {slot_label}" in monthly_file_content:
 **PM 校验步骤**：新函数 `evaluate_am_calibration()`，插在报告标题修正后、`write_report()` 之前，仅 PM slot 执行：
 1. `_extract_report_section()` 定位当天 AM 报告 section——以下一个日期戳 `## YYYY-MM-DD` 为边界，不被报告内部的 `## 子标题`/`---`分隔符误判（复用 2026-05-04 修复 KG section 截断 bug 时确立的模式，见踩坑记录#25）
 2. `_extract_verifiable_signals()` 提取"可验证信号"小节内容
-3. `_evaluate_am_predictions()`：一次 LLM 调用（`llm_config.py` stage `am_calibration`，默认 `google/gemma-4-31b-it`，~$0.0005；issue #59 前曾复用 `report_pass1` stage 的 DeepSeek V4 Flash，2026-08-03 实测该模型隐式推理吃满预算导致 3/3 真实调用失败，PR #61 拆成独立 stage 并换模型），对照当日实际价格表+新闻上下文（账本+Sonar），逐条判定 hit/miss/inconclusive，提炼一段"知识条目"（不是罗列对错，是可迁移的教训或验证），并判断是否值得展示
+3. `_evaluate_am_predictions()`：一次 LLM 调用（`llm_config.py` stage `am_calibration`，默认 `google/gemma-4-31b-it`，~$0.0005；issue #59 前曾复用 `report_pass1` stage 的 DeepSeek V4 Flash，2026-08-03 实测该模型隐式推理吃满预算导致 3/3 真实调用失败，PR #61 拆成独立 stage 并换模型），对照当日实际价格表+新闻上下文（情报快照+Sonar），逐条判定 hit/miss/inconclusive，提炼一段"知识条目"（不是罗列对错，是可迁移的教训或验证），并判断是否值得展示
 4. 若当天 AM 报告没有该小节（历史报告、或该步骤本身失败），静默跳过，不影响主流程——整个函数 fail-open
 
 **知识沉淀与备份（2026-07-02 修正：Obsidian 为主，不依赖 MemPalace）**：`_write_calibration_knowledge()` 写三份：
@@ -458,11 +458,11 @@ Step 4  openai/gpt-5.6-luna（非pro）via OR（主，stage `tg_followup`，issu
 
 **TG 追问流水线**（`telegram_commands.py::_load_framework()`）：从 `Finance/金融资产信息.md` 提取：总体构架（目标配置比例）+ Dream Bucket 逻辑（高弹性标的选择标准）。注入 Claude 的 system message，跨调用复用。
 
-**AM/PM 日报**（`run_finance.py::_load_framework()`）：从 `Finance/Investment Operating Manual v1.0.md` 提取第 6 节 Portfolio Construction 与第 7.4 节 Expectation Gap，连同持仓快照注入 Pass 2 user message。能力圈边界仅在 system prompt 写一句，不再要求对每只异动逐项归类或声明“无加减仓依据”。`sas_candidate_extract` 独立读账本段落和完整持仓信号，输出原有 `sas_candidates` JSON；`sas_review.py` 不变。
+**AM/PM 日报**（`run_finance.py::_load_framework()`）：从 `Finance/Investment Operating Manual v1.0.md` 提取第 6 节 Portfolio Construction 与第 7.4 节 Expectation Gap，连同持仓快照注入 Pass 2 user message。能力圈边界仅在 system prompt 写一句，不再要求对每只异动逐项归类或声明“无加减仓依据”。`sas_candidate_extract` 独立读情报快照段落和完整持仓信号，输出原有 `sas_candidates` JSON；`sas_review.py` 不变。
 
 ### 7.1b 持仓计算信号（user message，纯计算，零LLM/搜索成本，issue #33）
 
-`fetch_52week_stats()` 与 `_get_portfolio_weights()` 仍提供代码计算事实。报告 Pass 2 只在 52 周创新高/低、单一持仓跨过 15% 阈值时注入；FRED 整体档位变化同理。上次状态取成功写出的前一份账本 `context_state`，无数据的单次拉取不会清空已知状态。SAS 候选提取继续接收完整计算信号。
+`fetch_52week_stats()` 与 `_get_portfolio_weights()` 仍提供代码计算事实。报告 Pass 2 只在 52 周创新高/低、单一持仓跨过 15% 阈值时注入；FRED 整体档位变化同理。上次状态取成功写出的前一份情报快照 `context_state`，无数据的单次拉取不会清空已知状态。SAS 候选提取继续接收完整计算信号。
 
 ### 7.2 持仓快照（user message，每次追问刷新）
 
@@ -500,7 +500,7 @@ stage 名与调用点对应：`am_calibration` / `report_pass2` / `sas_candidate
 | #   | 调用位置 | 用途 | 主力模型 | Fallback | max_tokens | 成本估算 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1b  | `calibration.py::_evaluate_am_predictions()`（stage `am_calibration`） | PM slot：对照实际数据核验 AM「可验证信号」，产出知识条目 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #59/#60——从 `report_pass1` stage 拆分为独立 stage，避免未来调 report_pass1 预算/模型时静默影响这个无关的判断） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.0005 |
-| 2   | `run_finance.py` Pass 2 | 整合账本、Sonar 与个人上下文生成最终报告 | `openai/gpt-5.6-luna`（非pro）via OR/OpenAI（provider锁定，不允许fallback到其他provider；`reasoning={"effort":"high"}`，issue #60——原 `deepseek-v4-pro+thinking` 真实数据对比暴露自相矛盾判断，见文末记录） | `google/gemini-3.5-flash` OR flex | 16000 | ~$0.02（未核实精确单价） |
+| 2   | `run_finance.py` Pass 2 | 整合情报快照、Sonar 与个人上下文生成最终报告 | `openai/gpt-5.6-luna`（非pro）via OR/OpenAI（provider锁定，不允许fallback到其他provider；`reasoning={"effort":"high"}`，issue #60——原 `deepseek-v4-pro+thinking` 真实数据对比暴露自相矛盾判断，见文末记录） | `google/gemini-3.5-flash` OR flex | 16000 | ~$0.02（未核实精确单价） |
 | 2b  | `run_finance.py` Pass 2 后（stage `sas_candidate_extract`，issue #60） | 独立提取 SAS 候选证据（原是 Pass 2 JSON 的一个字段，见上文"SAS候选证据标注"说明） | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #60，9/9 真实对抗测试验证） | `google/gemini-3.1-flash-lite` OR flex | 800 | ~$0.0003 |
 | 4   | `intel_sources.py` step 6c（stage `macro_brief`） | Sonar 宏观快照（AM/PM 各一次） | `perplexity/sonar`（OR，`search_recency_filter="day"`，2026-07-02 加，见 issue #24） | 重试1次(5s) → `””` 空节 | 1500（issue #55 由 800 提高） | ~$0.005（含固定搜索费） |
 | 5   | `telegram_commands.py` Step 1（stage `tg_preprocess`） | 统一预处理：意图分类 + 2条 query 生成 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #11/#60） | `google/gemini-3.1-flash-lite` OR flex | 600 | ~$0.0001 |
@@ -636,8 +636,8 @@ tail -f /tmp/ibkr_keepalive.log                 # keepalive（每 5 分钟 auth 
 ├── scripts/
 │   ├── run_finance.py              主入口，报告生成流程
 │   ├── fetch_prices.py             yfinance 价格拉取
-│   ├── intel_collect.py            免费信源收集、实体匹配与原子账本
-│   ├── intel_pass0.py              账本构建与历史回放
+│   ├── intel_collect.py            免费信源收集、实体匹配与原子情报快照
+│   ├── intel_pass0.py              情报快照构建与历史回放
 │   ├── intel_deepen.py             代码 Pass 1 搜索/Extract
 │   ├── intel_render.py             Pass 2 输入与代码降级渲染
 │   ├── recent_coverage.py          近五交易日同标的报道
@@ -653,9 +653,9 @@ tail -f /tmp/ibkr_keepalive.log                 # keepalive（每 5 分钟 auth 
 ├── finance_tavily_budget.json      Tavily 每日计数
 ├── finance_serpapi_budget.json     SerpApi 月度计数（首次使用时自动创建）
 ├── tg_offset.json                  TG getUpdates offset
-├── archives/                       账本存档（Obsidian 之外，不被 mine）
+├── archives/                       情报快照存档（Obsidian 之外，不被 mine）
 │   └── YYYYMM/
-│       └── YYYY-MM-DD-{slot}-ledger.json
+│       └── YYYY-MM-DD-{slot}-intel-snapshot.json
 └── backups/                        本地备份镜像（gitignore，不进代码仓库）
     └── 预判校准记录_backup.md      与 Obsidian 预判校准记录.md 同步写入，防 Obsidian 侧丢失
 
@@ -784,7 +784,7 @@ Obsidian Vault/
 - **Sonar 宏观快照防过时/防幻觉（issue #24）**：详见第五节 Sonar 部分。
 
 **待规划**
-- **候选统一打标层（issue #14，并入方向 4；旧插入点已作废）**：原计划放在 `score_and_filter()` 与 `_haiku_relevance_filter()` 之间；这两个阶段已由 issue #87 的账本和代码深挖替换，不能按旧方案接入。若后续获准实施，应在 `intel_deepen.py` 的候选链接选择、实际 Extract 之前评估相关度（direct_company_news/sector_related_news/macro_market_news）及信源形态（wire_article/video_hub/aggregator_listing）。可通过 URL 路径 `/video/`、`/watch/` 等识别视频/聚合页，同事件优先文章版；用户此前决定先观察再评估优先级。
+- **候选统一打标层（issue #14，并入方向 4；旧插入点已作废）**：原计划放在 `score_and_filter()` 与 `_haiku_relevance_filter()` 之间；这两个阶段已由 issue #87 的情报快照和代码深挖替换，不能按旧方案接入。若后续获准实施，应在 `intel_deepen.py` 的候选链接选择、实际 Extract 之前评估相关度（direct_company_news/sector_related_news/macro_market_news）及信源形态（wire_article/video_hub/aggregator_listing）。可通过 URL 路径 `/video/`、`/watch/` 等识别视频/聚合页，同事件优先文章版；用户此前决定先观察再评估优先级。
 - MemPalace 细切片：月度报告目前整文件级 drawer，跨日报 embedding 较粗；可在 run_finance.py 写报告后直接 mempalace_add_drawer 做 per-day 切片，不增加 Obsidian 文件
 - TG 追问后置 Extract：Sonar 返回引用 URL 后对前 1-2 个 URL 调 `tavily_extract()`，补全文作为 Claude 辅证证据，仅当异动标的且 budget ≥ 2cr 时触发
 

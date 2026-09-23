@@ -17,8 +17,8 @@ from intel_pass0 import replay
 CASES = Path(__file__).with_name("attribution_eval_2026-08_09.json")
 
 
-def score_case(case: dict, ledger: dict) -> dict:
-    entity = next((e for e in ledger["entities"] if e["ticker"] == case["ticker"]), None)
+def score_case(case: dict, intel_snapshot: dict) -> dict:
+    entity = next((e for e in intel_snapshot["entities"] if e["ticker"] == case["ticker"]), None)
     regex = re.compile(case["pattern"], re.I)
     items_hit = bool(entity and any(regex.search(i["title"] + " " + i["summary"]) for i in entity["items"]))
     return {"date": case["date"], "slot": case["slot"], "ticker": case["ticker"],
@@ -38,8 +38,8 @@ def main():
         print(f"[{index}/24] {case['date']} {case['slot']} {case['ticker']}", flush=True)
         with tempfile.TemporaryDirectory(prefix="di87_eval_") as root:
             try:
-                ledger, _ = replay(case["date"], case["slot"], tickers=[case["ticker"]], archive_root=Path(root))
-                result = score_case(case, ledger)
+                intel_snapshot, _ = replay(case["date"], case["slot"], tickers=[case["ticker"]], archive_root=Path(root))
+                result = score_case(case, intel_snapshot)
             except Exception as exc:
                 result = {"date": case["date"], "slot": case["slot"], "ticker": case["ticker"],
                           "collection_hit": False, "error": f"{type(exc).__name__}: {exc}"}

@@ -19,11 +19,11 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
-## issue #87 PR1（Pass 0 影子账本，PR #88 已合并）
+## issue #87 PR1（Pass 0 影子情报快照，PR #88 已合并）
 
 PR #88 引入 `intel_pass0.py` 和 `intel_collect.py`，当时作为报告旁路运行的影子收集器。它对 watchlist 个股（排除 QQQM/VOO/EWJ/SGOL）按标的收集 Finnhub company-news、公司名 Google News RSS、现有 RSS 和 Guardian；按别名边界匹配与标的内去重，覆盖记录保留原始条数和错误。别名可在 watchlist `## 实体别名` 写 `INTC: Intel, 英特尔`，缺失时 Finnhub profile2 补全并缓存到 gitignore 的 `entity_alias_cache.json`。Google News 每次实际 HTTP 尝试（包括重试）至少间隔 1 秒，且与 Finnhub 使用独立线程池；其 RSS 链接只作线索，不解码原文。中文别名用 ASCII 边界匹配，拉丁别名仍用词边界。多日异动时 RSS/Guardian 共享抓取窗口扩到最早标的起点，再按各标的窗口分拣；报告与回放共用 `publication_window.py` 的交易日窗口计算。PR #89 将这套收集器接入主报告路径，见下节。
 
-PR #88 的影子账本只做免费收集，不调用 LLM 或 Tavily。每次运行原子写入 `archives/YYYYMM/YYYY-MM-DD-{slot}-ledger.json`，实体只保存移动、覆盖、条目和预留的 `fulltext`；条目标题与上一次运行账本归一化后相同则标 `seen_before`。`intel_pass0.py --replay YYYY-MM-DD --slot am|pm [--ticker SYMBOL]` 仍只建本地 JSON/Markdown 账本，不发通知、不写 Obsidian；回放优先用当时 context log 的盘前/日内涨跌，读不到才用日线近似；历史日线重建 3/5 日阈值和加长窗口。RSS 明确跳过，Guardian 用历史日期窗读取。24 条回溯评估集和收集召回验收入口位于 `scripts/eval/`。
+PR #88 的影子情报快照只做免费收集，不调用 LLM 或 Tavily。每次运行原子写入 `archives/YYYYMM/YYYY-MM-DD-{slot}-intel-snapshot.json`，实体只保存移动、覆盖、条目和预留的 `fulltext`；条目标题与上一次运行情报快照归一化后相同则标 `seen_before`。`intel_pass0.py --replay YYYY-MM-DD --slot am|pm [--ticker SYMBOL]` 仍只建本地 JSON/Markdown 情报快照，不发通知、不写 Obsidian；回放优先用当时 context log 的盘前/日内涨跌，读不到才用日线近似；历史日线重建 3/5 日阈值和加长窗口。RSS 明确跳过，Guardian 用历史日期窗读取。24 条回溯评估集和收集召回验收入口位于 `scripts/eval/`。
 
 PR #88 已合并；独立回放 22/24，零 LLM 调用。合并后的影子观察重点是收集召回、`seen_before` 重复率、Google News 稳定性与 Pass 0 耗时。issue #87 D5 的可验证信号与社交舆情选择留给后续决策，PR1 未触及。
 
@@ -31,11 +31,11 @@ PR #88 已合并；独立回放 22/24，零 LLM 调用。合并后的影子观�
 
 ## 开发中：issue #87 PR #89（Pass 2 去套话 + PR3 切换，尚未合并）
 
-owner 已要求把原规划 PR3 并入 #89。主流程在价格与多日涨跌计算后调用 `intel_pass0.build_ledger(archive=False)` 收集免费信源；收集异常时生成带错误覆盖记录的应急账本。只有标的异动/新闻或命中地缘话题才出报告。`intel_deepen.py` 用代码选绝对涨跌最大的最多 5 个异动标的，每标的挑最多 2 条不同域名且标题命中别名的 direct/Finnhub 302 链接做 Extract；没有可用链接才搜索 `Why is {公司名} stock {up|down}`，最多 3 次 basic 搜索、10 个 Extract URL，合计最多 5 Tavily credit。SerpApi fallback 保留。正文片段和覆盖记录写回同一个原子账本存档；停止新写 `*-extract.md`。
+owner 已要求把原规划 PR3 并入 #89。主流程在价格与多日涨跌计算后调用 `intel_pass0.build_intel_snapshot(archive=False)` 收集免费信源；收集异常时生成带错误覆盖记录的应急情报快照。只有标的异动/新闻或命中地缘话题才出报告。`intel_deepen.py` 用代码选绝对涨跌最大的最多 5 个异动标的，每标的挑最多 2 条不同域名且标题命中别名的 direct/Finnhub 302 链接做 Extract；没有可用链接才搜索 `Why is {公司名} stock {up|down}`，最多 3 次 basic 搜索、10 个 Extract URL，合计最多 5 Tavily credit。SerpApi fallback 保留。正文片段和覆盖记录写回同一个原子情报快照存档；停止新写 `*-extract.md`。
 
-`intel_render.py` 把异动标的最多 25 条（标题、来源、时间、摘要、此前已报道标记、正文与覆盖）、无异动持仓最多 8 个标题、无异动观察标的一行、地缘话题最多 8 条/话题且总数最多 40 条送入 Pass 2。Pass 2 总在有报告材料时运行，直接对账本归因；三状态为已知原因、线索待核实、未找到原因（附覆盖）；检索失败写“未能完成检索”。无文本/异常时发送代码渲染账本摘要并发 TG 告警。SAS 候选抽取读相同账本段落，JSON 输出格式不变；运行状态消息按账本来源覆盖和深挖结果显示。
+`intel_render.py` 把异动标的最多 25 条（标题、来源、时间、摘要、此前已报道标记、正文与覆盖）、无异动持仓最多 8 个标题、无异动观察标的一行、地缘话题最多 8 条/话题且总数最多 40 条送入 Pass 2。Pass 2 总在有报告材料时运行，直接对情报快照归因；三状态为已知原因、线索待核实、未找到原因（附覆盖）；检索失败写“未能完成检索”。无文本/异常时发送代码渲染情报快照摘要并发 TG 告警。SAS 候选抽取读相同情报快照段落，JSON 输出格式不变；运行状态消息按情报快照来源覆盖和深挖结果显示。
 
-近 5 个 NYSE 交易日的历史报告按异动/多日阈值标的抽取实体段落，跨月读取、同档只取首份、排除当前档，每标的最多 600 字符，提示只写新增事实。FRED 档位、15% 仓位跨越和 52 周新高/低按上次成功报告的账本 `context_state` 比较，仅变化时注入。社交舆情只对报告出现的标的每个注入一行。旧 LLM Pass 1、语义过滤、开放池、预留名额、异动/多日/轮询搜索 job、Brave 主流程调用及旧 RSS 分桶已移除，`llm_config.json` 删除旧两个 stage。Layer A 私有文件的旧“结论必须可操作”句运行时精确替换，其余个人原则保留。未运行付费报告，也未改 Obsidian 或部署；PR 状态以 GitHub 为准。
+近 5 个 NYSE 交易日的历史报告按异动/多日阈值标的抽取实体段落，跨月读取、同档只取首份、排除当前档，每标的最多 600 字符，提示只写新增事实。FRED 档位、15% 仓位跨越和 52 周新高/低按上次成功报告的情报快照 `context_state` 比较，仅变化时注入。社交舆情只对报告出现的标的每个注入一行。旧 LLM Pass 1、语义过滤、开放池、预留名额、异动/多日/轮询搜索 job、Brave 主流程调用及旧 RSS 分桶已移除，`llm_config.json` 删除旧两个 stage。Layer A 私有文件的旧“结论必须可操作”句运行时精确替换，其余个人原则保留。未运行付费报告，也未改 Obsidian 或部署；PR 状态以 GitHub 为准。
 ---
 
 ## [强制] "打扫战场"必须包含设计文档更新
@@ -517,12 +517,12 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
 ```
 0.  FINANCE_FORCE_DATE / FINANCE_FORCE_SLOT / FINANCE_FORCE_RUN 覆盖，NYSE 交易日与月度报告同档防重检查
 1.  读取 watchlist、预算和价格；AM 使用盘前价，PM 使用今日收盘和盘后价，并计算单日及 3/5 交易日涨跌
-2.  免费 Pass 0：intel_pass0.build_ledger(archive=False) 按标的收集 Finnhub、Google News、RSS、Guardian；多日异动扩大各来源发表窗口；收集整体失败时保留价格与窗口，生成带错误记录的应急账本
+2.  免费 Pass 0：intel_pass0.build_intel_snapshot(archive=False) 按标的收集 Finnhub、Google News、RSS、Guardian；多日异动扩大各来源发表窗口；收集整体失败时保留价格与窗口，生成带错误记录的应急情报快照
 3.  无标的异动、标的新闻或命中地缘话题则退出；否则读取 KB，收集 Sonar 宏观、社交舆情和 FRED 流动性背景
 4.  代码 Pass 1：intel_deepen.py 按触发的绝对涨跌选最多 5 个标的，优先每标的 2 个不同落地域名的直接文章/Finnhub 302 链接；无链接才按同一发表窗口搜索。最多 3 次 basic 搜索、10 个 Extract URL（最多 2cr），总 Tavily 预算最多 5cr，SerpApi 可作回退
-5.  将深挖正文、来源覆盖、此前已报道标记写回账本并存档；按异动/安静持仓/地缘话题的数量上限渲染 Pass 2 输入，加入最近 5 个既往交易日报告与发生变化的背景信号
-6.  Pass 2 直接按账本归因，输出 Markdown；空响应或异常时改用代码渲染的账本摘要并发 TG 告警。SAS 候选提取仍为独立 JSON 调用，PM 校准仍运行
-7.  写入月度 Obsidian 报告、账本上下文和 MemPalace；发送邮件、Telegram 报告及独立运行状态消息
+5.  将深挖正文、来源覆盖、此前已报道标记写回情报快照并存档；按异动/安静持仓/地缘话题的数量上限渲染 Pass 2 输入，加入最近 5 个既往交易日报告与发生变化的背景信号
+6.  Pass 2 直接按情报快照归因，输出 Markdown；空响应或异常时改用代码渲染的情报快照摘要并发 TG 告警。SAS 候选提取仍为独立 JSON 调用，PM 校准仍运行
+7.  写入月度 Obsidian 报告、情报快照上下文和 MemPalace；发送邮件、Telegram 报告及独立运行状态消息
 ```
 
 旧 LLM Pass 1、语义过滤、轮询 job、七天围栏、`score_and_filter()` 和 `*-extract.md` 新写入已从主报告路径移除；历史归档与早期变更记录保留作溯源。

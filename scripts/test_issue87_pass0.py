@@ -1,4 +1,4 @@
-"""PR1 contracts for the shadow Pass 0 ledger (no network or paid calls)."""
+"""PR1 contracts for the shadow Pass 0 intel_snapshot (no network or paid calls)."""
 import ast
 import json
 import sys
@@ -15,20 +15,20 @@ sys.path.insert(0, str(Path(__file__).parent))
 import intel_collect as collect
 import intel_pass0 as pass0
 from eval.evaluate_issue87 import score_case
-from intel_pass0 import _context_price_rows, build_ledger
+from intel_pass0 import _context_price_rows, build_intel_snapshot
 
 
 class PassZeroTest(unittest.TestCase):
     def test_collector_failure_keeps_anomaly_reportable(self):
         from fetch_prices import PriceRow
-        from intel_render import emergency_ledger, should_report
+        from intel_render import emergency_intel_snapshot, should_report
         now = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
         moves = {"INTC": (16.0, 21.0)}
         row = PriceRow("INTC", "Intel", 100, 90, 11, 25, True, "$", slot="pm")
-        ledger = emergency_ledger("2026-09-21", "pm", now, [row],
+        intel_snapshot = emergency_intel_snapshot("2026-09-21", "pm", now, [row],
                                   {"stocks": ["INTC"]}, moves, "collector: Timeout")
-        self.assertTrue(should_report(ledger))
-        self.assertIn("collector: Timeout", ledger["entities"][0]["coverage"]["errors"])
+        self.assertTrue(should_report(intel_snapshot))
+        self.assertIn("collector: Timeout", intel_snapshot["entities"][0]["coverage"]["errors"])
 
     def test_shadow_modules_have_no_paid_service_import_or_call(self):
         for name in ("intel_collect.py", "intel_pass0.py"):
@@ -112,7 +112,7 @@ class PassZeroTest(unittest.TestCase):
         self.assertEqual(entities[0]["coverage"]["guardian"], 1)
         self.assertIn("rss: skipped in replay", entities[0]["coverage"]["errors"])
 
-    def test_replay_passes_multiday_window_to_ledger(self):
+    def test_replay_passes_multiday_window_to_intel_snapshot(self):
         from fetch_prices import PriceRow
         row = PriceRow("INTC", "Intel", 100, 90, 11, 25, True, "$", slot="pm")
         with tempfile.TemporaryDirectory() as root, \
@@ -120,9 +120,9 @@ class PassZeroTest(unittest.TestCase):
              patch.object(pass0, "_read_context_rest", return_value=""), \
              patch.object(pass0, "_historical_prices", return_value=[row]), \
              patch.object(pass0, "_historical_multiday_moves", return_value={"INTC": (16.0, 25.0)}), \
-             patch.object(pass0, "build_ledger", return_value=({"date": "2026-09-21", "slot": "pm", "entities": [],
-                                                                  "macro_digest": {"items": []}}, Path(root) / "ledger.json")) as build, \
-             patch.object(collect, "archive_ledger"):
+             patch.object(pass0, "build_intel_snapshot", return_value=({"date": "2026-09-21", "slot": "pm", "entities": [],
+                                                                  "macro_digest": {"items": []}}, Path(root) / "intel_snapshot.json")) as build, \
+             patch.object(collect, "archive_intel_snapshot"):
             pass0.replay("2026-09-21", "pm", tickers=["INTC"], archive_root=Path(root))
         kwargs = build.call_args.kwargs
         self.assertEqual(kwargs["multiday_moves"]["INTC"], (16.0, 25.0))
@@ -159,11 +159,11 @@ class PassZeroTest(unittest.TestCase):
         later = datetime(2026, 9, 21, 13, tzinfo=timezone.utc)
         sources = {"finnhub": [collect.item("old", "", "Finnhub", "a.com", "u", "direct", now),
                                collect.item("future", "", "Finnhub", "a.com", "v", "direct", later)]}
-        ledger = collect.assemble_entity("INTC", "Intel", ["Intel"], False, None, {}, sources,
+        intel_snapshot = collect.assemble_entity("INTC", "Intel", ["Intel"], False, None, {}, sources,
                                          {"rss": "skipped in replay"}, now)
-        self.assertEqual([i["title"] for i in ledger["items"]], ["old"])
-        self.assertEqual(ledger["coverage"]["finnhub"], 1)
-        self.assertTrue(any("rss: skipped in replay" in e for e in ledger["coverage"]["errors"]))
+        self.assertEqual([i["title"] for i in intel_snapshot["items"]], ["old"])
+        self.assertEqual(intel_snapshot["coverage"]["finnhub"], 1)
+        self.assertTrue(any("rss: skipped in replay" in e for e in intel_snapshot["coverage"]["errors"]))
 
     def test_shadow_build_only_collects_and_marks_seen_titles(self):
         now = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
@@ -171,22 +171,37 @@ class PassZeroTest(unittest.TestCase):
         previous = {"as_of": "2026-09-20T12:00:00+00:00", "date": "2026-09-20", "slot": "pm",
                     "entities": [{"ticker": "INTC", "items": [{"title": "Intel signs AUO partnership"}]}]}
         with tempfile.TemporaryDirectory() as root:
-            collect.archive_ledger(previous, Path(root))
+            collect.archive_intel_snapshot(previous, Path(root))
             with patch("llm_client.call_llm", side_effect=AssertionError("shadow mode called LLM")), \
                  patch.object(collect, "resolve_aliases", return_value=({"INTC": ["Intel", "INTC"]}, {})), \
                  patch.object(collect, "collect", return_value=([collect.assemble_entity(
                      "INTC", "Intel", ["Intel", "INTC"], True, 4.0, {}, {"finnhub": [story]}, [], now)],
                      {"items": [], "geo_topics_hit": [], "coverage": {}})):
-                ledger, _ = build_ledger({"stocks": ["INTC"]}, now, "am", archive_root=Path(root))
-        entity = ledger["entities"][0]
+                intel_snapshot, _ = build_intel_snapshot({"stocks": ["INTC"]}, now, "am", archive_root=Path(root))
+        entity = intel_snapshot["entities"][0]
         self.assertTrue(entity["items"][0]["seen_before"])
         self.assertFalse(set(entity) & {"events", "move_status", "primary_event_ids", "gap_query"})
 
     def test_atomic_archive(self):
         with tempfile.TemporaryDirectory() as root:
-            path = collect.archive_ledger({"date": "2026-09-21", "slot": "am", "entities": []}, Path(root))
+            path = collect.archive_intel_snapshot({"date": "2026-09-21", "slot": "am", "entities": []}, Path(root))
+            self.assertEqual(path.name, "2026-09-21-am-intel-snapshot.json")
             self.assertEqual(json.loads(path.read_text())["slot"], "am")
             self.assertFalse(list(Path(root).rglob("*.tmp")))
+
+    def test_previous_titles_reads_legacy_archive_and_prefers_current_name(self):
+        with tempfile.TemporaryDirectory() as root:
+            month = Path(root) / "202609"
+            month.mkdir()
+            legacy = month / "2026-09-20-pm-ledger.json"
+            legacy.write_text(json.dumps({"as_of": "2026-09-20T20:00:00+00:00",
+                                          "entities": [{"ticker": "INTC", "items": [{"title": "old"}]}]}))
+            before = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
+            self.assertEqual(collect.previous_event_titles(Path(root), before, "INTC"), ["old"])
+            current = month / "2026-09-20-pm-intel-snapshot.json"
+            current.write_text(json.dumps({"as_of": "2026-09-20T20:00:00+00:00",
+                                           "entities": [{"ticker": "INTC", "items": [{"title": "new"}]}]}))
+            self.assertEqual(collect.previous_event_titles(Path(root), before, "INTC"), ["new"])
 
     def test_finnhub_keeps_all_in_window_and_truncates_only_summary(self):
         now = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)

@@ -1,10 +1,10 @@
-"""Bounded ledger inputs and deterministic fallback for issue #87 Pass 2."""
+"""Bounded intelligence snapshot inputs and deterministic fallback for issue #87 Pass 2."""
 from __future__ import annotations
 
 from intel_collect import _word_match
 
 
-def emergency_ledger(today: str, slot: str, as_of, price_rows: list,
+def emergency_intel_snapshot(today: str, slot: str, as_of, price_rows: list,
                      watchlist: dict, multiday_moves: dict, error: str,
                      held: set[str] | None = None, weights: dict | None = None,
                      window_starts: dict[str, str] | None = None) -> dict:
@@ -36,9 +36,9 @@ def _has_move(entity: dict) -> bool:
     return bool(set((entity.get("move") or {}).get("flags", [])) & {"anomaly", "d3", "d5"})
 
 
-def should_report(ledger: dict) -> bool:
-    return (any(_has_move(e) or e.get("items") for e in ledger.get("entities", []))
-            or bool((ledger.get("macro_digest") or {}).get("geo_topics_hit")))
+def should_report(intel_snapshot: dict) -> bool:
+    return (any(_has_move(e) or e.get("items") for e in intel_snapshot.get("entities", []))
+            or bool((intel_snapshot.get("macro_digest") or {}).get("geo_topics_hit")))
 
 
 def coverage_line(entity: dict) -> str:
@@ -49,11 +49,11 @@ def coverage_line(entity: dict) -> str:
             + (f"；错误：{'; '.join(errors)}" if errors else ""))
 
 
-def render_ledger_context(ledger: dict, geo_keywords: dict[str, list[str]]) -> str:
+def render_intel_snapshot_context(intel_snapshot: dict, geo_keywords: dict[str, list[str]]) -> str:
     """All movers, quiet holdings with up to 8 titles, macro latest 8/topic, 40 total."""
     lines = ["## 标的事实与来源（供分析）"]
     quiet_observers = []
-    for e in ledger.get("entities", []):
+    for e in intel_snapshot.get("entities", []):
         move = e.get("move") or {}
         active = _has_move(e)
         rows = e.get("items") or []
@@ -82,7 +82,7 @@ def render_ledger_context(ledger: dict, geo_keywords: dict[str, list[str]]) -> s
             lines.append(f"  正文[{chunk.get('url', '')}] {chunk.get('confidence_tags', '')}: {chunk.get('text', '')}")
     if quiet_observers:
         lines.append("无异动观察标的：" + "、".join(quiet_observers))
-    macro = (ledger.get("macro_digest") or {}).get("items", [])
+    macro = (intel_snapshot.get("macro_digest") or {}).get("items", [])
     chosen, seen = [], set()
     for topic, aliases in geo_keywords.items():
         count = 0
@@ -102,9 +102,9 @@ def render_ledger_context(ledger: dict, geo_keywords: dict[str, list[str]]) -> s
     return "\n".join(lines) + "\n"
 
 
-def render_fallback_report(ledger: dict, slot_label: str) -> str:
-    lines = [f"# [Daily_Intel] {ledger['date']} {slot_label}", "", "## 持仓与观察标的"]
-    for e in ledger.get("entities", []):
+def render_fallback_report(intel_snapshot: dict, slot_label: str) -> str:
+    lines = [f"# [Daily_Intel] {intel_snapshot['date']} {slot_label}", "", "## 持仓与观察标的"]
+    for e in intel_snapshot.get("entities", []):
         if not (_has_move(e) or e.get("items")):
             continue
         move = e.get("move") or {}
@@ -115,7 +115,7 @@ def render_fallback_report(ledger: dict, slot_label: str) -> str:
                      + f"；覆盖：{coverage_line(e)}。")
     if len(lines) == 3:
         lines.append("- 公司层面暂无可报告事项。")
-    macro = ledger.get("macro_digest") or {}
+    macro = intel_snapshot.get("macro_digest") or {}
     if macro.get("geo_topics_hit") and macro.get("items"):
         lines.append("\n## 宏观与地缘")
         for row in sorted(macro["items"], key=lambda r: r.get("published_at", ""), reverse=True)[:8]:

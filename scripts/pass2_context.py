@@ -5,14 +5,16 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from intel_collect import archived_intel_snapshot_paths
 
-def read_previous_ledger_state(root: Path, before: datetime) -> dict:
-    """Read the newest previously completed report state from an archived ledger."""
-    for path in sorted(Path(root).glob("*/*-ledger.json"), reverse=True):
+
+def read_previous_intel_snapshot_state(root: Path, before: datetime) -> dict:
+    """Read the newest previously completed report state from an intelligence snapshot."""
+    for path in archived_intel_snapshot_paths(root):
         try:
-            ledger = json.loads(path.read_text(encoding="utf-8"))
-            if datetime.fromisoformat(ledger["as_of"]) < before and isinstance(ledger.get("context_state"), dict):
-                return ledger["context_state"]
+            intel_snapshot = json.loads(path.read_text(encoding="utf-8"))
+            if datetime.fromisoformat(intel_snapshot["as_of"]) < before and isinstance(intel_snapshot.get("context_state"), dict):
+                return intel_snapshot["context_state"]
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return {}
