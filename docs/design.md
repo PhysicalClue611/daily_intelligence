@@ -784,7 +784,7 @@ Obsidian Vault/
 - **Sonar 宏观快照防过时/防幻觉（issue #24）**：详见第五节 Sonar 部分。
 
 **待规划**
-- **候选统一打标层（issue #14，并入方向 4）**：`score_and_filter()` 之后、`_haiku_relevance_filter()` 之前加统一打标步骤，产出两个 tier：相关度（direct_company_news/sector_related_news/macro_market_news，来自 #14）+ 信源形态（wire_article/video_hub/aggregator_listing，来自 #19 方向 4）。信源形态判断前移到候选阶段（URL 路径正则前筛 `/video/`/`/watch/` 等），而非现有 `_detect_low_structure()` 那样等 extract 抹完全文才事后判断——能在花 Tavily extract credit 之前就把视频/聚合页候选降权。同域名同事件时优先保留文章版，视频版降权/丢弃。用户决定先观察一段时间再评估优先级。
+- **候选统一打标层（issue #14，并入方向 4；旧插入点已作废）**：原计划放在 `score_and_filter()` 与 `_haiku_relevance_filter()` 之间；这两个阶段已由 issue #87 的账本和代码深挖替换，不能按旧方案接入。若后续获准实施，应在 `intel_deepen.py` 的候选链接选择、实际 Extract 之前评估相关度（direct_company_news/sector_related_news/macro_market_news）及信源形态（wire_article/video_hub/aggregator_listing）。可通过 URL 路径 `/video/`、`/watch/` 等识别视频/聚合页，同事件优先文章版；用户此前决定先观察再评估优先级。
 - MemPalace 细切片：月度报告目前整文件级 drawer，跨日报 embedding 较粗；可在 run_finance.py 写报告后直接 mempalace_add_drawer 做 per-day 切片，不增加 Obsidian 文件
 - TG 追问后置 Extract：Sonar 返回引用 URL 后对前 1-2 个 URL 调 `tavily_extract()`，补全文作为 Claude 辅证证据，仅当异动标的且 budget ≥ 2cr 时触发
 

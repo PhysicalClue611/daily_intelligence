@@ -61,12 +61,12 @@ def _direct_leads(entity: dict) -> list[tuple[str, dict]]:
             continue
         if not any(_word_match(row.get("title", ""), name) for name in names):
             continue
-        domain = row.get("publisher_domain") or (urlparse(row.get("url", "")).hostname or "")
-        if domain in domains:
-            continue
         url = row.get("url", "")
         if row.get("url_kind") == "finnhub_redirect":
             url = resolve_article_url(url) or ""
+        domain = (urlparse(url).hostname or "").removeprefix("www.").lower()
+        if not domain or domain in domains:
+            continue
         if url.startswith("https://"):
             leads.append((url, row))
             domains.add(domain)

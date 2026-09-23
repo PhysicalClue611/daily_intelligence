@@ -21,9 +21,9 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ## issue #87 PR1（Pass 0 影子账本，PR #88 已合并）
 
-`run_finance.py` 在价格与多日涨跌计算后旁路运行 `intel_pass0.py`，失败只记 WARNING，旧 RSS/Finnhub、Pass 1、Tavily、Pass 2 和报告写出仍照旧。新 `intel_collect.py` 对 watchlist 个股（排除 QQQM/VOO/EWJ/SGOL）按标的收集完整 Finnhub company-news、公司名 Google News RSS、7 个现有 RSS 和 Guardian；按别名边界匹配与标的内去重，覆盖记录保留原始条数和错误。别名可在 watchlist `## 实体别名` 写 `INTC: Intel, 英特尔`，缺失时 Finnhub profile2 补全并缓存到 gitignore 的 `entity_alias_cache.json`。Google News 每次实际 HTTP 尝试（包括重试）至少间隔 1 秒，且与 Finnhub 使用独立线程池；其 RSS 链接只作线索，不解码原文。中文别名用 ASCII 边界匹配，拉丁别名仍用词边界。多日异动时 RSS/Guardian 共享抓取窗口扩到最早标的起点，再按各标的窗口分拣；报告与回放共用 `publication_window.py` 的交易日窗口计算。
+PR #88 引入 `intel_pass0.py` 和 `intel_collect.py`，当时作为报告旁路运行的影子收集器。它对 watchlist 个股（排除 QQQM/VOO/EWJ/SGOL）按标的收集 Finnhub company-news、公司名 Google News RSS、现有 RSS 和 Guardian；按别名边界匹配与标的内去重，覆盖记录保留原始条数和错误。别名可在 watchlist `## 实体别名` 写 `INTC: Intel, 英特尔`，缺失时 Finnhub profile2 补全并缓存到 gitignore 的 `entity_alias_cache.json`。Google News 每次实际 HTTP 尝试（包括重试）至少间隔 1 秒，且与 Finnhub 使用独立线程池；其 RSS 链接只作线索，不解码原文。中文别名用 ASCII 边界匹配，拉丁别名仍用词边界。多日异动时 RSS/Guardian 共享抓取窗口扩到最早标的起点，再按各标的窗口分拣；报告与回放共用 `publication_window.py` 的交易日窗口计算。PR #89 将这套收集器接入主报告路径，见下节。
 
-影子账本只做免费收集，不调用 LLM 或 Tavily。每次运行原子写入 `archives/YYYYMM/YYYY-MM-DD-{slot}-ledger.json`，实体只保存移动、覆盖、条目和预留的 `fulltext`；条目标题与上一次运行账本归一化后相同则标 `seen_before`。`intel_pass0.py --replay YYYY-MM-DD --slot am|pm [--ticker SYMBOL]` 只建本地 JSON/Markdown 账本，不发通知、不写 Obsidian；回放优先用当时 context log 的盘前/日内涨跌，读不到才用日线近似；历史日线重建 3/5 日阈值和加长窗口。RSS 明确跳过，Guardian 用历史日期窗读取。24 条回溯评估集和收集召回验收入口位于 `scripts/eval/`。
+PR #88 的影子账本只做免费收集，不调用 LLM 或 Tavily。每次运行原子写入 `archives/YYYYMM/YYYY-MM-DD-{slot}-ledger.json`，实体只保存移动、覆盖、条目和预留的 `fulltext`；条目标题与上一次运行账本归一化后相同则标 `seen_before`。`intel_pass0.py --replay YYYY-MM-DD --slot am|pm [--ticker SYMBOL]` 仍只建本地 JSON/Markdown 账本，不发通知、不写 Obsidian；回放优先用当时 context log 的盘前/日内涨跌，读不到才用日线近似；历史日线重建 3/5 日阈值和加长窗口。RSS 明确跳过，Guardian 用历史日期窗读取。24 条回溯评估集和收集召回验收入口位于 `scripts/eval/`。
 
 PR #88 已合并；独立回放 22/24，零 LLM 调用。合并后的影子观察重点是收集召回、`seen_before` 重复率、Google News 稳定性与 Pass 0 耗时。issue #87 D5 的可验证信号与社交舆情选择留给后续决策，PR1 未触及。
 
@@ -512,40 +512,20 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
 
 ---
 
-## 运行逻辑（run_finance.py）
+## 运行逻辑（run_finance.py；PR #89 待合并）
 
 ```
-0.  环境变量覆盖：FINANCE_FORCE_DATE → 强制报告日期；FINANCE_FORCE_SLOT=am|pm → 强制时段；FINANCE_FORCE_RUN → 绕过交易日/防重检查
-1.  NYSE 交易日检查 → 非交易日退出（FORCE_DATE/FORCE_RUN 时跳过）
-2.  确定 run_slot（am: hour<18 / pm: hour≥18，FORCE_SLOT 优先）和 slot_label（开盘前简报/夜盘动向）
-3.  防重检查：月度文件中搜索 "## {date} {slot_label}" → 存在则退出
-4.  读取 watchlist.md
-5.  fetch_prices(slot=run_slot)：
-    - AM：日线数据取 prev_close + week_change；另拉 2d/1m prepost=True 取盘前最新价作为 price；change_pct = (premarket - prev_close) / prev_close
-    - PM：日线数据取今日收盘为 price；另拉 1m prepost=True 取 16:00-20:00 ET 最后 bar 为 afterhours_price；is_anomaly = close_anomaly OR ah_anomaly
-    - fallback：两级，yfinance失败→Finnhub（无盘前/盘后，记日志）；format_price_table(slot) 输出对应列
-6.  RSS 聚合（7个 feed + Guardian API，过去24小时，含 Digitimes；issue #85 停用五个综合新闻源）→ 计算 triggered_geo_topics（RSS 命中的地缘政治主题列表）；Guardian key 存在时合并 Guardian 结果并重排
-7.  代码层 skip：无 anomaly、无 triggered_geo_topics、且无多日累计追因 job → 静默退出（不调用 LLM，零成本）。多日 job 在这一步之前算完
-8.  bridge 拉取 KB 上下文（fail-open）：MemPalace + Obsidian → kb_section；字符预算 2000（MP 1200 / Obs 800 独立截断）
-8b. Finnhub 即时新闻（免费，无配额）：异动标的优先 + watchlist 股票补齐，取前8个，
-    hours=min(query_days×24, 48)，注入 finnhub_news_section（fail-open）
-8c. Sonar 宏观快照（perplexity/sonar，~$0.005）：`_sonar_macro_brief()` 从 watchlist 动态构建 query
-    AM 聚焦过去12h隔夜，PM 聚焦当日盘面+盘后；portfolio 快照注入 system prompt；fail-open
-    → sonar_macro_section，注入 Pass 1 和 Pass 2 prompt（紧接 Finnhub 之后）
-9.  计算 query_days = max(1, min(3, 距上次报告天数))
-10. LLM pass 1（deepseek-v4-flash）注入 price_table + RSS + finnhub_news + kb_section + triggered_geo_topics
-    → 输出：{report_md, tavily_queries:[{query, search_depth, days, max_results}]}
-    （网络/5xx 错误自动重试 2 次，间隔 2s/4s；4xx 和 JSON parse 不重试）
-11. 构建搜索任务列表：异动追因（`_anomaly_search_jobs`：AM/PM 前 3 大 `|change_pct|` 各一条 basic；Finnhub 只作补充）→ 多日累计追因（issue #80，`_unexplained_move_search_jobs`，最多 2 条，自带 start/end date）→ Pass1 `tavily_queries` → issue #33 rotation（候选 ticker 已在实际 anomaly job 集合中才跳过；不因多日 query 跳过）
-12. 顺序执行搜索任务，每次预检 budget。搜索前用 `_must_answer_tickers()` 定一份名单。名单内 job 打 `_source_ticker` 并过 7 天围栏（`now_et`）。Tavily 断连自动 fallback SerpApi
-12b. 名单内每个 ticker 预留一条 Extract URL（不进开放池打分）。开放池 `score_and_filter` top 25，语义过滤约 15。Extract 预留先发、开放池再按 10 个 URL 一批；两次 query 都用这份名单，开放池另加地缘词
-13. 有搜索结果 → LLM pass 2（openai/gpt-5.6-luna）合并生成最终报告（同样含 finnhub_news_section）
-14. PM slot：替换报告标题为「夜盘动向」
-15. Append 到 Obsidian 月度文件 Daily_Intel_report_YYYYMM.md
-16. 发邮件 → watchlist.md 配置的收件人
-17. 发 Telegram（@PhyCluFintel_bot）→ Markdown 转 HTML，超 4096 字符自动分段
-17b. 发送 TG 独立运行状态消息（`build_status_message()`）：Tavily/SerpApi 本次用量+剩余、情报源状态（RSS/Guardian/Finnhub/Sonar/Tavily搜索+Extract）、LLM/Provider 清单；不进入邮件和 Obsidian 正文
+0.  FINANCE_FORCE_DATE / FINANCE_FORCE_SLOT / FINANCE_FORCE_RUN 覆盖，NYSE 交易日与月度报告同档防重检查
+1.  读取 watchlist、预算和价格；AM 使用盘前价，PM 使用今日收盘和盘后价，并计算单日及 3/5 交易日涨跌
+2.  免费 Pass 0：intel_pass0.build_ledger(archive=False) 按标的收集 Finnhub、Google News、RSS、Guardian；多日异动扩大各来源发表窗口；收集整体失败时保留价格与窗口，生成带错误记录的应急账本
+3.  无标的异动、标的新闻或命中地缘话题则退出；否则读取 KB，收集 Sonar 宏观、社交舆情和 FRED 流动性背景
+4.  代码 Pass 1：intel_deepen.py 按触发的绝对涨跌选最多 5 个标的，优先每标的 2 个不同落地域名的直接文章/Finnhub 302 链接；无链接才按同一发表窗口搜索。最多 3 次 basic 搜索、10 个 Extract URL（最多 2cr），总 Tavily 预算最多 5cr，SerpApi 可作回退
+5.  将深挖正文、来源覆盖、此前已报道标记写回账本并存档；按异动/安静持仓/地缘话题的数量上限渲染 Pass 2 输入，加入最近 5 个既往交易日报告与发生变化的背景信号
+6.  Pass 2 直接按账本归因，输出 Markdown；空响应或异常时改用代码渲染的账本摘要并发 TG 告警。SAS 候选提取仍为独立 JSON 调用，PM 校准仍运行
+7.  写入月度 Obsidian 报告、账本上下文和 MemPalace；发送邮件、Telegram 报告及独立运行状态消息
 ```
+
+旧 LLM Pass 1、语义过滤、轮询 job、七天围栏、`score_and_filter()` 和 `*-extract.md` 新写入已从主报告路径移除；历史归档与早期变更记录保留作溯源。
 
 **Footer 内容（2026-06-12 起）**：邮件/Obsidian/TG 报告正文的 footer 仅含 `_Daily_Intel · {date} ET_` + IBKR 状态行（仅"需要重新授权"时显示；gateway 不可达时不显示任何提示，因 IBKR 暂时停用）。原"完全隔离"声明行和"Tavily今日剩余"计数已移除，后者改入 step 17b 的独立 TG 状态消息。
 

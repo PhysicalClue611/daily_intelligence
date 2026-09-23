@@ -608,7 +608,7 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 
 按标的账本作归因。异动只有三种表述：有直接证据的“已知原因”（附来源）；有线索但证据不足的“线索待核实”（单一来源的强断言在句内标“未证实”）；找不到线索时写“未找到原因”，并写明该标的覆盖记录。覆盖记录显示检索失败而无条目时写“未能完成检索”，不能声称已查遍。价格变化本身不是原因。不能因没找到就断言“没有公司级催化”；无账本证据不得臆测情绪、资金流或风格轮动。只写新闻相对“此前已报道”及近五个交易日报告新增的事实；无进展时省略，或一句“延续 MM-DD 已报道的<事件>，今日无新进展”。不复述信源独立域名数量。
 
-仓位建议仅在下列事实命中时提出，并指出具体新证据：认知提升（战略节点首次商业化、竞争格局结构变化、此前被怀疑的管理层承诺获证实）；Alpha 大幅兑现（预期差评分下降超过3分、未来 Alpha 潜力低于5分且无新催化）；更高赔率机会（候选潜力高2分以上且战略空间同量级）；价格被动上涨致单一仓位跨过15%。FRED 档位变化或52周新高低是背景，不单独触发交易。未命中时不写仓位段落，不逐股声明“无加减仓依据”，不复述标准原文。
+仓位建议仅在下列事实命中时提出，并指出具体新证据：认知提升（战略节点首次商业化、竞争格局结构变化、此前被怀疑的管理层承诺获证实）；Alpha 大幅兑现（预期差评分下降超过3分、未来 Alpha 潜力低于5分且无新催化）；更高赔率机会（候选潜力高2分以上且战略空间同量级）；价格被动上涨致单一仓位跨过15%。若注入了 FRED 档位变化或52周新高/新低，也允许写仓位小节，但只陈述本次背景变化，不把它当成单独的交易指令。上述事实或背景变化均未出现时省略仓位小节，不逐股声明“无加减仓依据”，不复述标准原文。
 
 输出骨架（空节省略）：
 # [Daily_Intel] {date} 开盘前简报
@@ -868,8 +868,8 @@ def _main_body():
     )
     pm_afterhours_note = (
         f"注意（夜盘报告）：价格表【盘后涨跌】列反映收盘后截至 {now_et.strftime('%H:%M %Z')} 的最新运行状态。"
-        f"Finnhub 即时新闻已聚焦过去8小时异动标的。"
-        f"请在【价格异动】中分别说明日内表现与盘后延续/反转情况，无盘后数据时注明\"盘后无成交\"。"
+        f"请在【持仓与观察标的】中按账本证据分别说明日内表现与盘后延续/反转情况，"
+        f"无盘后数据时注明\"盘后无成交\"。"
         if run_slot == "pm" else ""
     )
     price_rows = fetch_prices(
@@ -914,7 +914,8 @@ def _main_body():
         logger.warning("Pass 0 ledger collection failed: %s", exc)
         ledger = emergency_ledger(today_et, run_slot, now_et, price_rows, wl, multiday_moves,
                                   f"collector: {type(exc).__name__}",
-                                  held=set(_get_core_holding_tickers()), weights=_get_portfolio_weights())
+                                  held=set(_get_core_holding_tickers()), weights=_get_portfolio_weights(),
+                                  window_starts=windows)
     if not should_report(ledger):
         logger.info("No entity move, company item, or macro item; skipping")
         return

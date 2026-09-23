@@ -6,11 +6,12 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from intel_deepen import candidate_entities, deepen_ledger, resolve_article_url
-from intel_render import render_ledger_context, render_fallback_report, should_report, filter_social_lines
+from intel_render import emergency_ledger, render_ledger_context, render_fallback_report, should_report, filter_social_lines
 from fetch_news import _classify_topics
 
 
@@ -109,6 +110,18 @@ class SwitchTest(unittest.TestCase):
                              "https://publisher.example/article")
         self.assertFalse(head.call_args.kwargs["follow_redirects"])
 
+    def test_redirects_deduplicate_by_landing_domain_after_resolution(self):
+        rows = [item(f"INTC Intel report {i}", "finnhub.io", f"https://finnhub.io/news/{i}", "finnhub_redirect",
+                     f"2026-09-21T1{9-i}:00:00+00:00") for i in range(3)]
+        landing = {rows[0]["url"]: None, rows[1]["url"]: "https://a.example/one",
+                   rows[2]["url"]: "https://b.example/two"}
+        extracted = []
+        ledger = {"date": "2026-09-21", "slot": "pm", "entities": [entity("INTC", d1=8, items=rows)]}
+        with patch("intel_deepen.resolve_article_url", side_effect=lambda url: landing[url]):
+            deepen_ledger(ledger, search=lambda *_: self.fail("searched despite direct leads"),
+                          extract=lambda urls, _: extracted.extend(urls) or [], remaining=lambda: 25)
+        self.assertEqual(extracted, ["https://a.example/one", "https://b.example/two"])
+
     def test_paid_request_retries_transient_failure_before_accounting(self):
         import httpx
         import run_finance as rf
@@ -165,6 +178,28 @@ class SwitchTest(unittest.TestCase):
                       extract=lambda *_: [], remaining=lambda: 25)
         self.assertIn("stock down", queries[0])
 
+    def test_emergency_ledger_preserves_multiday_publication_start(self):
+        row = SimpleNamespace(ticker="INTC", change_pct=1.0, is_anomaly=False)
+        ledger = emergency_ledger("2026-09-21", "pm", datetime(2026, 9, 21, tzinfo=timezone.utc),
+                                  [row], {"stocks": ["INTC"]}, {"INTC": (-17.0, None)},
+                                  "collector failure", window_starts={"INTC": "2026-09-14"})
+        dates = []
+        deepen_ledger(ledger, search=lambda _q, start, end: dates.append((start, end)) or [],
+                      extract=lambda *_: [], remaining=lambda: 25)
+        self.assertEqual(dates, [("2026-09-14", "2026-09-21")])
+
+    def test_issue80_thresholds_and_exclusions_survive_switch(self):
+        import run_finance as rf
+        from intel_pass0 import _move_from_row
+        rows = [SimpleNamespace(ticker=ticker, change_3d_pct=16.0, change_5d_pct=21.0,
+                                change_pct=1.0, is_anomaly=False) for ticker in ("INTC", "AAOI", "QQQM", "GC=F")]
+        moves = rf._compute_multiday_moves(rows, slot="pm")
+        self.assertEqual(moves, {"INTC": (16.0, 21.0)})
+        self.assertEqual(_move_from_row(rows[0], (14.99, 19.99))["flags"], [])
+        self.assertEqual(_move_from_row(rows[0], (15.0, 20.0))["flags"], ["d3", "d5"])
+        rows[1].is_anomaly = True
+        self.assertEqual(_move_from_row(rows[1], (None, None))["flags"], ["anomaly"])
+
     def test_ledger_render_caps_and_fallback_reports_coverage(self):
         rows = [item(f"INTC story {i}", f"s{i}.example", f"https://s{i}.example/x") for i in range(30)]
         ledger = {"date": "2026-09-21", "slot": "pm", "entities": [entity("INTC", d1=8, items=rows), entity("NVDA", held=False)],
@@ -184,6 +219,16 @@ class SwitchTest(unittest.TestCase):
                       "macro_digest": {"items": [item("Oil route risk", "news.example", "https://news.example/x")],
                                        "geo_topics_hit": ["oil"]}}
         self.assertIn("Oil route risk", render_fallback_report(macro_only, "夜盘收市速报"))
+
+    def test_overlapping_geo_topics_do_not_consume_second_topic_quota(self):
+        shared = [item(f"Iran Hormuz shared {i}", "news.example", f"https://news.example/s{i}")
+                  for i in range(8)]
+        exclusive = [item(f"Hormuz exclusive {i}", "news.example", f"https://news.example/e{i}")
+                     for i in range(8)]
+        ledger = {"entities": [], "macro_digest": {"items": shared + exclusive}}
+        rendered = render_ledger_context(ledger, {"Iran": ["Iran"], "Hormuz": ["Hormuz"]})
+        self.assertIn("Hormuz exclusive 7", rendered)
+        self.assertEqual(sum("Hormuz exclusive" in line for line in rendered.splitlines()), 8)
 
     def test_social_only_entity_lines_one_per_ticker(self):
         result = filter_social_lines("- INTC crowd bearish\n- INTC forum noise\n- NVDA bullish", [entity("INTC", d1=5)])

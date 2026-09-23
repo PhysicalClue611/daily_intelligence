@@ -6,7 +6,8 @@ from intel_collect import _word_match
 
 def emergency_ledger(today: str, slot: str, as_of, price_rows: list,
                      watchlist: dict, multiday_moves: dict, error: str,
-                     held: set[str] | None = None, weights: dict | None = None) -> dict:
+                     held: set[str] | None = None, weights: dict | None = None,
+                     window_starts: dict[str, str] | None = None) -> dict:
     """Keep a failed collector from suppressing a price-anomaly report."""
     rows = {row.ticker: row for row in price_rows}
     entities = []
@@ -22,7 +23,9 @@ def emergency_ledger(today: str, slot: str, as_of, price_rows: list,
             flags.append("d5")
         entities.append({"ticker": ticker, "name": ticker, "aliases": watchlist.get("entity_aliases", {}).get(ticker, [ticker]),
                          "held": ticker in (held or set()), "weight_pct": (weights or {}).get(ticker),
-                         "move": {"d1": row.change_pct if row else None, "d3": d3, "d5": d5, "flags": flags},
+                         "move": {"d1": row.change_pct if row else None, "d3": d3, "d5": d5, "flags": flags,
+                                  **({"window_start": window_starts[ticker]}
+                                     if window_starts and ticker in window_starts else {})},
                          "coverage": {"finnhub": 0, "google_news": 0, "rss": 0, "guardian": 0, "errors": [error]},
                          "items": [], "fulltext": []})
     return {"schema_version": 1, "date": today, "slot": slot, "as_of": as_of.isoformat(),
@@ -86,10 +89,11 @@ def render_ledger_context(ledger: dict, geo_keywords: dict[str, list[str]]) -> s
         for row in sorted(macro, key=lambda r: r.get("published_at", ""), reverse=True):
             if count >= 8 or len(chosen) >= 40:
                 break
-            if any(_word_match(row.get("title", "") + " " + row.get("summary", ""), alias) for alias in aliases):
-                if row.get("id") not in seen:
-                    chosen.append((topic, row))
-                    seen.add(row.get("id"))
+            if (row.get("id") not in seen and
+                    any(_word_match(row.get("title", "") + " " + row.get("summary", ""), alias)
+                        for alias in aliases)):
+                chosen.append((topic, row))
+                seen.add(row.get("id"))
                 count += 1
     if chosen:
         lines.append("## 宏观与地缘线索")

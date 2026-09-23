@@ -75,6 +75,26 @@ Intel current slot must be excluded.
                                                    {"INTC": ["Intel"]})
             self.assertEqual(result, "")
 
+    def test_am_uses_five_prior_sessions_and_pm_adds_today_am(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write(root, "202609", """## 2026-09-14 开盘前简报
+Intel earliest of five prior sessions.
+
+## 2026-09-21 开盘前简报
+Intel current morning update.
+
+## 2026-09-21 夜盘收市速报
+Intel current evening update.
+""")
+            am = build_recent_coverage_section(root, "2026-09-21", "am", ["INTC"], {"INTC": ["Intel"]})
+            pm = build_recent_coverage_section(root, "2026-09-21", "pm", ["INTC"], {"INTC": ["Intel"]})
+            self.assertIn("earliest of five", am)
+            self.assertNotIn("current morning", am)
+            self.assertIn("earliest of five", pm)
+            self.assertIn("current morning", pm)
+            self.assertNotIn("current evening", pm)
+
 
 class BackgroundChangeTest(unittest.TestCase):
     def test_only_changed_liquidity_crossing_and_new_extrema(self):
@@ -141,6 +161,7 @@ class PromptContractTest(unittest.TestCase):
         self.assertNotIn("一条都不命中", template)
         self.assertNotIn("独立域名佐证", template)
         self.assertNotIn("驱动因素归类（能力圈内外）", template)
+        self.assertIn("FRED 档位变化或52周新高/新低，也允许写仓位小节", template)
         fields = {name: "" for _, name, _, _ in Formatter().parse(template) if name}
         fields.update(date="2026-09-18", ledger_section="### INTC\n- [news.example] Intel new deal",
                       recent_coverage_section="## 近 5 个交易日已报道（同一标的）\n### INTC\n[09-17 PM] Intel update",

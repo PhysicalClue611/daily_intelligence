@@ -12,16 +12,16 @@ _FOLLOWUP = re.compile(r"^## 追问\b", re.M)
 
 
 def _trading_dates(today: date) -> set[str]:
-    """Last five NYSE sessions, including today when it is a session."""
+    """Five NYSE sessions strictly before the report date."""
     try:
         import exchange_calendars as xcals
         calendar = xcals.get_calendar("XNYS")
         start = today - timedelta(days=18)
-        sessions = calendar.sessions_in_range(start.isoformat(), today.isoformat())
+        sessions = calendar.sessions_in_range(start.isoformat(), (today - timedelta(days=1)).isoformat())
         return {day.date().isoformat() for day in sessions[-5:]}
     except Exception:
         dates = []
-        cursor = today
+        cursor = today - timedelta(days=1)
         while len(dates) < 5:
             if cursor.weekday() < 5:
                 dates.append(cursor.isoformat())
@@ -67,6 +67,8 @@ def build_recent_coverage_section(report_dir: Path, today: str, slot: str,
     if not tickers:
         return ""
     dates = _trading_dates(date.fromisoformat(today))
+    if slot == "pm":
+        dates.add(today)  # Today's earlier AM section is eligible, not the current PM section.
     files = sorted({Path(report_dir) / f"Daily_Intel_report_{day[:7].replace('-', '')}.md"
                     for day in dates})
     reports = []
