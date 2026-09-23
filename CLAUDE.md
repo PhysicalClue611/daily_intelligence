@@ -418,7 +418,7 @@ Issue #19已关闭（关闭条件B：核心防护done，issue #47单独跟踪残
 ├── scripts/
 │   ├── run_finance.py                 ← 主入口
 │   ├── fetch_prices.py                ← yfinance 价格拉取（宿主机运行）
-│   ├── fetch_news.py                  ← RSS 聚合（NYT/BBC/FT，httpx+feedparser）
+│   ├── fetch_news.py                  ← RSS 聚合（FT/CNBC/Digitimes 等，httpx+feedparser）
 │   ├── finance_email.py               ← Resend email client
 │   ├── memory_context_finance.py      ← KB 上下文注入（bridge REST API）
 │   ├── telegram_commands.py           ← Telegram 双向指令控制（long polling）
@@ -505,7 +505,7 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
     - AM：日线数据取 prev_close + week_change；另拉 2d/1m prepost=True 取盘前最新价作为 price；change_pct = (premarket - prev_close) / prev_close
     - PM：日线数据取今日收盘为 price；另拉 1m prepost=True 取 16:00-20:00 ET 最后 bar 为 afterhours_price；is_anomaly = close_anomaly OR ah_anomaly
     - fallback：两级，yfinance失败→Finnhub（无盘前/盘后，记日志）；format_price_table(slot) 输出对应列
-6.  RSS 聚合（15个 feed + Guardian API，过去24小时，含 Digitimes）→ 计算 triggered_geo_topics（RSS 命中的地缘政治主题列表）；Guardian key 存在时合并 Guardian 结果并重排
+6.  RSS 聚合（7个 feed + Guardian API，过去24小时，含 Digitimes；issue #85 停用五个综合新闻源）→ 计算 triggered_geo_topics（RSS 命中的地缘政治主题列表）；Guardian key 存在时合并 Guardian 结果并重排
 7.  代码层 skip：无 anomaly、无 triggered_geo_topics、且无多日累计追因 job → 静默退出（不调用 LLM，零成本）。多日 job 在这一步之前算完
 8.  bridge 拉取 KB 上下文（fail-open）：MemPalace + Obsidian → kb_section；字符预算 2000（MP 1200 / Obs 800 独立截断）
 8b. Finnhub 即时新闻（免费，无配额）：异动标的优先 + watchlist 股票补齐，取前8个，
@@ -652,25 +652,19 @@ _Tavily: N/10_
 
 ---
 
-## RSS Feeds（已验证可达，15个源 + Guardian API）
+## RSS Feeds（7个源 + Guardian API；issue #85 起五个综合新闻源停用）
 
 | Feed | URL | 定位 |
 |---|---|---|
-| NYT Business | `https://rss.nytimes.com/services/xml/rss/nyt/Business.xml` | 财经综合 |
-| NYT World | `https://rss.nytimes.com/services/xml/rss/nyt/World.xml` | 国际新闻 |
-| NYT Politics | `https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml` | 美国政治 |
-| BBC Business | `https://feeds.bbci.co.uk/news/business/rss.xml` | 财经综合 |
-| BBC World | `https://feeds.bbci.co.uk/news/world/rss.xml` | 国际新闻 |
 | FT World | `https://www.ft.com/world?format=rss` | 专业财经 |
 | CNBC | `https://www.cnbc.com/id/100003114/device/rss/rss.html` | 快速财经/市场 |
 | MarketWatch | `https://feeds.marketwatch.com/marketwatch/topstories/` | 市场数据驱动 |
 | Foreign Policy | `https://foreignpolicy.com/feed/` | 地缘战略深度 |
-| Al Jazeera | `https://www.aljazeera.com/xml/rss/all.xml` | 中东/非西方视角 |
 | Seeking Alpha | `https://seekingalpha.com/market_currents.xml` | 个股机构分析 |
 | Reuters（via Google News） | `https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en` | 综合/财经（Google 代理，<1h延迟） |
-| AP（via Google News） | `https://news.google.com/rss/search?q=site:apnews.com&hl=en-US&gl=US&ceid=US:en` | 综合新闻（Google 代理） |
-| WSJ（via Google News） | `https://news.google.com/rss/search?q=site:wsj.com&hl=en-US&gl=US&ceid=US:en` | 专业财经（Google 代理） |
 | Digitimes | `https://www.digitimes.com/rss/daily.xml` | 台湾/大陆半导体供应链贸易媒体（issue #72） |
+
+**停用（issue #85，`RSS_FEEDS_DISABLED`，URL 保留，挪回 `RSS_FEEDS` 即恢复）**：NYT Business/World/Politics、BBC Business/World、Al Jazeera、AP（Google News）、WSJ（Google News）。2026-09-23 实测这五个源占 RSS 总量 57%，只有约 10% 与持仓/科技/宏观相关；在子串匹配打地缘标签、每桶只留 5 条的情况下，它们把持仓新闻挤出了 prompt。
 
 **Guardian API**（`content.guardianapis.com/search`，非 RSS）：免费 500次/日，JSON 结构化，`GUARDIAN_API_KEY` 控制，fail-open。`fetch_guardian_news()` 拉取 business/world/politics/us-news 板块最新 20 条，合并进 RSS 结果统一排序。
 

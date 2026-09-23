@@ -24,13 +24,6 @@ _RSS_HEADERS = {
 # RSS feeds — verified working on macOS host; unverified feeds are attempted fail-open.
 # DNS/TLS-blocked sources (confirmed): Reuters, AP, WSJ, Guardian.
 RSS_FEEDS = [
-    # NYT — verified
-    ("NYT", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"),
-    ("NYT", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"),
-    ("NYT", "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml"),
-    # BBC — verified
-    ("BBC", "https://feeds.bbci.co.uk/news/business/rss.xml"),
-    ("BBC", "https://feeds.bbci.co.uk/news/world/rss.xml"),
     # FT — verified
     ("FT",  "https://www.ft.com/world?format=rss"),
     # CNBC — fast financial/market news
@@ -39,16 +32,26 @@ RSS_FEEDS = [
     ("MarketWatch", "https://feeds.marketwatch.com/marketwatch/topstories/"),
     # Foreign Policy — geopolitical depth, US foreign policy strategy
     ("ForeignPolicy", "https://foreignpolicy.com/feed/"),
-    # Al Jazeera — Middle East / non-Western geopolitical perspective
-    ("AlJazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
     # Seeking Alpha — individual stock analysis, institutional perspective
     ("SeekingAlpha", "https://seekingalpha.com/market_currents.xml"),
-    # Google News RSS — indirect Reuters/AP/WSJ via Google index (<1h lag)
+    # Google News RSS — indirect Reuters via Google index (<1h lag)
     ("Reuters", "https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en"),
-    ("AP",      "https://news.google.com/rss/search?q=site:apnews.com&hl=en-US&gl=US&ceid=US:en"),
-    ("WSJ",     "https://news.google.com/rss/search?q=site:wsj.com&hl=en-US&gl=US&ceid=US:en"),
     # Digitimes — Taiwan/China semiconductor supply-chain trade press (issue #72)
     ("Digitimes", "https://www.digitimes.com/rss/daily.xml"),
+]
+
+# Not fetched (issue #85). Measured 2026-09-23: 57% of all RSS items, ~10% of them
+# relevant to holdings/tech/macro; the rest crowded holding news out of the prompt.
+# Move an entry back into RSS_FEEDS to restore it.
+RSS_FEEDS_DISABLED = [
+    ("NYT", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"),
+    ("NYT", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"),
+    ("NYT", "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml"),
+    ("BBC", "https://feeds.bbci.co.uk/news/business/rss.xml"),
+    ("BBC", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+    ("AlJazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
+    ("AP",  "https://news.google.com/rss/search?q=site:apnews.com&hl=en-US&gl=US&ceid=US:en"),
+    ("WSJ", "https://news.google.com/rss/search?q=site:wsj.com&hl=en-US&gl=US&ceid=US:en"),
 ]
 
 
