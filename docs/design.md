@@ -2,11 +2,11 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-09-23（issue #87 PR #89 开发中：免费账本切换、代码 Pass 1、Pass 2 新输入和降级；未合并、未部署）
+> **最后更新**：2026-09-23（issue #87 PR #89：免费账本切换、代码 Pass 1、Pass 2 新输入和降级；部署状态以运行环境为准）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
-> **issue #87 PR1，PR #88 已合并**：旧报告流水线旁新增只做免费收集的 Pass 0 影子账本。`scripts/intel_collect.py` 按标的保留完整 Finnhub company-news、按公司名查询的 Google News RSS、现有 7 源 RSS 与 Guardian；拉丁词边界与中文 ASCII 边界实体匹配、标题去重与每来源覆盖/错误记录。Google News 的实际 HTTP 尝试至少间隔 1 秒且与 Finnhub 分池；多日异动时 RSS/Guardian 从所有标的最早起点抓取、再逐标的裁剪；报告与回放共用 `scripts/publication_window.py` 的交易日窗口计算。`scripts/intel_pass0.py` 在旧主流程跳过判断前旁路运行，原子归档 `archives/YYYYMM/*-ledger.json`；条目按上次运行账本的归一化标题标 `seen_before`。回放命令只写本地 JSON/Markdown，RSS 标为 skipped、Guardian 用历史日期窗读取；价格优先取当时 context log 的盘前/日内涨跌，读不到才用日线近似，并从历史日线重建 3/5 日阈值。`entity_alias_cache.json` 忽略追踪。影子模式没有 LLM/Tavily 调用；旧 Pass 1/Tavily/Pass 2/写出没有在 PR1 切换。独立回放 22/24、零 LLM 调用。Google News RSS 频率至少 1 秒/请求，链接不解码，影子期观察稳定性和重复率。权威 Obsidian 文档由合并后验证方同步。
+> **issue #87 PR1，PR #88 已合并（历史阶段）**：PR1 当时在旧报告流水线旁新增了只做免费收集的 Pass 0 影子账本，尚未切换旧 Pass 1/Tavily/Pass 2/写出。`scripts/intel_collect.py` 按标的保留完整 Finnhub company-news、按公司名查询的 Google News RSS、现有 7 源 RSS 与 Guardian；拉丁词边界与中文 ASCII 边界实体匹配、标题去重与每来源覆盖/错误记录。Google News 的实际 HTTP 尝试至少间隔 1 秒且与 Finnhub 分池；多日异动时 RSS/Guardian 从所有标的最早起点抓取、再逐标的裁剪；报告与回放共用 `scripts/publication_window.py` 的交易日窗口计算。PR1 时 `scripts/intel_pass0.py` 在旧主流程跳过判断前旁路运行，原子归档 `archives/YYYYMM/*-ledger.json`；条目按上次运行账本的归一化标题标 `seen_before`。回放命令仍只写本地 JSON/Markdown，RSS 标为 skipped、Guardian 用历史日期窗读取；价格优先取当时 context log 的盘前/日内涨跌，读不到才用日线近似，并从历史日线重建 3/5 日阈值。`entity_alias_cache.json` 忽略追踪。PR1 独立回放 22/24、零 LLM 调用。PR #89 将这套收集器接入主报告路径，并由代码深挖和账本驱动的 Pass 2 接续处理；现行架构见下文第二节及 5.1b、5.2 节。权威 Obsidian 文档由合并后验证方同步。
 
 ---
 
