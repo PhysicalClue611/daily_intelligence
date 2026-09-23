@@ -72,8 +72,8 @@ def test_defaults_when_file_missing():
     _load(None)
     assert llm_config.model("am_calibration") == "google/gemma-4-31b-it"
     assert llm_config.model("am_calibration") == "google/gemma-4-31b-it"
-    assert llm_config.model("report_pass2") == "openai/gpt-5.6-luna"
-    assert llm_config.stage("report_pass2")["reasoning"] == {"effort": "high"}
+    assert llm_config.model("report_pass2") == "openai/gpt-6-luna"
+    assert llm_config.stage("report_pass2")["reasoning"] == {"effort": "xhigh"}
     assert llm_config.model("sas_candidate_extract") == "google/gemma-4-31b-it"
     assert llm_config.model("tg_followup") == "openai/gpt-5.6-luna"
     assert llm_config.stage("tg_followup")["reasoning"] == {"effort": "high"}
@@ -89,6 +89,9 @@ def test_reasoning_field_override_and_validation():
     records = _load({"stages": {"tg_followup": {"reasoning": {"effort": "extreme"}}}})
     assert llm_config.stage("tg_followup")["reasoning"] == {"effort": "high"}  # reverted
     assert any("tg_followup.reasoning" in m for m in _levels(records, "WARNING"))
+    records = _load({"stages": {"report_pass2": {"reasoning": {"effort": "xhigh"}}}})
+    assert llm_config.stage("report_pass2")["reasoning"] == {"effort": "xhigh"}
+    assert not any("report_pass2.reasoning" in m for m in _levels(records, "WARNING"))
 
 
 def test_valid_override_applies_and_is_logged():
@@ -330,7 +333,7 @@ def test_llm_client_reads_stage_config():
     assert out.get("ok") is True
     assert captured["model"] == "x-ai/grok-4.5"
     assert "thinking" not in captured           # report_pass2 no longer uses DeepSeek's thinking
-    assert captured["reasoning"] == {"effort": "high"}
+    assert captured["reasoning"] == {"effort": "xhigh"}
     assert captured["max_tokens"] == 16000
 
 
@@ -373,6 +376,7 @@ def test_call_llm_parse_json_false_empty_content_falls_back():
     importlib.reload(llm_client)
     _load(None)
     calls = []
+    fallback_payloads = []
 
     class _Resp:
         def __init__(self, content):
@@ -387,9 +391,10 @@ def test_call_llm_parse_json_false_empty_content_falls_back():
 
     def fake_post(url, headers=None, json=None, timeout=None):
         calls.append(json["model"])
-        # Primary (report_pass2's gpt-5.6-luna) always returns empty;
+        # Primary (report_pass2's gpt-6-luna) always returns empty;
         # the flex-fallback request (google/gemini-3.5-flash) returns text.
         if json["model"] == llm_config.stage("report_pass2")["fallback_model"]:
+            fallback_payloads.append(json)
             return _Resp("Fallback report body.")
         return _Resp("")
 
@@ -402,7 +407,8 @@ def test_call_llm_parse_json_false_empty_content_falls_back():
         llm_client.httpx.post = orig
     assert out["text"] == "Fallback report body."
     assert out["_llm_meta"]["fallback"] is True
-    assert calls.count("openai/gpt-5.6-luna") == 2  # primary + 1 retry, both empty
+    assert calls.count("openai/gpt-6-luna") == 2  # primary + 1 retry, both empty
+    assert fallback_payloads[0]["temperature"] == 0.2
 
 
 def test_call_llm_parse_json_false_never_promotes_partial_cot_on_length():
@@ -454,7 +460,7 @@ def test_call_llm_parse_json_false_never_promotes_partial_cot_on_length():
     assert out["text"] == "Fallback report body."
     assert "partial chain of thought" not in out["text"]
     assert out["_llm_meta"]["fallback"] is True
-    assert calls.count("openai/gpt-5.6-luna") == 2  # primary + 1 retry, neither promoted CoT
+    assert calls.count("openai/gpt-6-luna") == 2  # primary + 1 retry, neither promoted CoT
 
 
 def test_call_llm_parse_json_false_accepts_partial_content_on_length():
@@ -517,10 +523,11 @@ def test_call_llm_sends_reasoning_param_for_report_pass2_parse_json_false():
         llm_client.call_llm("p", system_prompt="s", stage="report_pass2", parse_json=False)
     finally:
         llm_client.httpx.post = orig
-    assert captured["model"] == "openai/gpt-5.6-luna"
-    assert captured["reasoning"] == {"effort": "high"}
+    assert captured["model"] == "openai/gpt-6-luna"
+    assert captured["reasoning"] == {"effort": "xhigh"}
     assert "thinking" not in captured
     assert captured["provider"] == {"order": ["OpenAI"], "allow_fallbacks": False}
+    assert "temperature" not in captured
 
 
 def test_call_llm_parse_json_false_unwraps_legacy_json_report_md():
