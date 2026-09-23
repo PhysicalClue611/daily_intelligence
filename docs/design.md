@@ -6,7 +6,7 @@
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
-> **开发中，issue #87 PR1，尚未合并**：旧报告流水线旁新增只做免费收集的 Pass 0 影子账本。`scripts/intel_collect.py` 按标的保留完整 Finnhub company-news、按公司名查询的 Google News RSS、现有 7 源 RSS 与 Guardian；拉丁词边界与中文 ASCII 边界实体匹配、标题去重与每来源覆盖/错误记录。Google News 的实际 HTTP 尝试至少间隔 1 秒且与 Finnhub 分池；多日异动时 RSS/Guardian 从所有标的最早起点抓取、再逐标的裁剪；报告与回放共用 `scripts/publication_window.py` 的交易日窗口计算。`scripts/intel_pass0.py` 在旧主流程跳过判断前旁路运行，原子归档 `archives/YYYYMM/*-ledger.json`；条目按上次运行账本的归一化标题标 `seen_before`。回放命令只写本地 JSON/Markdown，RSS 标为 skipped、Guardian 用历史日期窗读取；价格优先取当时 context log 的盘前/日内涨跌，读不到才用日线近似，并从历史日线重建 3/5 日阈值。`entity_alias_cache.json` 忽略追踪。影子模式没有 LLM/Tavily 调用；旧 Pass 1/Tavily/Pass 2/写出没有在 PR1 切换。验收按 issue #87 Revision 的 24 条评估集逐条核对免费收集召回 ≥21/24。Google News RSS 频率至少 1 秒/请求，链接不解码，影子期观察稳定性和重复率。权威 Obsidian 文档由合并后验证方同步。
+> **issue #87 PR1，PR #88 已合并**：旧报告流水线旁新增只做免费收集的 Pass 0 影子账本。`scripts/intel_collect.py` 按标的保留完整 Finnhub company-news、按公司名查询的 Google News RSS、现有 7 源 RSS 与 Guardian；拉丁词边界与中文 ASCII 边界实体匹配、标题去重与每来源覆盖/错误记录。Google News 的实际 HTTP 尝试至少间隔 1 秒且与 Finnhub 分池；多日异动时 RSS/Guardian 从所有标的最早起点抓取、再逐标的裁剪；报告与回放共用 `scripts/publication_window.py` 的交易日窗口计算。`scripts/intel_pass0.py` 在旧主流程跳过判断前旁路运行，原子归档 `archives/YYYYMM/*-ledger.json`；条目按上次运行账本的归一化标题标 `seen_before`。回放命令只写本地 JSON/Markdown，RSS 标为 skipped、Guardian 用历史日期窗读取；价格优先取当时 context log 的盘前/日内涨跌，读不到才用日线近似，并从历史日线重建 3/5 日阈值。`entity_alias_cache.json` 忽略追踪。影子模式没有 LLM/Tavily 调用；旧 Pass 1/Tavily/Pass 2/写出没有在 PR1 切换。独立回放 22/24、零 LLM 调用。Google News RSS 频率至少 1 秒/请求，链接不解码，影子期观察稳定性和重复率。权威 Obsidian 文档由合并后验证方同步。
 
 ---
 
@@ -447,7 +447,7 @@ if not anomalies and not triggered_geo_topics and not unexplained_jobs:
 - max_results=12（原 8）
 - Tavily 断连自动 fallback SerpApi；两者均耗尽则跳过搜索继续生成基础报告
 
-**Pass 2（有搜索结果时）**：使用 `openai/gpt-5.6-luna`（非pro，issue #60，此前依次是 `deepseek-v4-flash` → `deepseek-v4-pro`）合并 Tavily 结果生成最终报告，`report_md` 直接输出裸 markdown（不再是 JSON 字段，见第八节）。
+**Pass 2（有搜索结果时）**：使用 `openai/gpt-5.6-luna`（非pro，issue #60，此前依次是 `deepseek-v4-flash` → `deepseek-v4-pro`）合并 Tavily 结果生成最终报告，`report_md` 直接输出裸 markdown（不再是 JSON 字段，见第八节）。 PR2（issue #87，开发中）改造 prompt：仅写新增事实，不为每个异动强写仓位结论，宏观/地缘与仓位章节仅在有实质内容时出现；不写无证据的情绪/资金流归因或独立域名数量。近 5 个 NYSE 交易日的月度报告按当日异动及多日阈值标的提取实体段落，跨月、同档首份、排除当前档位，每标的最多 600 字符；无匹配则不注入。FRED 整体档位、持仓 15% 跨越与 52 周新高/新低按本地 `archives/pass2_context_state.json` 与上次成功写出的 Pass 2 比较，只注入变化。SAS 候选提取仍用完整持仓信号。PR2 不从 Pass 0 影子账本读取报告内容，权威 Obsidian 文档由合并后验证方同步。
 
 **错误韧性**：两个 pass 的 LLM 调用（`call_llm()`）在遇到网络/5xx 错误时自动重试 2 次（指数退避 2s/4s），4xx 和 JSON 解析错误不重试。`telegram_commands.py` 中 DeepSeek 调用通过 `_deepseek_post()` 直连，Claude/Sonar 调用通过 `_openrouter_post()` 走 OR，均使用相同重试策略（网络/5xx 自动重试 2 次）。
 

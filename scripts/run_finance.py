@@ -87,7 +87,10 @@ from report_writers import (
     _mempalace_add_daily_drawer, write_report,
     send_telegram_report, send_telegram_alert,
     _fmt_llm_meta, finance_footer,
+    REPORTS_DIR,
 )
+from recent_coverage import build_recent_coverage_section
+from pass2_context import current_state, changed_background, read_state, write_state
 from calibration import (
     write_sas_candidate_log, _load_recent_calibration_notes, evaluate_am_calibration,
 )
@@ -896,9 +899,8 @@ _framework_cache: str = ""
 def _load_framework() -> str:
     """Extract operative rules from Investment Operating Manual v1.0.md (issue #30).
 
-    Pulls three sections verbatim from the canonical Obsidian manual so edits there
-    propagate to Pass 2 without code changes: Section 2 (能力边界, used for the
-    capability-boundary tagging rule), Section 6 (Portfolio Construction, incl. the
+    Pulls two sections verbatim from the canonical Obsidian manual so edits there
+    propagate to Pass 2 without code changes: Section 6 (Portfolio Construction, incl. the
     认知提升/减仓条件 checklists), Section 7.4 (Expectation Gap internal signal list).
     Module-level cache. Replaces the prior 金融资产信息.md excerpt.
     """
@@ -910,9 +912,6 @@ def _load_framework() -> str:
         return ""
     text = re.sub(r"^---.*?---\s*", "", manual_file.read_text(encoding="utf-8"), flags=re.DOTALL)
     parts = []
-    m = re.search(r"2\. 能力边界.*?\n\n(.*?)(?=\n\s*3\. Alpha 的来源)", text, re.DOTALL)
-    if m:
-        parts.append("【能力边界：以下变量属于能力圈外，不构成操作依据】\n" + m.group(1).strip()[:500])
     m2 = re.search(r"6\. Portfolio Construction\n\n(.*?)(?=\n\s*7\. Strategic Alpha Score)", text, re.DOTALL)
     if m2:
         parts.append("【Portfolio Construction：认知提升标准 / 减仓条件】\n" + m2.group(1).strip()[:1600])
@@ -1011,7 +1010,7 @@ def _get_portfolio_weights() -> dict[str, float]:
         return {}
 
 
-def _compute_holding_signals() -> str:
+def _compute_holding_signals(stats: dict | None = None) -> str:
     """Issue #33: pure-computation signals for Manual 7.4 (股价相对位置) and the
     position-size-overload reduce-trigger in Section 6 (position share > 15%) —
     code-computed ground truth, not LLM estimation from prose.
@@ -1020,7 +1019,8 @@ def _compute_holding_signals() -> str:
     weights = _get_portfolio_weights()
     if not core_tickers and not weights:
         return ""
-    stats = fetch_52week_stats(core_tickers) if core_tickers else {}
+    if stats is None:
+        stats = fetch_52week_stats(core_tickers) if core_tickers else {}
     lines = ["【持仓计算信号：以下为代码直接计算的既定事实，非LLM估算，仓位是否结构性超载（占比是否超过15%）请直接读取此处】"]
     all_tickers = core_tickers or list(weights.keys())
     for ticker in all_tickers:
@@ -1039,7 +1039,8 @@ def _compute_holding_signals() -> str:
     return "\n".join(lines)
 
 
-def _load_personal_context() -> str:
+def _load_personal_context(background_signals: str | None = None,
+                           holding_stats: dict | None = None) -> str:
     """Combine portfolio snapshot + investment framework for Pass 2 injection (Layer B)."""
     parts = [
         "【重要】实际持仓以下方「IB美股持仓」快照为唯一依据。"
@@ -1050,7 +1051,12 @@ def _load_personal_context() -> str:
     portfolio = _get_portfolio_snapshot()
     if portfolio:
         parts.append(portfolio)
-    signals = _compute_holding_signals()
+    if background_signals is not None:
+        signals = background_signals
+    elif holding_stats is not None:
+        signals = _compute_holding_signals(holding_stats)
+    else:
+        signals = _compute_holding_signals()
     if signals:
         parts.append(signals)
     fw = _load_framework()
@@ -1071,7 +1077,7 @@ SYSTEM_PROMPT = """你是一名服务于个人投资者的金融情报分析师�
 # Pass 2 system prompt (Layer A): platform-generic analyst persona, Portfonia-reusable
 _LAYER_A_PATH = OBSIDIAN / "Hermes/Daily Intelligence/Layer_A_Prompt.md"
 _LAYER_A_FALLBACK = """你是一名专业财经情报分析师，服务于秉持价值投资、长期持仓、低交易频率理念的投资者。
-分析原则：区分结构性催化剂与情绪性波动；结论必须可操作；明确区分事实与推测；不重复新闻原文。
+分析原则：区分结构性催化剂与情绪性波动；只在出现可操作事实时给结论，没有就不写，不为凑结论而设价格触发线；明确区分事实与推测；不重复新闻原文。
 输出语言：中文。所有时间推理以 America/New_York 为基准。"""
 
 
@@ -1083,13 +1089,20 @@ def _load_layer_a() -> str:
             # Strip YAML frontmatter (--- ... ---)
             text = re.sub(r"^---.*?---\s*", "", raw, flags=re.DOTALL).strip()
             if text:
-                return text
+                # The private Layer A still carries the old instruction. Replace
+                # that one sentence at load time; leave the user's other rules intact.
+                return text.replace(
+                    '结论必须可操作：给出具体价格区间、触发条件或观察信号；不给模糊的"持续关注"',
+                    '只在出现可操作事实时给结论；没有就不写，不为凑结论而设价格触发线',
+                )
     except Exception as e:
         logger.warning(f"Layer A prompt load failed: {e}")
     return _LAYER_A_FALLBACK
 
 
-SYSTEM_PROMPT_P2 = _load_layer_a()
+SYSTEM_PROMPT_P2 = _load_layer_a() + (
+    "\n利率和宏观周期、普通财报差异、资金流与风格轮动、短期技术择时、情绪波动属于个人投资者的能力边界，不单独构成操作依据。"
+)
 
 # AM-only instruction (issue #10): ask for a short list of falsifiable claims
 # that the PM run can mechanically check against actual EOD data that evening.
@@ -1161,70 +1174,23 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 ## 过去24小时新闻（RSS）
 {news_text}
 
-{finnhub_news_section}{brave_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}{calibration_notes}
----
-
-== 持仓与框架 ==
+{finnhub_news_section}{brave_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}{calibration_notes}{recent_coverage_section}
+## 实际持仓与框架
 {personal_context}
 
-== 分析要求 ==
-必须覆盖（以下每一条都独立成立，不依赖其他条目的编号，直接按内容判断即可）：
+先写今天的新事实及其来源、时间和对实际持仓或观察标的的具体含义。价格涨跌本身不证明驱动原因；资金流、情绪或市场预期若没有直接证据，不得补写成原因。单一来源、时间不明或过时材料应明确降级，不得把孤证当确定事实；信源元数据仅用于判断，不在正文报告独立域名数量。观察标的不得写成实际持仓。
 
-**价格异动含义**：今日价格异动（[!]标记标的）的驱动力，以及对该持仓逻辑的具体含义
+对照“近 5 个交易日已报道”：同一标的只写相对旧报道新增的事实。没有新事实时，省略该事件，或只用一句“延续 MM-DD 已报道的<事件>，今日无新进展”。不要重复背景、已作出的仓位结论，也不要为每个异动附一句“未构成加减仓依据”。
 
-**地缘政治传导**：地缘政治动态对持仓的潜在传导路径（有则写，无则省略）
-
-**宏观信号与仓位暴露**：宏观信号（利率、商品、汇率）与仓位暴露的关系
-
-**信源置信度处理**：[Tavily Extract] 每条来源前标注了 [信源类型 | 发布时间 | 交叉印证] 标签。
-   写入具体断言（尤其含日期、协议签署、人事变动等强论断）前先看该来源标签：
-   - 标"单一信源"或"视频/聚合页疑似caption堆叠"或"发布时间：未知"的，正文必须用
-     "未证实"/"单一信源，待核实"等措辞明确降级，不得以确定语气写成既成事实
-   - 标"约N天前"且 N 较大的，需提示"可能已被后续事件覆盖"
-   - 有"N个独立域名佐证"（N≥1）的可正常按事实陈述
-   快变的宏观/市场行情下，传统媒体报道常滞后于现状，未标注可靠时间戳的信息尤其容易过时，
-   宁可标注不确定，也不要把孤证当结论
-
-**驱动因素归类（能力圈内外）**：对每个异动/驱动因素，先判断它是否属于以下五类——利率与宏观周期、
-   财报超预期或不及预期、资金流向与风格轮动、技术分析与短期timing、情绪驱动的价格波动（这五类是
-   下方"持仓与框架"中列出的能力圈外变量，个人投资者对其既无信息优势也无影响力）。属于这五类的，
-   只客观陈述事实，并显式加注"（不构成操作依据）"，不得据此给出隐含的加减仓暗示；不属于这五类的
-   （如战略执行进展、竞争格局变化、产品/商业化里程碑），可以讨论其对持仓逻辑的含义，但这类讨论同样
-   不直接构成操作依据——是否真正触发加仓或减仓，必须满足下面"持仓异动核对"里列出的具体事实标准，
-   不能仅因为"值得讨论"就单独给出仓位建议
-
-**流动性水位分级响应**：若上方注入了"流动性水位快照"（FRED），只作为背景参考，不单独触发操作建议——
-   它是对回撤应对框架的补充信号，不是替代。整体标记【正常】：不提及或一笔带过。标记【观察】：可以
-   提示"流动性边际收紧，保持现有仓位，暂不启动避险交易"，不建议减仓。标记【警戒】：可以提示"优先
-   评估高贝塔个股暴露"，但核心仓位（QQQM/VOO）仍按回撤框架的价格/回撤幅度决定操作，不得因这一项
-   信号单独建议清仓或大幅减仓
-
-**持仓异动核对（唯一允许给出加减仓建议的依据来源）**：涉及"IB美股持仓"快照中实际持有标的（非仅
-   观察用的watchlist标的）时，加减仓建议只能建立在以下四类具体事实标准之上——但不要把它们做成
-   独立的逐条核对清单，而是作为判断标准自然融入上面对该标的驱动力/战略含义的论述：命中了，就在
-   讨论这只标的时顺带说清命中的是哪类事实、具体新证据是什么，不必复述标准原文或标注"命中第几条"；
-   一条都不命中，就在该标的论述收尾处用一句话说明当前证据不构成加/减仓依据，不必逐条否定排除。
-   不得给出与下列四类标准无关的仓位建议：
-   - 认知提升（加仓依据，需满足其一，且必须基于新出现的可验证事实而非价格变动本身）：企业解锁了
-     一个之前不确定的战略节点（如产品从内测进入商业化、新市场首次产生可计量收入）；竞争格局出现了
-     有利于企业的结构性变化（如主要竞争对手退出、监管为企业构建护城河）；管理层兑现了此前市场明确
-     怀疑的承诺（如量产节点、利润率或份额目标在财报中被证实）
-   - Alpha大幅兑现（减仓依据）：预期差较建仓时明显收窄（评分下降超过3分），且未来Alpha潜力评分
-     转弱（低于5分），且找不到能让预期差重新扩大的具体催化剂
-   - 出现更高赔率机会（减仓依据）：识别到另一候选标的，其未来Alpha潜力评分比当前持仓高2分以上，
-     且两者战略空间量级相当（同量级TAM）
-   - 仓位结构性超载（减仓依据）：并非主动加仓，而是价格被动上涨导致单一标的占组合比例超过15%——
-     这个占比数字直接读取下方【持仓计算信号】里代码算好的值，不要自己从持仓文本估算
-   上面"驱动因素归类"里讨论的战略含义和这里的事实核对是同一段论述的两个维度，不是先后两步——
-   写成"先归类背景、再单独核对"的两段式结构本身就是应该避免的机械化
-
+输出骨架（没有实质内容的小节直接省略）：
+# [Daily_Intel] {date} 开盘前简报
+## 要点（可选；只放最重要的新事实）
+## 持仓与观察标的
+## 宏观与地缘（仅有新的传导事实时）
+## 仓位（仅当认知提升、Alpha 大幅兑现、更高赔率机会或仓位跨过 15% 等事实真正命中时）
 {verifiable_signals_rule}
 
-可选覆盖：其他值得关注的市场要闻（无实质内容可省略）
-
-格式要求：价格数据已在上方表格，正文自由展开，有话则长，无话则短，省略废话。直接输出报告正文
-（以 "# [Daily_Intel] {date} 开盘前简报" 开头的 Markdown），不要用 JSON 包裹，不要用代码围栏
-（```）包裹，不要在正文前后附加任何其他文字。
+仓位建议须指出对应事实和证据；未命中则不写“仓位”小节。FRED 等背景信号不能单独触发交易建议。报告应有话则长，无话则短；不要套话、逐条核对清单或凭空设价格触发线。直接输出 Markdown 正文，不要 JSON、代码围栏或附言。
 """
 
 # SAS候选证据提取：独立于 Pass 2 report_md 的第二次调用（issue #60）。原先与 report_md 共享
@@ -2086,8 +2052,40 @@ def _main_body():
     # Pass 2 uses SYSTEM_PROMPT_P2 (Layer A) + personal context (Layer B) for portfolio-aware analysis.
     report_md = result.get("report_md", "")
     llm_meta_p2 = {}
+    pass2_state_to_save = None
     if tavily_section:
-        personal_context = _load_personal_context()
+        # PR2 reads only the existing monthly reports, never the shadow ledger.
+        # Include every anomaly and every threshold mover, not only the jobs
+        # admitted under the Tavily search cap.
+        coverage_tickers = list(dict.fromkeys(
+            [row.ticker for row in anomalies] + [
+                row.ticker for row in price_rows
+                if any(pct is not None and abs(pct) >= threshold
+                       for pct, threshold in zip(multiday_moves.get(row.ticker, (None, None)), (15, 20)))
+            ]
+        ))
+        try:
+            recent_coverage_section = build_recent_coverage_section(
+                REPORTS_DIR, today_et, run_slot, coverage_tickers, wl["entity_aliases"]
+            )
+        except (OSError, ValueError) as e:
+            logger.warning(f"Recent report coverage unavailable: {e}")
+            recent_coverage_section = ""
+
+        state_path = _PROJ_DIR / "archives" / "pass2_context_state.json"
+        core_tickers = _get_core_holding_tickers()
+        stats = fetch_52week_stats(core_tickers) if core_tickers else {}
+        previous_context_state = read_state(state_path)
+        context_state = current_state(
+            liquidity_section, _get_portfolio_weights(), stats, previous_context_state
+        )
+        changed_liquidity, holding_background = changed_background(
+            liquidity_section, context_state, previous_context_state
+        )
+        # The full snapshot remains available to the independent SAS extractor.
+        sas_personal_context = _load_personal_context(holding_stats=stats)
+        personal_context = _load_personal_context(background_signals=holding_background)
+        p2_social_section = polymarket_section + adanos_section + reddit_section + changed_liquidity
         prompt2 = USER_PROMPT_TEMPLATE_P2.format(
             date=today_et,
             now_str=now_et.strftime("%Y-%m-%d %H:%M %Z"),
@@ -2100,10 +2098,11 @@ def _main_body():
             finnhub_news_section=finnhub_news_section,
             brave_news_section=brave_news_section,
             sonar_macro_section=sonar_macro_section,
-            social_sentiment_section=social_sentiment_section,
+            social_sentiment_section=p2_social_section,
             tavily_section=tavily_section,
             kb_section=kb_section,
             calibration_notes=calibration_notes,
+            recent_coverage_section=recent_coverage_section,
             personal_context=personal_context,
             verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P2 if run_slot == "am" else "",
         )
@@ -2115,6 +2114,8 @@ def _main_body():
                             parse_json=False)
         llm_meta_p2 = result2.get("_llm_meta", {})
         report_md = result2.get("text") or report_md
+        if result2.get("text"):
+            pass2_state_to_save = (state_path, context_state)
 
         # SAS candidate extraction (issue #32) is now a fully independent call
         # (issue #60), not sharing report_md's JSON envelope — its own model/
@@ -2138,7 +2139,7 @@ def _main_body():
                 sonar_macro_section=sonar_macro_section,
                 social_sentiment_section=social_sentiment_section,
                 tavily_section=tavily_section,
-                personal_context=personal_context,
+                personal_context=sas_personal_context,
             )
             sas_result = call_llm(
                 sas_prompt, stage="sas_candidate_extract",
@@ -2173,6 +2174,11 @@ def _main_body():
 
     # 11. Write to Obsidian monthly file
     write_report(today_et, slot_label, report_md, budget)
+    if pass2_state_to_save:
+        try:
+            write_state(*pass2_state_to_save)
+        except OSError as e:
+            logger.warning(f"Pass 2 background state not saved: {e}")
     _mempalace_add_daily_drawer(today_et, run_slot, report_md)
 
     # 11b. Write context log to Obsidian (price table + triggered news + Sonar + queries)

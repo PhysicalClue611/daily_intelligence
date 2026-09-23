@@ -849,6 +849,9 @@ def _compute_52week_from_closes(closes) -> dict | None:
         return {
             "range_percentile": round((current - lo) / (hi - lo) * 100, 1),
             "pct_from_high": round((current - hi) / hi * 100, 1),
+            "latest_close": current,
+            "high_close": hi,
+            "low_close": lo,
         }
     except Exception:
         return None
