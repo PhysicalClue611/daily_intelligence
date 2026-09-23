@@ -43,6 +43,7 @@ import json
 import logging
 import math
 import re
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -53,8 +54,7 @@ from fetch_prices import (
     fetch_prices, format_price_table, get_anomalies, fetch_52week_stats,
     multiday_return_pct,
 )
-from fetch_news import fetch_rss, fetch_guardian_news, format_news_for_prompt
-from publication_window import _session_anchor, _unexplained_publication_window
+from publication_window import _unexplained_publication_window
 from memory_context_finance import get_finance_context
 
 from finance_email import send_report
@@ -72,25 +72,30 @@ from budget_trackers import (
     load_serpapi_budget, save_serpapi_budget, serpapi_remaining,
     load_adanos_budget, save_adanos_budget,
     load_apify_budget, save_apify_budget,
-    load_brave_budget,
     TAVILY_DAILY_LIMIT, SERPAPI_MONTHLY_LIMIT, ADANOS_MONTHLY_LIMIT,
-    APIFY_MONTHLY_LIMIT, BRAVE_MONTHLY_LIMIT,
+    APIFY_MONTHLY_LIMIT,
 )
 from intel_sources import (
     _sonar_macro_brief, _polymarket_brief, _adanos_x_sentiment,
     _reddit_sentiment_brief, fetch_liquidity_snapshot,
-    fetch_finnhub_news, fetch_brave_news,
 )
 from report_writers import (
-    write_context_log, write_extract_archive,
-    _monthly_dedup, get_last_report_date,
+    write_context_log,
+    _monthly_dedup,
     _mempalace_add_daily_drawer, write_report,
     send_telegram_report, send_telegram_alert,
     _fmt_llm_meta, finance_footer,
     REPORTS_DIR,
 )
 from recent_coverage import build_recent_coverage_section
-from pass2_context import current_state, changed_background, read_state, write_state
+from pass2_context import current_state, changed_background, read_previous_ledger_state
+from intel_pass0 import build_ledger
+from intel_collect import archive_ledger
+from intel_deepen import deepen_ledger
+from intel_render import (
+    emergency_ledger, should_report, render_ledger_context,
+    render_fallback_report, filter_social_lines,
+)
 from calibration import (
     write_sas_candidate_log, _load_recent_calibration_notes, evaluate_am_calibration,
 )
@@ -106,12 +111,7 @@ from calibration import (
 # need them) removes the assumption entirely.
 from llm_client import call_llm
 import llm_config
-from scoring_utils import (
-    _title_tokens_for_dedup, _title_keyword_hits, _token_jaccard,
-    _TITLE_DEDUP_THRESHOLD, _TITLE_DEDUP_THRESHOLD_NO_KEYWORD,
-    _TITLE_DEDUP_STRICT_NO_DATE_THRESHOLD, _TITLE_DEDUP_WINDOW_HOURS,
-    _DEDUP_STOPWORDS, _source_confidence_tags, build_keyword_set,
-)
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,9 +138,7 @@ TAVILY_API_KEY      = os.getenv("TAVILY_API_KEY", "")
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 OR_BASE_URL         = "https://openrouter.ai/api/v1/chat/completions"
 OR_ATTRIBUTION_HEADERS = {"HTTP-Referer": "https://github.com/PhysicalClue611/daily_intelligence", "X-OpenRouter-Title": "DailyIntel"}
-# Model/provider selection per pipeline stage now lives in llm_config.py
-# (runtime-overridable via llm_config.json, issue #11) — see llm_config.DEFAULTS
-# for stage names: report_pass1 / report_pass2 / semantic_filter / macro_brief.
+# Model/provider selection per pipeline stage lives in llm_config.py.
 EXA_API_KEY         = os.getenv("EXA_API_KEY", "")
 EXA_BASE_URL        = "https://api.exa.ai/chat/completions"
 
@@ -157,12 +155,6 @@ ADANOS_API_KEY         = os.getenv("ADANOS_API_KEY", "")
 # APIFY_MONTHLY_LIMIT runs/month stays far under the $5 one-time free credit
 # (60 runs × ~4 tickers ≈ $0.25/mo at these rates).
 APIFY_API_TOKEN      = os.getenv("APIFY_API_TOKEN", "")
-
-# Brave News API (issue #14): independent Western search engine, not a Google
-# proxy like Serper/SerpApi. No longer free as of 2026 — $5/mo prepaid credit
-# then metered billing on file, so the monthly cap here is a hard stop, not a
-# soft warning, to avoid unattended overage charges.
-BRAVE_API_KEY       = os.getenv("BRAVE_API_KEY", "")
 
 ET = ZoneInfo("America/New_York")
 
@@ -265,19 +257,22 @@ def is_nyse_trading_day() -> bool:
         return datetime.now().weekday() < 5  # Mon–Fri
 
 
-def serpapi_search(query: str, budget: dict) -> list[dict]:
+def serpapi_search(query: str, budget: dict,
+                   start_date: str | None = None, end_date: str | None = None) -> list[dict]:
     if not SERPAPI_API_KEY:
         return []
     if serpapi_remaining(budget) <= 0:
         logger.warning("SerpApi monthly budget exhausted")
         return []
     try:
-        resp = httpx.get(
+        params = {"q": query, "api_key": SERPAPI_API_KEY, "num": 5, "engine": "google"}
+        if start_date and end_date:
+            params["tbs"] = f"cdr:1,cd_min:{start_date},cd_max:{end_date}"
+        resp = _request_with_retry(httpx.get,
             "https://serpapi.com/search.json",
-            params={"q": query, "api_key": SERPAPI_API_KEY, "num": 5, "engine": "google"},
+            params=params,
             timeout=15,
         )
-        resp.raise_for_status()
         results = resp.json().get("organic_results", [])[:5]
         budget["used"] += 1
         save_serpapi_budget(budget)
@@ -289,6 +284,19 @@ def serpapi_search(query: str, budget: dict) -> list[dict]:
 
 
 # ── Tavily search ────────────────────────────────────────────────────────────
+
+def _request_with_retry(method, url: str, **kwargs):
+    """Retry transient transport, 429, and 5xx failures before budget accounting."""
+    for attempt in range(3):
+        try:
+            response = method(url, **kwargs)
+            response.raise_for_status()
+            return response
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            transient = not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code in (429, 500, 502, 503, 504)
+            if not transient or attempt == 2:
+                raise
+            time.sleep(0.5 * (attempt + 1))
 
 def tavily_search(query: str, budget: dict, days: int = 1,
                   search_depth: str = "basic", max_results: int = 12,
@@ -319,8 +327,7 @@ def tavily_search(query: str, budget: dict, days: int = 1,
         payload["days"] = days
 
     try:
-        resp = httpx.post("https://api.tavily.com/search", json=payload, timeout=30)
-        resp.raise_for_status()
+        resp = _request_with_retry(httpx.post, "https://api.tavily.com/search", json=payload, timeout=30)
         results = resp.json().get("results", [])
         budget["used"] += credits
         save_budget(budget)
@@ -349,7 +356,7 @@ def tavily_extract(urls: list[str], query: str, budget: dict,
                        f"({n} URLs needs {extract_cost}cr, have {budget_remaining(budget)}cr)")
         return []
     try:
-        resp = httpx.post(
+        resp = _request_with_retry(httpx.post,
             "https://api.tavily.com/extract",
             json={
                 "api_key": TAVILY_API_KEY,
@@ -359,7 +366,6 @@ def tavily_extract(urls: list[str], query: str, budget: dict,
             },
             timeout=45,
         )
-        resp.raise_for_status()
         results = resp.json().get("results", [])
         budget["used"] += extract_cost
         save_budget(budget)
@@ -369,526 +375,6 @@ def tavily_extract(urls: list[str], query: str, budget: dict,
     except Exception as e:
         logger.warning(f"Tavily extract failed (non-fatal): {e}")
         return []
-
-
-# Trusted financial/news domains for scoring bonus
-_TRUSTED_DOMAINS = [
-    "reuters.com", "bloomberg.com", "ft.com", "wsj.com",
-    "apnews.com", "cnbc.com", "marketwatch.com", "politico.com",
-    "barrons.com", "seekingalpha.com", "axios.com", "thestreet.com",
-]
-
-# Video/aggregator path patterns (issue #19 direction 4): these pages are prone
-# to caption-stacking with no per-caption timestamp (see _detect_low_structure),
-# so a small scoring penalty lets the plain-article version of the same story
-# naturally outrank the video/gallery version instead of needing a hard exclude.
-_VIDEO_PATH_RE = re.compile(r"/(?:video|watch|gallery|live-blog)/", re.IGNORECASE)
-
-
-def _drop_stale_dated_results(
-    results: list[dict],
-    now: datetime,
-    max_age_days: int = 7,
-) -> list[dict]:
-    """Drop dated hits older than max_age_days relative to `now`.
-
-    Applied to anomaly-attribution and unexplained multi-day queries
-    (issues #72 and #82). Undated results pass through. Age is measured
-    against the report clock, not wall clock.
-    """
-    kept = []
-    dropped = 0
-    for r in results:
-        pub = r.get("published_date", "")
-        if not pub:
-            kept.append(r)
-            continue
-        try:
-            from dateutil import parser as _dp
-            pub_dt = _dp.parse(pub).astimezone(ET)
-        except Exception:
-            kept.append(r)
-            continue
-        if (now - pub_dt).days > max_age_days:
-            dropped += 1
-            continue
-        kept.append(r)
-    if dropped:
-        logger.info(f"anomaly fence: dropped {dropped} stale (>{max_age_days}d) result(s)")
-    return kept
-
-
-# Issue #82. Open-discovery hits still compete in score_and_filter.
-# Anomaly (max 3) and unexplained-move (max 2) tickers each keep one Extract
-# URL chosen inside their own result subset. Tavily Extract accepts up to 20
-# URLs per request; this code still sends at most 10 per call (2 credits).
-# A 15-URL open pool therefore takes a second open batch. Reserved URLs go
-# out first so a short budget still extracts the must-answer tickers.
-OPEN_POOL_PRESCREEN_TOP_N = 25
-OPEN_POOL_SEMANTIC_TOP_N = 15
-
-
-def _source_quality_adjustment(
-    url: str,
-    published_date: str,
-    now: datetime,
-) -> tuple[float, datetime | None]:
-    """domain_bonus + recency_bonus + video_penalty. No keyword term."""
-    domain = url.split("/")[2] if "//" in url else ""
-    domain_bonus = 0.15 if any(d in domain for d in _TRUSTED_DOMAINS) else 0.0
-    video_penalty = -0.08 if url and _VIDEO_PATH_RE.search(url) else 0.0
-    recency_bonus = 0.0
-    pub_dt = None
-    if published_date:
-        try:
-            from dateutil import parser as _dp
-            pub_dt = _dp.parse(published_date).astimezone(ET)
-            age_h = (now - pub_dt).total_seconds() / 3600
-            recency_bonus = 0.10 if age_h <= 24 else (0.05 if age_h <= 72 else 0.0)
-        except Exception:
-            pass
-    return domain_bonus + recency_bonus + video_penalty, pub_dt
-
-
-def _reserved_candidate_score(result: dict, now: datetime) -> float:
-    url = result.get("url") or ""
-    adjustment, _pub_dt = _source_quality_adjustment(
-        url, result.get("published_date") or "", now,
-    )
-    return float(result.get("score") or 0) + adjustment
-
-
-def _select_reserved_results(
-    raw_results: list[dict],
-    must_answer_tickers: list[str],
-    now: datetime | None = None,
-) -> dict[str, dict]:
-    """One best hit per must-answer ticker, scored only inside that ticker.
-
-    Relevance is already decided by the dedicated query. Keyword bonus is
-    not applied. An empty subset reserves nothing.
-    """
-    if now is None:
-        now = datetime.now(ET)
-    reserved: dict[str, dict] = {}
-    for ticker in must_answer_tickers:
-        if not ticker or ticker in reserved:
-            continue
-        subset = [
-            r for r in raw_results
-            if r.get("_source_ticker") == ticker and r.get("url")
-        ]
-        if not subset:
-            continue
-        reserved[ticker] = max(subset, key=lambda r: _reserved_candidate_score(r, now))
-    return reserved
-
-
-def _plan_reserved_and_open(
-    raw_results: list[dict],
-    must_answer_tickers: list[str],
-    geo_keywords: dict,
-    now: datetime,
-) -> tuple[dict[str, dict], list[dict]]:
-    """Reserve must-answer hits, then rank everything else for the open pool.
-
-    Keyword bonus reads `must_answer_tickers`. It does not take a second
-    ticker list.
-    """
-    reserved = _select_reserved_results(raw_results, must_answer_tickers, now=now)
-    reserved_urls = {r["url"] for r in reserved.values()}
-    open_input = [r for r in raw_results if r.get("url") not in reserved_urls]
-    prescreened = score_and_filter(
-        open_input,
-        must_answer_tickers,
-        geo_keywords,
-        top_n=OPEN_POOL_PRESCREEN_TOP_N,
-        now=now,
-    )
-    return reserved, prescreened
-
-
-def _annotate_job_results(
-    job: dict,
-    results: list[dict],
-    now: datetime,
-    must_answer_tickers: list[str],
-) -> list[dict]:
-    """7-day fence and `_source_ticker` follow `must_answer_tickers` only."""
-    ticker = job.get("_must_answer_ticker")
-    if ticker in must_answer_tickers:
-        results = _drop_stale_dated_results(results, now=now, max_age_days=7)
-        source_ticker = ticker
-    else:
-        source_ticker = None
-    for result in results:
-        result["_source_ticker"] = source_ticker
-    return results
-
-
-def _extract_url_batches(urls: list[str], batch_size: int = 10) -> list[list[str]]:
-    clean: list[str] = []
-    seen: set[str] = set()
-    for url in urls:
-        if url and url not in seen:
-            seen.add(url)
-            clean.append(url)
-    if not clean:
-        return []
-    return [clean[i:i + batch_size] for i in range(0, len(clean), batch_size)]
-
-
-def _extract_intent_queries(
-    must_answer_tickers: list[str],
-    geo_topics_str: str,
-) -> tuple[str, str]:
-    """Queries Tavily uses to rerank extracted chunks.
-
-    Both calls use the same must-answer names. The open call also gets the
-    geopolitics tail, still capped at 80 characters. There is no second
-    ticker slice.
-    """
-    names = " ".join(dict.fromkeys(t for t in must_answer_tickers if t))
-    open_q = f"{names} {(geo_topics_str or '')[:80]}".strip()
-    return names, open_q
-
-
-def _extract_reserved_then_open(
-    reserved_urls: list[str],
-    open_urls: list[str],
-    reserved_query: str,
-    open_query: str,
-    budget: dict,
-    extract_fn=None,
-) -> list[dict]:
-    """Extract reserved URLs first, then the open pool, 10 URLs per call."""
-    extract_fn = extract_fn or tavily_extract
-    extracted: list[dict] = []
-    for batch in _extract_url_batches(reserved_urls):
-        extracted.extend(extract_fn(batch, reserved_query, budget) or [])
-    for batch in _extract_url_batches(open_urls):
-        extracted.extend(extract_fn(batch, open_query, budget) or [])
-    return extracted
-
-
-def _extract_search_results(
-    reserved_results: dict[str, dict],
-    open_urls: list[str],
-    must_answer_tickers: list[str],
-    geo_topics_str: str,
-    budget: dict,
-    extract_fn=None,
-) -> list[dict]:
-    reserved_urls = [r["url"] for r in reserved_results.values() if r.get("url")]
-    reserved_q, open_q = _extract_intent_queries(must_answer_tickers, geo_topics_str)
-    return _extract_reserved_then_open(
-        reserved_urls, open_urls, reserved_q, open_q, budget, extract_fn,
-    )
-
-
-def score_and_filter(
-    results: list[dict],
-    anomaly_tickers: list[str],
-    geo_keywords: dict[str, list[str]],
-    top_n: int = 8,
-    now: datetime | None = None,
-) -> list[dict]:
-    """Score, deduplicate (exact URL + near-duplicate title within a time window),
-    and return top_n search results by composite score.
-
-    Composite = tavily_score
-              + domain_bonus  (trusted financial/news source: +0.15)
-              + recency_bonus (≤24h: +0.10; ≤72h: +0.05)
-              + keyword_bonus (anomaly ticker or geo keyword in title/content: +0.05 each)
-              + video_penalty (video/gallery/watch path: -0.08, issue #19 direction 4)
-
-    Title dedup: different outlets covering the same wire story get different
-    URLs but paraphrased headlines. Exact-URL dedup misses this almost
-    entirely — a token-overlap match on titles that share a tracked ticker/geo
-    keyword, within a 24h publish window, catches it without needing
-    embeddings or an extra LLM call (see the module-level comment above
-    _TITLE_DEDUP_THRESHOLD for why character-level similarity was rejected).
-    Genuinely different angles on the same broader event (e.g. the
-    geopolitical act itself vs. the market's price reaction to it) score low
-    on token overlap and are correctly kept as separate, non-duplicate items.
-
-    `geo_keywords` takes the curated topic→keyword dict from watchlist.md
-    (e.g. "US-Iran": ["Iran", "nuclear", "Strait of Hormuz", ...]), not a bare
-    list of topic labels — splitting a label like "US-Iran" into ["us","iran"]
-    both misses real synonym anchors (a "Hormuz"-only headline never matched
-    an "iran"-only one, confirmed missed in the 2026-07-15 PM production run)
-    and introduces short-token false positives ("us" matching inside "focus").
-    """
-    # build_keyword_set() (scoring_utils.py) does the same lowering + multi-word
-    # phrase word-splitting described above — shared with the corroboration
-    # fingerprint (_extract_key_phrases) as of issue #19 follow-up so both keyword
-    # anchoring paths stay in sync.
-    keywords = build_keyword_set(anomaly_tickers, geo_keywords)
-
-    if now is None:
-        now = datetime.now(ET)
-    scored: list[tuple[float, dict, "datetime | None"]] = []
-    seen: set[str] = set()
-
-    for r in results:
-        url = r.get("url", "")
-        if not url or url in seen:
-            continue
-        seen.add(url)
-
-        s = float(r.get("score") or 0)
-        pub = r.get("published_date", "")
-        adjustment, pub_dt = _source_quality_adjustment(url, pub, now)
-
-        text = (r.get("title", "") + " " + (r.get("content") or "")).lower()
-        kw_bonus = 0.05 * sum(1 for k in keywords if k and k in text)
-
-        scored.append((s + adjustment + kw_bonus, r, pub_dt))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    kept: list[tuple[float, dict]] = []
-    kept_meta: list[tuple[frozenset, frozenset, "datetime | None"]] = []
-    dup_count = 0
-    for score, r, pub_dt in scored:
-        title = r.get("title", "")
-        tokens = _title_tokens_for_dedup(title)
-        kw_hits = _title_keyword_hits(title.lower(), keywords)
-        is_dup = False
-        for kept_tokens, kept_kw_hits, kept_dt in kept_meta:
-            if kw_hits and kept_kw_hits:
-                if not (kw_hits & kept_kw_hits):
-                    continue  # different tracked topics — never compare
-                threshold = _TITLE_DEDUP_THRESHOLD
-            elif not kw_hits and not kept_kw_hits:
-                threshold = _TITLE_DEDUP_THRESHOLD_NO_KEYWORD  # no anchor, need a stronger bar
-            else:
-                continue  # one hit a keyword, the other didn't — different category
-            jac = _token_jaccard(tokens, kept_tokens)
-            if jac < threshold:
-                continue
-            if pub_dt and kept_dt:
-                if abs((pub_dt - kept_dt).total_seconds()) > _TITLE_DEDUP_WINDOW_HOURS * 3600:
-                    continue  # confirmed too far apart in time — probably unrelated
-            elif jac < _TITLE_DEDUP_STRICT_NO_DATE_THRESHOLD:
-                # can't confirm publish-time proximity either way — require
-                # near-exact wording before deduping instead of an unbounded match
-                continue
-            is_dup = True
-            break
-        if is_dup:
-            dup_count += 1
-            continue
-        kept.append((score, r))
-        kept_meta.append((tokens, kw_hits, pub_dt))
-
-    top = [r for _, r in kept[:top_n]]
-    if dup_count:
-        logger.info(f"score_and_filter: dropped {dup_count} near-duplicate-title result(s) (cross-source dedup)")
-    logger.info(f"score_and_filter: {len(results)} → {len(top)} results (top_n={top_n})")
-    return top
-
-
-def _semantic_relevance_filter(
-    results: list[dict],
-    anomaly_tickers: list[str],
-    geo_topics: list[str],
-    portfolio_tickers: list[str] | None = None,
-    top_n: int = 10,
-) -> tuple[list[dict], dict]:
-    """Semantically rank pre-screened search results using google/gemma-4-31b-it.
-
-    Considers upstream/downstream supply chains, sector-wide regulatory impacts,
-    and macro drivers — not just direct ticker name mentions.
-    Fail-open: returns script-scored top_n on any error.
-    Cost: ~$0.0001-0.00014 per call (verified 2026-07-22 against real prompt shape).
-
-    Returns (filtered_results, meta). meta mirrors call_llm()'s _llm_meta shape
-    ({"provider", "fallback", ...}) for status-line reporting via build_status_message().
-    meta is {"skipped": "no_results" | "no_api_key"} when the LLM was never called
-    (nothing to rank / no key configured), and {} only when both primary and
-    OR-flex fallback were actually attempted and both failed — the two cases
-    read very differently in the TG status line and must not be conflated.
-
-    Switched from deepseek-v4-flash 2026-07-22 after a live production crash
-    ('NoneType' object has no attribute 'strip') traced to that model silently
-    burning its max_tokens budget on hidden reasoning tokens despite no
-    thinking/reasoning key being sent. gemma-4-31b-it validated clean
-    (reasoning_tokens=0, finish_reason=stop) against this exact prompt template
-    before switching, not just against a synthetic eval case set — see issue #53.
-    """
-    if not results:
-        return results[:top_n], {"skipped": "no_results"}
-    if not OPENROUTER_API_KEY:
-        return results[:top_n], {"skipped": "no_api_key"}
-
-    cfg = llm_config.stage("semantic_filter")
-
-    ptickers = ", ".join(portfolio_tickers[:15]) if portfolio_tickers else "INTC NVDA QCOM TSLA AMKR"
-    items_text = []
-    for i, r in enumerate(results):
-        title   = (r.get("title") or "").strip()
-        url     = (r.get("url") or "")[:70]
-        score   = r.get("score", 0)
-        snippet = (r.get("content") or "")[:130].replace("\n", " ")
-        items_text.append(f"[{i}] sc={score:.2f} | {title}\n    {url}\n    {snippet}")
-
-    prompt = f"""You are a financial intelligence analyst. Rank these {len(results)} articles by relevance to today's market monitoring situation.
-
-Context:
-- Anomaly tickers (moved significantly today): {', '.join(anomaly_tickers) if anomaly_tickers else 'none'}
-- Active geopolitical topics: {', '.join(geo_topics) if geo_topics else 'none'}
-- Portfolio tickers: {ptickers}
-
-Relevance criteria (in priority order):
-1. Direct catalyst for anomaly tickers (earnings beat/miss, product launch, deal, regulatory action, analyst upgrade/downgrade)
-2. Supply chain impact: upstream component suppliers, downstream OEM customers, foundry partners, competitor reactions
-3. Sector-wide shifts: export controls, tariff changes, industry capacity rebalancing that explain the move
-4. Geopolitical transmission: sanctions, conflict escalation, trade negotiations with quantifiable market impact
-5. Macro signals directly linked to portfolio exposure (Fed policy, bond yields, FX moves, commodity supply shocks)
-
-NOT relevant: general market sentiment, unrelated sectors, repeated/duplicate coverage, opinion without new facts.
-
-Articles:
-{chr(10).join(items_text)}
-
-Return ONLY a JSON array of exactly {top_n} indices (or fewer if less than {top_n} are relevant), best first:
-[i1, i2, ...]"""
-
-    try:
-        resp = httpx.post(
-            OR_BASE_URL,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                **OR_ATTRIBUTION_HEADERS,
-            },
-            json={
-                "model": cfg["model"],
-                **({"provider": cfg["providers"]} if cfg["providers"] else {}),
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": cfg["max_tokens"],
-                "temperature": cfg["temperature"],
-            },
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        choice = data["choices"][0]
-        msg = choice["message"]
-        content = (msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
-        provider = data.get("provider", "n/a")
-        usage = data.get("usage", {})
-        logger.info(f"Semantic filter tokens: prompt={usage.get('prompt_tokens')} "
-                    f"completion={usage.get('completion_tokens')} "
-                    f"reasoning={usage.get('completion_tokens_details', {}).get('reasoning_tokens')} "
-                    f"finish_reason={choice.get('finish_reason')} provider={provider}")
-        m = re.search(r'\[[\d,\s]+\]', content)
-        if m:
-            indices = json.loads(m.group())
-            filtered = [results[i] for i in indices if isinstance(i, int) and 0 <= i < len(results)]
-            if filtered:
-                logger.info(f"Semantic filter: {len(results)} → {len(filtered)} results "
-                            f"(supply-chain + semantic ranking, OR/{provider})")
-                return filtered, {"provider": provider, "fallback": False}
-        if not content and choice.get("finish_reason") == "length":
-            logger.warning("Semantic filter: budget exhausted before any content (finish_reason=length, empty content)")
-        else:
-            logger.warning(f"Semantic filter: unexpected output: {content[:80]}")
-    except Exception as e:
-        logger.warning(f"Semantic filter failed ({e}), trying OR flex fallback...")
-
-    # OR flex fallback for semantic filter (skipped when configured off)
-    if not cfg.get("fallback_model"):
-        return results[:top_n], {}
-    try:
-        resp = httpx.post(
-            OR_BASE_URL,
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                     "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
-            json={
-                "model": cfg["fallback_model"],
-                "service_tier": "flex",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": cfg["max_tokens"],
-                "temperature": cfg["temperature"],
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        choice = data["choices"][0]
-        msg = choice["message"]
-        content = (msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
-        provider = data.get("provider", "n/a")
-        usage = data.get("usage", {})
-        logger.info(f"Semantic filter OR flex tokens: prompt={usage.get('prompt_tokens')} "
-                    f"completion={usage.get('completion_tokens')} "
-                    f"finish_reason={choice.get('finish_reason')} provider={provider}")
-        m = re.search(r'\[[\d,\s]+\]', content)
-        if m:
-            indices = json.loads(m.group())
-            filtered = [results[i] for i in indices if isinstance(i, int) and 0 <= i < len(results)]
-            if filtered:
-                logger.info(f"Semantic filter OR flex: {len(results)} → {len(filtered)} results")
-                return filtered, {"provider": provider, "fallback": True, "model": cfg["fallback_model"]}
-    except Exception as e:
-        logger.warning(f"Semantic filter OR flex also failed: {e}")
-
-    return results[:top_n], {}
-
-
-def format_tavily_results(results: list[dict]) -> str:
-    """Format search results (250-char snippets). Used as fallback when extract unavailable."""
-    if not results:
-        return ""
-    lines = ["[Tavily搜索摘要]"]
-    for r in results:
-        lines.append(f"  • {r.get('title', '')} — {r.get('url', '')}")
-        content = (r.get("content") or "")[:300]
-        if content:
-            lines.append(f"    {content}")
-    return "\n".join(lines)
-
-
-
-def format_extract_results(
-    results: list[dict],
-    candidates: list[dict] | None = None,
-    extra_keywords: list[str] | None = None,
-) -> str:
-    """Format Extract results (full chunks, up to 600 chars each).
-
-    Each source gets a confidence tag line (structure type / date confidence /
-    rule-based corroboration count) so Pass 2 can hedge language on claims that
-    are single-source and/or from undated caption-listing pages, instead of
-    stating them as settled fact (see issue #19 — a Reuters video-hub caption
-    with no date of its own was reported as a confirmed "signing set for Friday").
-    `candidates` is the broader pre-extract search result pool (has published_date
-    and title/content for corroboration matching); pass score_and_filter's output.
-    `extra_keywords` is build_keyword_set()'s output — plugs the corroboration
-    fingerprint's single-token/all-caps entity gap (issue #19 follow-up).
-    """
-    if not results:
-        return ""
-    candidates = candidates or []
-    lines = ["[Tavily Extract — 全文片段]"]
-    for r in results:
-        url = r.get("url", "")
-        chunks = r.get("chunks") or []
-        raw = r.get("raw_content", "")
-        full_text = " ".join((c.get("content") or "") for c in chunks) or raw
-
-        lines.append(f"\n  来源: {url}")
-        lines.append(f"    [{_source_confidence_tags(url, full_text, candidates, extra_keywords)}]")
-        if chunks:
-            for i, chunk in enumerate(chunks[:2]):
-                text = (chunk.get("content") or "")[:600]
-                if text:
-                    lines.append(f"    [{i+1}] {text}")
-        elif raw:
-            lines.append(f"    {raw[:800]}")
-    return "\n".join(lines)
 
 
 # ── Personal context helpers (for Pass 2 injection) ──────────────────────────
@@ -1068,12 +554,6 @@ def _load_personal_context(background_signals: str | None = None,
 # ── LLM call ─────────────────────────────────────────────────────────────────
 
 # Pass 1 system prompt: lightweight, instructs structured JSON output + search task generation
-SYSTEM_PROMPT = """你是一名服务于个人投资者的金融情报分析师。
-用户持有多只美股及ETF，同时关注黄金、原油、债券收益率、汇率和地缘政治风险。
-你的任务是每日整理关键情报并生成搜索指令，不做深入推理，仅呈现事实与异动，供用户自行判断。
-输出语言：中文。风格：简洁、直接、数据优先。
-所有时间推理均以纽约证券交易所所在时区（America/New_York，夏令时 EDT/冬令时 EST）为基准。"""
-
 # Pass 2 system prompt (Layer A): platform-generic analyst persona, Portfonia-reusable
 _LAYER_A_PATH = OBSIDIAN / "Hermes/Daily Intelligence/Layer_A_Prompt.md"
 _LAYER_A_FALLBACK = """你是一名专业财经情报分析师，服务于秉持价值投资、长期持仓、低交易频率理念的投资者。
@@ -1101,96 +581,44 @@ def _load_layer_a() -> str:
 
 
 SYSTEM_PROMPT_P2 = _load_layer_a() + (
-    "\n利率和宏观周期、普通财报差异、资金流与风格轮动、短期技术择时、情绪波动属于个人投资者的能力边界，不单独构成操作依据。"
+    "\n能力圈外的变量只陈述事实，不推导操作。"
 )
 
 # AM-only instruction (issue #10): ask for a short list of falsifiable claims
 # that the PM run can mechanically check against actual EOD data that evening.
 # Kept out of the PM prompt — the point is to test the morning's calls against
 # what actually happened, not to have every report predict itself.
-VERIFIABLE_SIGNALS_INSTRUCTION_P1 = (
-    "4. report_md 结尾追加\"## 可验证信号\"小节，2-4条，每条必须是可被今晚收盘后核验的具体条件-结果断言"
-    "（如\"WTI跌破$65→通胀预期继续下修\"、\"Fed官员今日确认/否认降息\"），不写模糊定性描述（如\"值得关注\"）"
-)
 VERIFIABLE_SIGNALS_INSTRUCTION_P2 = (
     "可验证信号（仅开盘前简报要求）：report_md 结尾追加\"## 可验证信号\"小节，2-4条，每条必须是可被今晚"
     "收盘后核验的具体条件-结果断言（价格阈值/事件是否发生），不写模糊定性描述——这些会在今晚 PM 报告生成前"
     "被核验，核验结果沉淀为知识库供未来报告参考"
 )
 
-USER_PROMPT_TEMPLATE = """今日日期（ET）：{date}
-当前时间：{now_str}
-上次报告：{last_report_date}
-默认搜索窗口：{query_days} 天（自上次报告起）
-今日 RSS 命中地缘政治主题：{triggered_geo_topics}
-{pm_afterhours_note}
-## 价格数据（{price_data_label}）
-{price_table}
-{price_missing_note}
-## 过去24小时新闻（RSS）
-{news_text}
-
-{finnhub_news_section}{brave_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}{calibration_notes}
----
-
-## 搜索任务约束（填写 tavily_queries 时遵守）
-- 只为"今日 RSS 命中地缘政治主题"中列出的主题生成查询，未命中的主题不生成
-- 所有查询统一 search_depth="basic"（系统自动在 Extract 层补充全文深度，无需 advanced）
-- 单次 tavily_queries 总条数不超过 4 条
-- days 默认使用上方搜索窗口值，宏观趋势背景可用 days=3
-- max_results 统一填 12
-- 对单个持仓 ticker 的个股查询，在 query 中加 site:stockanalysis.com 或 site:macrotrends.net 可显著提升数据密度（例："NVDA site:stockanalysis.com"）
-{anomaly_tickers_note}
-{unexplained_move_note}
-
-请输出以下JSON（不要附加任何其他文字）：
-{{
-  "report_md": "# [Daily_Intel] YYYY-MM-DD 开盘前简报\\n\\n...",
-  "tavily_queries": []
-}}
-
-规则：
-1. report_md 分四节：【价格异动】【地缘政治】【市场要闻】【简评】
-   - 【价格异动】：仅列出[!]标记标的，说明幅度和可能原因（基于新闻）；
-     若为夜盘报告且价格表含"盘后涨跌"数据，则在每个[!]标的下分别列出
-     「日内涨跌」和「盘后截止{now_str}涨跌」，并结合 Finnhub 即时新闻说明盘后驱动因素
-   - 【地缘政治】：按主题分段，无动态则注明"无新进展"
-   - 【市场要闻】：其他重要财经新闻，最多5条
-   - 【简评】：不超过3句，点出今日最需关注的1-2个信号
-2. tavily_queries：为需要更多背景的事件生成搜索对象数组，每项格式：
-   {{"query": "英文搜索词", "search_depth": "basic", "days": N, "max_results": 12}}
-3. 严格JSON格式，report_md内换行用\\n
-{verifiable_signals_rule}
-"""
-
 # Pass 2 prompt template: free-form analysis with personal context (Layer B injected at call site)
 USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 当前时间：{now_str}
-上次报告：{last_report_date}
 {pm_afterhours_note}
 ## 价格数据（{price_data_label}）
 {price_table}
 {price_missing_note}
-## 过去24小时新闻（RSS）
-{news_text}
-
-{finnhub_news_section}{brave_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}{kb_section}{calibration_notes}{recent_coverage_section}
+{ledger_section}
+{sonar_macro_section}{social_sentiment_section}{liquidity_section}{kb_section}{calibration_notes}{recent_coverage_section}
 ## 实际持仓与框架
 {personal_context}
 
-先写今天的新事实及其来源、时间和对实际持仓或观察标的的具体含义。价格涨跌本身不证明驱动原因；资金流、情绪或市场预期若没有直接证据，不得补写成原因。单一来源、时间不明或过时材料应明确降级，不得把孤证当确定事实；信源元数据仅用于判断，不在正文报告独立域名数量。观察标的不得写成实际持仓。
+按标的账本作归因。异动只有三种表述：有直接证据的“已知原因”（附来源）；有线索但证据不足的“线索待核实”（单一来源的强断言在句内标“未证实”）；找不到线索时写“未找到原因”，并写明该标的覆盖记录。覆盖记录显示检索失败而无条目时写“未能完成检索”，不能声称已查遍。价格变化本身不是原因。不能因没找到就断言“没有公司级催化”；无账本证据不得臆测情绪、资金流或风格轮动。只写新闻相对“此前已报道”及近五个交易日报告新增的事实；无进展时省略，或一句“延续 MM-DD 已报道的<事件>，今日无新进展”。不复述信源独立域名数量。
 
-对照“近 5 个交易日已报道”：同一标的只写相对旧报道新增的事实。没有新事实时，省略该事件，或只用一句“延续 MM-DD 已报道的<事件>，今日无新进展”。不要重复背景、已作出的仓位结论，也不要为每个异动附一句“未构成加减仓依据”。
+仓位建议仅在下列事实命中时提出，并指出具体新证据：认知提升（战略节点首次商业化、竞争格局结构变化、此前被怀疑的管理层承诺获证实）；Alpha 大幅兑现（预期差评分下降超过3分、未来 Alpha 潜力低于5分且无新催化）；更高赔率机会（候选潜力高2分以上且战略空间同量级）；价格被动上涨致单一仓位跨过15%。FRED 档位变化或52周新高低是背景，不单独触发交易。未命中时不写仓位段落，不逐股声明“无加减仓依据”，不复述标准原文。
 
-输出骨架（没有实质内容的小节直接省略）：
+输出骨架（空节省略）：
 # [Daily_Intel] {date} 开盘前简报
-## 要点（可选；只放最重要的新事实）
+## 要点（可选，最多3条）
 ## 持仓与观察标的
-## 宏观与地缘（仅有新的传导事实时）
-## 仓位（仅当认知提升、Alpha 大幅兑现、更高赔率机会或仓位跨过 15% 等事实真正命中时）
+## 宏观与地缘（只写对持仓有传导的新事实）
+## 仓位（仅出现上述例外时）
 {verifiable_signals_rule}
 
-仓位建议须指出对应事实和证据；未命中则不写“仓位”小节。FRED 等背景信号不能单独触发交易建议。报告应有话则长，无话则短；不要套话、逐条核对清单或凭空设价格触发线。直接输出 Markdown 正文，不要 JSON、代码围栏或附言。
+有话则长，无话则短；不要套话或凭空设价格触发线。直接输出 Markdown 正文，不要 JSON、代码围栏或附言。
 """
 
 # SAS候选证据提取：独立于 Pass 2 report_md 的第二次调用（issue #60）。原先与 report_md 共享
@@ -1204,10 +632,7 @@ SAS_CANDIDATE_PROMPT_TEMPLATE = """今日日期（ET）：{date}
 ## 价格数据（{price_data_label}）
 {price_table}
 {price_missing_note}
-## 过去24小时新闻（RSS）
-{news_text}
-
-{finnhub_news_section}{brave_news_section}{sonar_macro_section}{social_sentiment_section}{tavily_section}
+{ledger_section}
 == 持仓 ==
 {personal_context}
 
@@ -1242,102 +667,39 @@ fact 为一句话事实摘要（含关键数字/来源，不超过80字）。宁
 
 # ── TG-only run status message ──────────────────────────────────────────────
 
-def build_status_message(
-    today_et: str,
-    slot_label: str,
-    budget: dict,
-    serpapi_budget: dict,
-    tavily_used_before: int,
-    serpapi_used_before: int,
-    news_items: list,
-    guardian_enabled: bool,
-    finnhub_tickers: list,
-    finnhub_news_section: str,
-    brave_news_section: str,
-    brave_budget: dict,
-    sonar_macro_section: str,
-    polymarket_section: str,
-    adanos_section: str,
-    adanos_budget: dict,
-    reddit_section: str,
-    apify_budget: dict,
-    all_search_jobs: list,
-    raw_results: list,
-    filtered: list,
-    extract_results: list,
-    tavily_section: str,
-    llm_meta_p1: dict,
-    llm_meta_p2: dict,
-    sem_filter_meta: dict,
-) -> str:
-    """Build a separate status report (Tavily/SerpApi usage, intel sources, LLM/Provider list)
-    sent to TG only — kept out of the email/Obsidian report body."""
-    tavily_used_run = budget["used"] - tavily_used_before
+def build_status_message(today_et: str, slot_label: str, budget: dict,
+                         serpapi_budget: dict, tavily_used_before: int,
+                         serpapi_used_before: int, ledger: dict,
+                         sonar_macro_section: str, polymarket_section: str,
+                         adanos_section: str, adanos_budget: dict,
+                         reddit_section: str, apify_budget: dict,
+                         llm_meta_p2: dict) -> str:
+    """TG-only status aligned with ledger coverage and code-only deepening."""
+    lines = [f"**Daily_Intel 运行状态** · {today_et} {slot_label}", "",
+             f"Tavily今日剩余: {budget_remaining(budget)}/{TAVILY_DAILY_LIMIT}（本次用 {budget['used'] - tavily_used_before}）"]
     serpapi_used_run = serpapi_budget["used"] - serpapi_used_before
-
-    lines = [
-        f"**Daily_Intel 运行状态** · {today_et} {slot_label}",
-        "",
-        f"Tavily今日剩余: {budget_remaining(budget)}/{TAVILY_DAILY_LIMIT}（本次用 {tavily_used_run}）",
-    ]
     if serpapi_used_run:
-        lines.append(
-            f"SerpApi本月已用: {serpapi_budget['used']}/{SERPAPI_MONTHLY_LIMIT}（本次用 {serpapi_used_run}）"
-        )
-
-    lines += ["", "情报来源:"]
-    lines.append(f"- RSS{'+Guardian' if guardian_enabled else ''}: {len(news_items)} 条")
-    lines.append(
-        f"- Finnhub即时新闻: 已注入 {len(finnhub_tickers)} ticker" if finnhub_news_section
-        else "- Finnhub即时新闻: 无数据/未触发"
-    )
-    if BRAVE_API_KEY:
-        lines.append(
-            f"- Brave News: {'成功' if brave_news_section else '无数据/跳过'}"
-            f"（本月已用 {brave_budget['used']}/{BRAVE_MONTHLY_LIMIT}）"
-        )
+        lines.append(f"SerpApi本月已用: {serpapi_budget['used']}/{SERPAPI_MONTHLY_LIMIT}（本次用 {serpapi_used_run}）")
+    entities = ledger.get("entities", [])
+    totals = {key: sum((e.get("coverage") or {}).get(key, 0) for e in entities)
+              for key in ("finnhub", "google_news", "rss", "guardian")}
+    errors = list(dict.fromkeys(err for e in entities for err in (e.get("coverage") or {}).get("errors", [])))
+    lines += ["", "情报来源:",
+              f"- Pass 0: {len(entities)} 标的；Finnhub {totals['finnhub']}、Google News {totals['google_news']}、RSS {totals['rss']}、Guardian {totals['guardian']}",
+              f"- 来源错误: {'；'.join(errors[:5]) if errors else '无'}",
+              f"- Pass 1（代码）: 搜索 {ledger.get('search_count', 0)}，Extract {ledger.get('extract_success_count', 0)}/{ledger.get('extract_url_count', 0)} URL"]
+    for ticker, status in (ledger.get("deepen_status") or {}).items():
+        lines.append(f"  {ticker}: {status}")
     lines.append(f"- Sonar宏观快照: {'成功' if sonar_macro_section else '失败/跳过'}")
-    lines.append(f"- Polymarket预测市场: {'成功' if polymarket_section else '无相关市场/跳过'}")
+    lines.append(f"- Polymarket: {'成功' if polymarket_section else '无相关市场/跳过'}")
     if ADANOS_API_KEY:
-        lines.append(
-            f"- Adanos X舆情: {'成功' if adanos_section else '无数据/跳过'}"
-            f"（本月已用 {adanos_budget['used']}/{ADANOS_MONTHLY_LIMIT}）"
-        )
+        lines.append(f"- Adanos: {'成功' if adanos_section else '无数据/跳过'}（本月 {adanos_budget['used']}/{ADANOS_MONTHLY_LIMIT}）")
     if APIFY_API_TOKEN:
-        lines.append(
-            f"- Reddit舆情(Apify): {'成功' if reddit_section else '无数据/跳过'}"
-            f"（本月已用 {apify_budget['used']}/{APIFY_MONTHLY_LIMIT}）"
-        )
-    if all_search_jobs:
-        line = f"- Tavily/SerpApi搜索: {len(all_search_jobs)} 任务, {len(raw_results)} 条原始结果"
-        if filtered:
-            line += f" → 筛选 {len(filtered)} 条"
-        lines.append(line)
-        if extract_results:
-            lines.append(f"- Tavily Extract: {len(extract_results)} 篇全文")
-    else:
-        lines.append("- Tavily/SerpApi搜索: 未触发")
-
+        lines.append(f"- Reddit: {'成功' if reddit_section else '无数据/跳过'}（本月 {apify_budget['used']}/{APIFY_MONTHLY_LIMIT}）")
     lines += ["", "LLM/Provider:"]
-    lines.append(f"- Pass 1（{llm_config.model('report_pass1')}）: {_fmt_llm_meta(llm_meta_p1)}")
-    if raw_results:
-        skipped = sem_filter_meta.get("skipped")
-        if skipped == "no_results":
-            sem_line = "跳过（打分后无候选，未调用 LLM）"
-        elif skipped == "no_api_key":
-            sem_line = "跳过（未配置 OPENROUTER_API_KEY）"
-        elif not sem_filter_meta:
-            sem_line = "脚本打分兜底（LLM 主+备均失败，未发送独立告警）"
-        elif sem_filter_meta.get("fallback"):
-            sem_line = f"OR flex fallback → {sem_filter_meta.get('model', '?')} via {sem_filter_meta.get('provider', 'n/a')}"
-        else:
-            sem_line = f"OR/{sem_filter_meta.get('provider', 'n/a')}"
-        lines.append(f"- 语义过滤（{llm_config.model('semantic_filter')}）: {sem_line}")
     if sonar_macro_section:
         lines.append(f"- 宏观快照（{llm_config.model('macro_brief')}）: OR")
-    if tavily_section:
-        lines.append(f"- Pass 2（{llm_config.model('report_pass2')}）: {_fmt_llm_meta(llm_meta_p2)}")
-
+    lines.append(f"- Pass 2（{llm_config.model('report_pass2')}）: {_fmt_llm_meta(llm_meta_p2)}")
     return "\n".join(lines)
 
 
@@ -1357,7 +719,7 @@ def _do_search(query: str, budget: dict, serpapi_budget: dict,
         if results:
             return results
     if serpapi_remaining(serpapi_budget) > 0:
-        return serpapi_search(query, serpapi_budget)
+        return serpapi_search(query, serpapi_budget, start_date, end_date)
     return []
 
 
@@ -1377,85 +739,6 @@ def _acquire_lock():
         fd.close()
         logger.info("Another run_finance instance is already running (lock held), exiting")
         sys.exit(0)
-
-
-# ── Core-holding cognitive-upgrade rotation query (issue #33) ─────────────────
-# AM/PM search triggering is otherwise entirely anomaly/geo-driven — a core
-# holding that isn't moving never gets a proactive check for the Manual
-# Section 6 cognitive-upgrade fact types (product/commercialization milestones,
-# competitive-landscape shifts, management delivering on doubted promises).
-# One rotation query/day, deterministic by date (no rotation-state file to
-# maintain), appended after the anomaly/geo/LLM-suggested jobs so it only
-# consumes leftover Tavily budget rather than competing with real signals.
-
-_COGNITIVE_UPGRADE_LOOKBACK_DAYS = 30
-
-
-def _build_cognitive_upgrade_query(ticker: str, today_et: str) -> str:
-    year = today_et[:4]
-    return (
-        f"{ticker} product commercialization milestone OR competitive landscape "
-        f"change OR management guidance confirmed {year}"
-    )
-
-
-def _anomaly_search_jobs(
-    anomalies: list,
-    run_slot: str,
-    today_et: str,
-    query_days: int,
-) -> list[dict]:
-    """One Tavily job per top-3 mover by |change_pct| (issue #72)."""
-    if not anomalies:
-        return []
-    top3 = sorted(anomalies, key=lambda r: abs(r.change_pct), reverse=True)[:3]
-    jobs = []
-    session_word = "premarket" if run_slot == "am" else "afterhours"
-    days = min(int(query_days), 7)
-    for r in top3:
-        direction = "surge" if r.change_pct > 0 else "drop"
-        anomaly_q = (
-            f"{r.ticker} stock {direction} {abs(r.change_pct):.1f}% "
-            f"{session_word} reason {today_et}"
-        )
-        jobs.append({
-            "query": anomaly_q,
-            "search_depth": "basic",
-            "days": days,
-            "max_results": 15,
-            "_anomaly_query": True,
-            "_anomaly_ticker": r.ticker,
-            "_must_answer_ticker": r.ticker,
-        })
-    return jobs
-
-
-def _must_answer_tickers(jobs: list[dict]) -> list[str]:
-    """Tickers this run must explain. The only place that list is built."""
-    return list(dict.fromkeys(
-        job["_must_answer_ticker"]
-        for job in jobs
-        if job.get("_must_answer_ticker")
-    ))
-
-
-def _anomaly_tickers_from_jobs(jobs: list[dict]) -> list[str]:
-    """Return only tickers that actually received a dedicated anomaly job."""
-    return list(dict.fromkeys(
-        job["_anomaly_ticker"]
-        for job in jobs
-        if job.get("_anomaly_ticker")
-    ))
-
-
-def _build_anomaly_tickers_note(covered_tickers: list[str]) -> str:
-    if not covered_tickers:
-        return ""
-    return (
-        "以下标的已被系统识别为今日异动并自动生成追因查询，不需要你重复建议同名 ticker 的查询："
-        + ", ".join(covered_tickers)
-        + "。Pass1 的 query 配额应优先给地缘/宏观话题或非异动个股。"
-    )
 
 
 # Issue #80. Commodities, FX, and index ETFs never reached 15%/20% in the
@@ -1520,113 +803,6 @@ def _compute_multiday_moves(
     return out
 
 
-def _job_search_bounds(job: dict, default_start, default_end, default_days):
-    """Bounds the search loop actually sends. A job key wins over the default."""
-    return (
-        job.get("start_date", default_start),
-        job.get("end_date", default_end),
-        job.get("days", default_days),
-    )
-
-
-def _should_skip_no_signal(has_anomaly: bool, geo_topics, unexplained_jobs) -> bool:
-    """Quiet same-day book still runs when a multi-day move needs a catalyst query."""
-    return not has_anomaly and not geo_topics and not unexplained_jobs
-
-
-def _unexplained_move_search_jobs(
-    price_rows: list,
-    multiday_moves: dict,
-    covered_tickers: set[str],
-    run_slot: str,
-    today_et: str,
-    query_days: int,
-    max_jobs: int = 2,
-) -> list[dict]:
-    """Catalyst queries for multi-day moves today's anomaly jobs did not cover.
-
-    Fires even when that ticker's same-day change is under the anomaly
-    threshold. 3-day >= 15% wins over 5-day >= 20%. At most max_jobs per run.
-    `query_days` is accepted and ignored: the published-date window is the
-    move plus a 2-day buffer, not the gap since the last report.
-    """
-    del query_days
-    candidates = []
-    for r in price_rows:
-        if r.ticker in covered_tickers or r.ticker in _EXCLUDED_UNEXPLAINED_MOVE_TICKERS:
-            continue
-        pct_3d, pct_5d = multiday_moves.get(r.ticker, (None, None))
-        if pct_3d is not None and abs(pct_3d) >= 15.0:
-            candidates.append((r.ticker, 3, pct_3d))
-        elif pct_5d is not None and abs(pct_5d) >= 20.0:
-            candidates.append((r.ticker, 5, pct_5d))
-    candidates.sort(key=lambda c: abs(c[2]), reverse=True)
-    jobs = []
-    for ticker, window_days, pct in candidates[:max_jobs]:
-        direction = "surged" if pct > 0 else "dropped"
-        query = (
-            f"{ticker} stock {direction} {abs(pct):.1f}% over {window_days} "
-            f"trading days reason catalyst {today_et}"
-        )
-        start_date, end_date, days = _unexplained_publication_window(
-            today_et, window_days, run_slot,
-        )
-        jobs.append({
-            "query": query,
-            "search_depth": "basic",
-            "days": days,
-            "start_date": start_date,
-            "end_date": end_date,
-            "max_results": 15,
-            "_unexplained_move_ticker": ticker,
-            "_must_answer_ticker": ticker,
-        })
-    if jobs:
-        names = ", ".join(j["_unexplained_move_ticker"] for j in jobs)
-        logger.info(f"Issue #80 unexplained-move queries ({run_slot}): {names}")
-    return jobs
-
-
-def _build_unexplained_move_note(covered_tickers: list[str]) -> str:
-    if not covered_tickers:
-        return ""
-    return (
-        "以下标的近3日或5日累计涨跌已超过阈值，系统已自动生成追因查询，不需要你重复建议同名 ticker 的查询："
-        + ", ".join(covered_tickers)
-        + "。"
-    )
-
-
-def _rotation_search_job(today_et: str, anomaly_tickers: set[str] | None = None) -> dict | None:
-    """Pick one core holding for today via date.toordinal() % N — self-correcting
-    if the holding list changes, no persisted state to go stale."""
-    core_tickers = _get_core_holding_tickers()
-    if not core_tickers:
-        return None
-    from datetime import date as _date
-    try:
-        idx = _date.fromisoformat(today_et).toordinal() % len(core_tickers)
-    except ValueError:
-        return None
-    ticker = core_tickers[idx]
-    if anomaly_tickers and ticker in anomaly_tickers:
-        logger.info(
-            f"Issue #33 rotation skipped: {ticker} already covered by anomaly query"
-        )
-        return None
-    return {
-        "query": _build_cognitive_upgrade_query(ticker, today_et),
-        "search_depth": "basic",
-        "days": _COGNITIVE_UPGRADE_LOOKBACK_DAYS,
-        "max_results": 10,
-        # Explicit None overrides the loop's default "since last report" window
-        # (usually ~1 day) — this query needs a 30-day lookback, not yesterday's news.
-        "start_date": None,
-        "end_date": None,
-        "_rotation_ticker": ticker,  # for logging only
-    }
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1636,25 +812,6 @@ def main():
     finally:
         _lock_fd.close()
         LOCK_FILE.unlink(missing_ok=True)
-
-
-def _run_shadow_ledger(wl, now_et, run_slot, price_rows, multiday_moves, today_et):
-    """Collect an independent ledger; source/archive errors cannot block reports."""
-    try:
-        from intel_pass0 import build_ledger
-        windows = {}
-        for ticker, (d3, d5) in multiday_moves.items():
-            days = 5 if d5 is not None and abs(d5) >= 20 else (3 if d3 is not None and abs(d3) >= 15 else 0)
-            if days:
-                windows[ticker] = _unexplained_publication_window(today_et, days, run_slot)[0]
-        ledger, ledger_path = build_ledger(
-            wl, now_et, run_slot, price_rows=price_rows, multiday_moves=multiday_moves,
-            window_starts=windows, held=set(_get_core_holding_tickers()),
-            weights=_get_portfolio_weights(),
-        )
-        logger.info("Pass0 shadow ledger: %s entities, %s", len(ledger["entities"]), ledger_path)
-    except Exception as exc:
-        logger.warning("Pass0 shadow ledger failed (report unaffected): %s", exc)
 
 
 def _main_body():
@@ -1739,108 +896,42 @@ def _main_body():
         if _failed else ""
     )
 
-    # 5. Fetch RSS news (last 24h since last report)
-    news_items = fetch_rss(hours=24, geo_keywords=wl["geo_keywords"])
-    guardian_key = os.environ.get("GUARDIAN_API_KEY")
-    if guardian_key:
-        guardian_items = fetch_guardian_news(hours=24, geo_keywords=wl["geo_keywords"], api_key=guardian_key)
-        news_items = sorted(news_items + guardian_items, key=lambda x: x.published, reverse=True)
-    news_text = format_news_for_prompt(news_items, wl["geo_keywords"])
-
-    # Code-level skip: if no price anomalies AND no geo/macro RSS hits, exit early
-    triggered_geo_topics = sorted(set(t for item in news_items for t in item.topics))
-    has_anomaly = len(anomalies) > 0
-    geo_topics_str = ", ".join(triggered_geo_topics) if triggered_geo_topics else "（无）"
-    logger.info(f"Triggered geo topics: {geo_topics_str}")
-
-    # 7. Query window, then anomaly jobs and multi-day jobs. The skip below
-    # has to see the multi-day jobs; a quiet same-day book can still carry one.
-    last_date = get_last_report_date()
-    try:
-        last_dt = datetime.strptime(last_date, "%Y-%m-%d").date()
-        query_days = max(1, min(3, (datetime.now(ET).date() - last_dt).days + 1))
-    except (ValueError, TypeError):
-        query_days = 1
-    logger.info(f"Query window: {query_days} day(s) since last report ({last_date})")
-
-    anomaly_search_jobs = _anomaly_search_jobs(
-        anomalies,
-        run_slot=run_slot,
-        today_et=today_et,
-        query_days=query_days,
-    )
-    covered_anomaly_tickers = _anomaly_tickers_from_jobs(anomaly_search_jobs)
+    # 5. Free-source ledger is now the only article collector. It replaces
+    # duplicate RSS/Finnhub/Brave reads and the LLM-generated Pass 1 draft.
     multiday_moves = _compute_multiday_moves(price_rows, slot=run_slot)
-    # Issue #87 PR1: build a separate shadow ledger. It cannot affect the
-    # existing search/report/write path, even when a free source fails.
-    _run_shadow_ledger(wl, now_et, run_slot, price_rows, multiday_moves, today_et)
-    unexplained_jobs = _unexplained_move_search_jobs(
-        price_rows,
-        multiday_moves,
-        covered_tickers=set(covered_anomaly_tickers),
-        run_slot=run_slot,
-        today_et=today_et,
-        query_days=query_days,
-    )
-
-    if _should_skip_no_signal(has_anomaly, triggered_geo_topics, unexplained_jobs):
-        logger.info("No price anomalies, no geo/macro RSS hits, no multi-day move — skipping")
-        sys.exit(0)
-
-    # 6. Fetch personal knowledge base context (fail-open)
-    anomaly_ticker_syms = [r.ticker for r in anomalies] if anomalies else []
+    windows = {}
+    for ticker, (d3, d5) in multiday_moves.items():
+        days = 5 if d5 is not None and abs(d5) >= 20 else (3 if d3 is not None and abs(d3) >= 15 else 0)
+        if days:
+            windows[ticker] = _unexplained_publication_window(today_et, days, run_slot)[0]
+    try:
+        ledger, _ = build_ledger(
+            wl, now_et, run_slot, price_rows=price_rows, multiday_moves=multiday_moves,
+            window_starts=windows, held=set(_get_core_holding_tickers()),
+            weights=_get_portfolio_weights(), archive=False,
+        )
+    except Exception as exc:
+        logger.warning("Pass 0 ledger collection failed: %s", exc)
+        ledger = emergency_ledger(today_et, run_slot, now_et, price_rows, wl, multiday_moves,
+                                  f"collector: {type(exc).__name__}",
+                                  held=set(_get_core_holding_tickers()), weights=_get_portfolio_weights())
+    if not should_report(ledger):
+        logger.info("No entity move, company item, or macro item; skipping")
+        return
+    anomaly_ticker_syms = [r.ticker for r in anomalies]
     kb_context = get_finance_context(
         anomaly_tickers=anomaly_ticker_syms,
         geo_topics=list(wl["geo_keywords"].keys()),
     )
     kb_section = f"\n## 个人知识库上下文\n{kb_context}\n" if kb_context else ""
 
-    # 6b. Finnhub ticker-specific news (free, no quota cost)
-    # AM: anomaly tickers first + watchlist fill-up, cap 8, window = query_days * 24h (up to 48h)
-    # PM: anomaly tickers only (AH movers matter most), cap 5, window = 8h (covers AH 4 PM–midnight)
-    #     Keeping cap at 5 for PM avoids unnecessary calls: 5 calls << 60 req/min free limit
-    if run_slot == "pm":
-        _finnhub_tickers = anomaly_ticker_syms[:5]  # only movers; no filler for PM
-        _finnhub_hours = 8                           # AH window: last 8h before midnight
-    else:
-        _finnhub_tickers = list(dict.fromkeys(
-            anomaly_ticker_syms + [t for t in wl["stocks"] if t not in anomaly_ticker_syms]
-        ))[:8]
-        _finnhub_hours = min(query_days * 24, 48)    # 24h normally, up to 48h after weekend
-    finnhub_news_section = fetch_finnhub_news(_finnhub_tickers, hours=_finnhub_hours)
-    logger.info(f"Finnhub news: slot={run_slot}, tickers={_finnhub_tickers}, hours={_finnhub_hours}")
-
-    # 6b2. Brave News (issue #14) — independent Western search engine, budget-capped
-    # (see BRAVE_MONTHLY_LIMIT note: Brave dropped its free tier in 2026, hard stop
-    # to avoid unattended card charges). Wrapped in try/except like the social
-    # sentiment step so a budget-file I/O hiccup can't take down the rest of the run.
-    brave_news_section = ""
-    brave_budget = {"year_month": "", "used": 0}
-    try:
-        brave_budget = load_brave_budget()
-        brave_news_section = fetch_brave_news(
-            _finnhub_tickers, list(wl["geo_keywords"].keys()), brave_budget,
-        )
-    except Exception as e:
-        logger.warning(f"Brave News step failed, continuing without it: {e}")
-
-    # 6c. Sonar macro brief — real-time multi-source synthesis (AM + PM)
-    # Query is built dynamically from watchlist; evolves as holdings change.
+    # Sonar, social, and FRED collection stay in place; only their injection
+    # is scoped to ledger-relevant entities and changed background states.
     sonar_macro_section = _sonar_macro_brief(
-        slot=run_slot,
-        stocks=wl["stocks"],
-        commodities=wl["commodities"],
-        fx=wl["fx"],
-        geo_topics=list(wl["geo_keywords"].keys()),
-        now_et=now_et,
-        portfolio_snapshot=kb_context[:400] if kb_context else "",
-        price_table=price_table,
+        slot=run_slot, stocks=wl["stocks"], commodities=wl["commodities"],
+        fx=wl["fx"], geo_topics=list(wl["geo_keywords"].keys()), now_et=now_et,
+        portfolio_snapshot=kb_context[:400] if kb_context else "", price_table=price_table,
     )
-
-    # 6d. Social sentiment — Polymarket (free, prediction-market odds) + Adanos X/Twitter
-    # (free tier, capped monthly budget). Anomaly tickers prioritized for Adanos, same as Finnhub.
-    # Wrapped in its own try/except so any unexpected failure here (e.g. budget file I/O)
-    # degrades to empty sections instead of taking down the rest of the run.
     polymarket_section = ""
     adanos_section = ""
     adanos_budget = {"year_month": "", "used": 0}
@@ -1849,341 +940,127 @@ def _main_body():
     try:
         adanos_budget = load_adanos_budget()
         polymarket_section = _polymarket_brief(list(wl["geo_keywords"].keys()))
-        _social_tickers = list(dict.fromkeys(
+        social_tickers = list(dict.fromkeys(
             anomaly_ticker_syms + [t for t in wl["stocks"] if t not in anomaly_ticker_syms]
         ))[:4]
-        adanos_section = _adanos_x_sentiment(_social_tickers, adanos_budget)
+        adanos_section = _adanos_x_sentiment(social_tickers, adanos_budget)
         save_adanos_budget(adanos_budget)
         apify_budget = load_apify_budget()
-        reddit_section = _reddit_sentiment_brief(_social_tickers, apify_budget)
+        reddit_section = _reddit_sentiment_brief(social_tickers, apify_budget)
         save_apify_budget(apify_budget)
-    except Exception as e:
-        logger.warning(f"Social sentiment step failed, continuing without it: {e}")
-
-    # 6e. Liquidity plumbing snapshot (FRED) — supports 市场见顶预警指标.md.
-    # Same reasoning as above: isolated try/except so a FRED hiccup can't
-    # take down the run. Folded into the same social_sentiment_section slot
-    # (both are optional macro-context sections) rather than adding a new
-    # template variable to both prompts.
+    except Exception as exc:
+        logger.warning("Social sentiment step failed: %s", exc)
     liquidity_section = ""
     try:
         liquidity_section = fetch_liquidity_snapshot()
-    except Exception as e:
-        logger.warning(f"Liquidity snapshot step failed, continuing without it: {e}")
+    except Exception as exc:
+        logger.warning("Liquidity snapshot step failed: %s", exc)
 
-    social_sentiment_section = polymarket_section + adanos_section + reddit_section + liquidity_section
-    logger.info(
-        f"Social sentiment: polymarket={'yes' if polymarket_section else 'no'}, "
-        f"adanos={'yes' if adanos_section else 'no'} "
-        f"(budget {adanos_budget['used']}/{ADANOS_MONTHLY_LIMIT}), "
-        f"reddit={'yes' if reddit_section else 'no'} "
-        f"(budget {apify_budget['used']}/{APIFY_MONTHLY_LIMIT})"
+    # 6. Code-only Pass 1. Search and Extract budgets are enforced both by the
+    # planner and the existing HTTP budget helpers; no LLM call occurs here.
+    try:
+        ledger = deepen_ledger(
+            ledger,
+            search=lambda query, start, end: _do_search(
+                query, budget, serpapi_budget, search_depth="basic", max_results=2,
+                start_date=start, end_date=end,
+            ),
+            extract=lambda urls, query: tavily_extract(urls, query, budget),
+            remaining=lambda: budget_remaining(budget),
+        )
+    except Exception as exc:
+        logger.warning("Pass 1 deepening failed, keeping free-source ledger: %s", exc)
+        ledger["deepen_status"] = {"error": type(exc).__name__}
+    previous_context_state = read_previous_ledger_state(_PROJ_DIR / "archives", now_et)
+    try:
+        archive_ledger(ledger)
+    except OSError as exc:
+        logger.warning("Ledger archive failed: %s", exc)
+    ledger_section = render_ledger_context(ledger, wl["geo_keywords"])
+    social_section = filter_social_lines(
+        polymarket_section + adanos_section + reddit_section, ledger["entities"]
     )
 
-    # 7b. First LLM pass — analyze and generate search tasks
-
-    # AM-only: recent AM-calibration knowledge (issue #10), read directly from
-    # Obsidian (see _load_recent_calibration_notes docstring for why this
-    # bypasses MemPalace). No-op most of the time until entries accumulate.
+    # 7. Pass 2 runs even when no paid search result exists. A failed or empty
+    # completion still produces a deterministic report and a Telegram alert.
+    coverage_tickers = [e["ticker"] for e in ledger["entities"]
+                        if set((e.get("move") or {}).get("flags", [])) & {"anomaly", "d3", "d5"}]
+    try:
+        recent_coverage_section = build_recent_coverage_section(
+            REPORTS_DIR, today_et, run_slot, coverage_tickers, wl["entity_aliases"]
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning("Recent report coverage unavailable: %s", exc)
+        recent_coverage_section = ""
+    core_tickers = _get_core_holding_tickers()
+    stats = fetch_52week_stats(core_tickers) if core_tickers else {}
+    context_state = current_state(liquidity_section, _get_portfolio_weights(), stats,
+                                  previous_context_state)
+    changed_liquidity, holding_background = changed_background(
+        liquidity_section, context_state, previous_context_state
+    )
+    personal_context = _load_personal_context(background_signals=holding_background)
+    sas_personal_context = _load_personal_context(holding_stats=stats)
     calibration_notes = _load_recent_calibration_notes() if run_slot == "am" else ""
-
-    anomaly_tickers_note = _build_anomaly_tickers_note(covered_anomaly_tickers)
-    unexplained_move_note = _build_unexplained_move_note(
-        [j["_unexplained_move_ticker"] for j in unexplained_jobs]
+    prompt2 = USER_PROMPT_TEMPLATE_P2.format(
+        date=today_et, now_str=now_et.strftime("%Y-%m-%d %H:%M %Z"),
+        pm_afterhours_note=pm_afterhours_note, price_data_label=price_data_label,
+        price_table=price_table, price_missing_note=price_missing_note,
+        ledger_section=ledger_section, sonar_macro_section=sonar_macro_section,
+        social_sentiment_section=social_section, liquidity_section=changed_liquidity,
+        kb_section=kb_section, calibration_notes=calibration_notes,
+        recent_coverage_section=recent_coverage_section,
+        personal_context=personal_context,
+        verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P2 if run_slot == "am" else "",
     )
-
-    prompt = USER_PROMPT_TEMPLATE.format(
-        date=today_et,
-        now_str=now_et.strftime("%Y-%m-%d %H:%M %Z"),
-        last_report_date=last_date,
-        query_days=query_days,
-        triggered_geo_topics=geo_topics_str,
-        pm_afterhours_note=pm_afterhours_note,
-        price_data_label=price_data_label,
-        price_table=price_table,
-        price_missing_note=price_missing_note,
-        news_text=news_text,
-        finnhub_news_section=finnhub_news_section,
-        brave_news_section=brave_news_section,
-        sonar_macro_section=sonar_macro_section,
-        social_sentiment_section=social_sentiment_section,
-        tavily_section="",
-        kb_section=kb_section,
-        calibration_notes=calibration_notes,
-        verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P1 if run_slot == "am" else "",
-        anomaly_tickers_note=anomaly_tickers_note,
-        unexplained_move_note=unexplained_move_note,
-    )
-    result = call_llm(prompt, system_prompt=SYSTEM_PROMPT)
-    llm_meta_p1 = result.get("_llm_meta", {})
-
-    # 8. Build search job list — all basic (Extract provides the depth)
-    # AM anomaly: downgraded to basic (saves 1cr vs old advanced; Extract compensates)
-    # PM and AM anomaly jobs both run; Finnhub is supplemental context only.
-    # Priority: anomaly, then multi-day moves that were not in that top 3,
-    # then Pass 1's own queries, then issue #33 rotation.
-    all_search_jobs: list[dict] = list(anomaly_search_jobs)
-    all_search_jobs.extend(unexplained_jobs)
-
-    # Precise date range for Tavily (replaces days=N)
-    search_start = last_date if last_date != "N/A（首次运行）" else None
-    search_end   = today_et
-
-    for qobj in result.get("tavily_queries", []):
-        if not isinstance(qobj, dict) or not qobj.get("query"):
-            continue
-        # All queries forced to basic — Extract handles depth
-        all_search_jobs.append({**qobj, "search_depth": "basic"})
-
-    # Issue #33: one core-holding cognitive-upgrade rotation query/day, appended
-    # last so it only spends leftover Tavily budget (anomaly/geo/LLM queries above
-    # take priority — this is a proactive fill-in, not a real signal yet).
-    rotation_job = _rotation_search_job(
-        today_et, anomaly_tickers=set(covered_anomaly_tickers)
-    )
-    if rotation_job:
-        all_search_jobs.append(rotation_job)
-        logger.info(f"Issue #33 rotation query: {rotation_job['_rotation_ticker']}")
-
-    must_answer_tickers = _must_answer_tickers(all_search_jobs)
-
-    # 9. Layer 1 — Discovery: run all basic searches, accumulate raw results
-    tavily_section = ""
-    raw_results: list[dict] = []
-    filtered: list[dict] = []        # populated in Layer 2b; needed for archive writer
-    extract_results: list[dict] = [] # populated in Layer 3; needed for archive writer
-    corroboration_keywords: list[str] = []  # populated below; needed for archive writer
-    sem_filter_meta: dict = {}       # populated in Layer 2b; needed for status message
-    for job in all_search_jobs:
-        if budget_remaining(budget) < 1:
-            logger.info("Tavily budget exhausted, stopping search")
-            break
-        start_date, end_date, days = _job_search_bounds(
-            job, search_start, search_end, query_days,
-        )
-        results = _do_search(
-            job["query"], budget, serpapi_budget,
-            days=days,
-            search_depth="basic",
-            max_results=job.get("max_results", 12),
-            start_date=start_date,
-            end_date=end_date,
-        )
-        results = _annotate_job_results(job, results, now_et, must_answer_tickers)
-        raw_results.extend(results)
-
-    reserved_results: dict[str, dict] = {}
-    if raw_results:
-        # Layer 2 — reserved slots, then open-pool ranking. Both read
-        # must_answer_tickers. Keyword bonus does not keep its own ticker list.
-        reserved_results, prescreened = _plan_reserved_and_open(
-            raw_results,
-            must_answer_tickers,
-            wl["geo_keywords"],
-            now_et,
-        )
-        if reserved_results:
-            logger.info(
-                "Issue #82 reserved extract slots: "
-                + ", ".join(reserved_results)
-            )
-
-        # Layer 2b — semantic ranking of the open pool only → about 15
-        filtered, sem_filter_meta = _semantic_relevance_filter(
-            prescreened,
-            anomaly_ticker_syms,
-            list(wl["geo_keywords"].keys()),
-            portfolio_tickers=wl["stocks"],
-            top_n=OPEN_POOL_SEMANTIC_TOP_N,
-        )
-
-        # Layer 3 — reserved batch, then open batches of 10. Each call checks
-        # budget. The two batches use different rerank queries: Tavily applies
-        # one query to every URL in the call.
-        reserved_urls = [r["url"] for r in reserved_results.values() if r.get("url")]
-        reserved_url_set = set(reserved_urls)
-        open_urls = [
-            r["url"] for r in filtered
-            if r.get("url") and r["url"] not in reserved_url_set
-        ][:OPEN_POOL_SEMANTIC_TOP_N]
-        extract_results = _extract_search_results(
-            reserved_results, open_urls, must_answer_tickers, geo_topics_str, budget,
-        )
-
-        # split_phrases=False (scoring_utils.py): corroboration needs a narrower
-        # keyword set than score_and_filter's ranking bonus — a single generic
-        # split word ("east" from "Middle East") or shared ticker alone isn't
-        # evidence of independent confirmation (verified false-positive, PR #46
-        # review); literal curated keywords are still enough to fix the original
-        # 2026-07-17 miss.
-        corroboration_keywords = build_keyword_set([], wl["geo_keywords"], split_phrases=False)
-        extract_candidates = list(reserved_results.values()) + [
-            r for r in prescreened if r.get("url") not in reserved_url_set
-        ]
-        if extract_results:
-            tavily_section = format_extract_results(
-                extract_results, candidates=extract_candidates, extra_keywords=corroboration_keywords
-            )
-            logger.info(f"Using Extract chunks for Pass 2 ({len(extract_results)} sources)")
-        elif filtered or reserved_results:
-            tavily_section = format_tavily_results(
-                list(reserved_results.values()) + list(filtered)
-            )
-            logger.info(
-                f"Extract unavailable, using search summaries "
-                f"({len(reserved_results) + len(filtered)} results)"
-            )
-
-    # 9b. Archive cleaned Extract full text to local disk (outside Obsidian, never mined)
-    archive_candidates = list(reserved_results.values()) + [
-        r for r in filtered if r.get("url") not in {item["url"] for item in reserved_results.values()}
-    ]
-    write_extract_archive(
-        today_et, run_slot, now_et, all_search_jobs, archive_candidates, extract_results,
-        extra_keywords=corroboration_keywords,
-        reserved_by_url={
-            item["url"]: ticker
-            for ticker, item in reserved_results.items()
-            if item.get("url")
-        },
-    )
-
-    # 10. If Tavily added new data, do a second LLM pass to incorporate it
-    # Pass 2 uses SYSTEM_PROMPT_P2 (Layer A) + personal context (Layer B) for portfolio-aware analysis.
-    report_md = result.get("report_md", "")
-    llm_meta_p2 = {}
-    pass2_state_to_save = None
-    if tavily_section:
-        # PR2 reads only the existing monthly reports, never the shadow ledger.
-        # Include every anomaly and every threshold mover, not only the jobs
-        # admitted under the Tavily search cap.
-        coverage_tickers = list(dict.fromkeys(
-            [row.ticker for row in anomalies] + [
-                row.ticker for row in price_rows
-                if any(pct is not None and abs(pct) >= threshold
-                       for pct, threshold in zip(multiday_moves.get(row.ticker, (None, None)), (15, 20)))
-            ]
-        ))
-        try:
-            recent_coverage_section = build_recent_coverage_section(
-                REPORTS_DIR, today_et, run_slot, coverage_tickers, wl["entity_aliases"]
-            )
-        except (OSError, ValueError) as e:
-            logger.warning(f"Recent report coverage unavailable: {e}")
-            recent_coverage_section = ""
-
-        state_path = _PROJ_DIR / "archives" / "pass2_context_state.json"
-        core_tickers = _get_core_holding_tickers()
-        stats = fetch_52week_stats(core_tickers) if core_tickers else {}
-        previous_context_state = read_state(state_path)
-        context_state = current_state(
-            liquidity_section, _get_portfolio_weights(), stats, previous_context_state
-        )
-        changed_liquidity, holding_background = changed_background(
-            liquidity_section, context_state, previous_context_state
-        )
-        # The full snapshot remains available to the independent SAS extractor.
-        sas_personal_context = _load_personal_context(holding_stats=stats)
-        personal_context = _load_personal_context(background_signals=holding_background)
-        p2_social_section = polymarket_section + adanos_section + reddit_section + changed_liquidity
-        prompt2 = USER_PROMPT_TEMPLATE_P2.format(
-            date=today_et,
-            now_str=now_et.strftime("%Y-%m-%d %H:%M %Z"),
-            last_report_date=last_date,
-            pm_afterhours_note=pm_afterhours_note,
-            price_data_label=price_data_label,
-            price_table=price_table,
-            price_missing_note=price_missing_note,
-            news_text=news_text,
-            finnhub_news_section=finnhub_news_section,
-            brave_news_section=brave_news_section,
-            sonar_macro_section=sonar_macro_section,
-            social_sentiment_section=p2_social_section,
-            tavily_section=tavily_section,
-            kb_section=kb_section,
-            calibration_notes=calibration_notes,
-            recent_coverage_section=recent_coverage_section,
-            personal_context=personal_context,
-            verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P2 if run_slot == "am" else "",
-        )
-        # parse_json=False (issue #60): report_md is plain markdown now, not a
-        # JSON-wrapped string — a truncation mid-payload loses only the tail,
-        # not the whole report (this stage has hit finish_reason=length in
-        # production before, issue #59).
+    try:
         result2 = call_llm(prompt2, stage="report_pass2", system_prompt=SYSTEM_PROMPT_P2,
-                            parse_json=False)
-        llm_meta_p2 = result2.get("_llm_meta", {})
-        report_md = result2.get("text") or report_md
-        if result2.get("text"):
-            pass2_state_to_save = (state_path, context_state)
-
-        # SAS candidate extraction (issue #32) is now a fully independent call
-        # (issue #60), not sharing report_md's JSON envelope — its own model/
-        # budget. Explicitly wrapped in try/except (PR #62 review): call_llm()
-        # is documented to fail open by returning {} rather than raising, but
-        # that's an implicit contract at this call site, not an enforced one —
-        # an unexpected raise from call_llm/.format()/stage lookup here would
-        # otherwise abort _main_body() *after* report_md is already built,
-        # taking the whole report down with it for a feature that's supposed
-        # to be a side channel.
-        try:
-            sas_prompt = SAS_CANDIDATE_PROMPT_TEMPLATE.format(
-                date=today_et,
-                pm_afterhours_note=pm_afterhours_note,
-                price_data_label=price_data_label,
-                price_table=price_table,
-                price_missing_note=price_missing_note,
-                news_text=news_text,
-                finnhub_news_section=finnhub_news_section,
-                brave_news_section=brave_news_section,
-                sonar_macro_section=sonar_macro_section,
-                social_sentiment_section=social_sentiment_section,
-                tavily_section=tavily_section,
-                personal_context=sas_personal_context,
-            )
-            sas_result = call_llm(
-                sas_prompt, stage="sas_candidate_extract",
-                system_prompt="你是一名严格遵循规则的候选证据提取器，只输出JSON，不输出任何其他文字。",
-            )
-            write_sas_candidate_log(today_et, slot_label, sas_result.get("sas_candidates", []))
-        except Exception as e:
-            logger.warning(f"SAS candidate extraction failed (non-fatal, report_md unaffected): {e}")
-
+                           parse_json=False)
+    except Exception as exc:
+        logger.warning("Pass 2 failed, using ledger summary: %s", exc)
+        result2 = {}
+    if not isinstance(result2, dict):
+        result2 = {}
+    llm_meta_p2 = result2.get("_llm_meta", {})
+    raw_report = result2.get("text")
+    report_md = raw_report.strip() if isinstance(raw_report, str) else ""
+    pass2_succeeded = bool(report_md)
     if not report_md:
-        logger.warning("Empty report_md, skipping")
-        send_telegram_alert(
-            f"[!] Daily_Intel {today_et} {slot_label} 生成失败：Pass 1/Pass 2 均未返回有效 report_md，"
-            f"本次报告未发送。详见 /tmp/daily_intelligence.log"
-        )
-        sys.exit(0)
+        report_md = render_fallback_report(ledger, slot_label)
+        send_telegram_alert(f"[!] Daily_Intel {today_et} {slot_label} Pass 2 失败；已发送代码生成的账本摘要。")
 
-    # Fix report title for PM slot (LLM always writes 开盘前简报 regardless of slot)
+    # Independent SAS extraction retains its JSON output schema, now sourced
+    # from the same ledger rather than the removed discovery pool.
+    try:
+        sas_prompt = SAS_CANDIDATE_PROMPT_TEMPLATE.format(
+            date=today_et, pm_afterhours_note=pm_afterhours_note,
+            price_data_label=price_data_label, price_table=price_table,
+            price_missing_note=price_missing_note, ledger_section=ledger_section,
+            personal_context=sas_personal_context,
+        )
+        sas_result = call_llm(sas_prompt, stage="sas_candidate_extract",
+                              system_prompt="你是一名严格遵循规则的候选证据提取器，只输出JSON，不输出任何其他文字。")
+        write_sas_candidate_log(today_et, slot_label, sas_result.get("sas_candidates", []))
+    except Exception as exc:
+        logger.warning("SAS candidate extraction failed (non-fatal): %s", exc)
+
     if run_slot == "pm":
-        report_md = re.sub(
-            r"^# \[Daily_Intel\] .+",
-            f"# [Daily_Intel] {today_et} {slot_label}",
-            report_md,
-            flags=re.MULTILINE,
-        )
-
-    # 10b. AM prediction calibration (PM slot only, issue #10) — see function
-    # docstring for design notes. Fail-open: never raises.
+        report_md = re.sub(r"^# \[Daily_Intel\] .+", f"# [Daily_Intel] {today_et} {slot_label}",
+                           report_md, flags=re.MULTILINE)
     report_md = evaluate_am_calibration(
-        today_et, run_slot, price_table, finnhub_news_section, sonar_macro_section, report_md
+        today_et, run_slot, price_table, ledger_section, sonar_macro_section, report_md
     )
-
-    # 11. Write to Obsidian monthly file
     write_report(today_et, slot_label, report_md, budget)
-    if pass2_state_to_save:
+    if pass2_succeeded:
+        ledger["context_state"] = context_state
         try:
-            write_state(*pass2_state_to_save)
-        except OSError as e:
-            logger.warning(f"Pass 2 background state not saved: {e}")
+            archive_ledger(ledger)
+        except OSError as exc:
+            logger.warning("Ledger context state save failed: %s", exc)
     _mempalace_add_daily_drawer(today_et, run_slot, report_md)
-
-    # 11b. Write context log to Obsidian (price table + triggered news + Sonar + queries)
-    write_context_log(today_et, slot_label, now_et, price_table,
-                      news_items, triggered_geo_topics, sonar_macro_section, all_search_jobs)
+    write_context_log(today_et, slot_label, now_et, price_table, [],
+                      (ledger.get("macro_digest") or {}).get("geo_topics_hit", []),
+                      sonar_macro_section, ledger.get("search_jobs", []), ledger=ledger)
 
     # 12. Send email
     footer = finance_footer(today_et, budget)
@@ -2205,12 +1082,10 @@ def _main_body():
     status_md = build_status_message(
         today_et, slot_label, budget, serpapi_budget,
         tavily_used_before, serpapi_used_before,
-        news_items, bool(guardian_key), _finnhub_tickers, finnhub_news_section,
-        brave_news_section, brave_budget,
+        ledger,
         sonar_macro_section, polymarket_section, adanos_section, adanos_budget,
         reddit_section, apify_budget,
-        all_search_jobs, raw_results, filtered, extract_results,
-        tavily_section, llm_meta_p1, llm_meta_p2, sem_filter_meta,
+        llm_meta_p2,
     )
     send_telegram_report(status_md, "")
 

@@ -2,19 +2,11 @@
 Daily Intelligence — report writers
 =====================================
 Everything that writes a pipeline artifact somewhere: monthly report file
-path/dedup helpers, Context Log + Extract Archive writers, MemPalace drawer
+path/dedup helpers, Context Log writer, MemPalace drawer
 push, Obsidian report append, Telegram send, email footer. Extracted from
 run_finance.py (issue #42, 2026-07-17) to shrink that file.
 
-Leaf module: does not import from run_finance.py (sas_review.py accesses
-several of these via `import run_finance as rf; rf.X`, which still works —
-see run_finance.py's re-export block). write_extract_archive()'s
-_source_confidence_tags comes from scoring_utils.py, a shared leaf module —
-not a deferred `from run_finance import ...` inside the function body (the
-original approach here, before PR #43 review feedback pointed out it
-silently assumed run_finance.py is registered in sys.modules as
-"run_finance", which is false when it's run directly as the entrypoint, as
-launchd does — Python registers it as "__main__" instead).
+Leaf module: does not import from run_finance.py.
 """
 import logging
 import os
@@ -27,7 +19,6 @@ import httpx
 
 from telegram_utils import call_telegram
 from budget_trackers import TAVILY_DAILY_LIMIT
-from scoring_utils import _source_confidence_tags
 
 _HOME = os.path.expanduser("~")
 _IN_CONTAINER = os.path.exists("/opt/data")
@@ -41,7 +32,6 @@ else:
 OBSIDIAN    = Path(os.getenv("OBSIDIAN_PATH", _OBSIDIAN_ROOT))
 _PROJ_DIR   = Path(os.path.dirname(os.path.abspath(__file__))).parent
 REPORTS_DIR = OBSIDIAN / "Hermes/Daily Intelligence/Daily Reports"
-ARCHIVE_DIR = _PROJ_DIR / "archives"  # Extract full-text archive (outside Obsidian, never mined)
 ET = ZoneInfo("America/New_York")
 logger = logging.getLogger(__name__)
 
@@ -61,20 +51,6 @@ def _monthly_dedup(date_str: str, slot_label: str) -> bool:
     return f"## {date_str} {slot_label}" in p.read_text(encoding="utf-8")
 
 
-def get_last_report_date() -> str:
-    """Find the most recent report date across all monthly files."""
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    monthly_files = sorted(REPORTS_DIR.glob("Daily_Intel_report_*.md"), reverse=True)
-    for mf in monthly_files:
-        text = mf.read_text(encoding="utf-8")
-        dates = re.findall(r"^## (\d{4}-\d{2}-\d{2})", text, re.MULTILINE)
-        if dates:
-            return max(dates)
-    return "N/A（首次运行）"
-
-
-# ── Context log + Extract archive writers ────────────────────────────────────
-
 def _context_log_path(date_str: str) -> Path:
     ym = date_str[:7].replace("-", "")
     return REPORTS_DIR / f"Daily_Intel_context_{ym}.md"
@@ -89,10 +65,11 @@ def write_context_log(
     triggered_geo_topics: list,
     sonar_macro_section: str,
     all_search_jobs: list,
+    ledger: dict | None = None,
 ) -> None:
     """Append structured context snapshot to monthly context log in Obsidian (gets mined).
     Contains: price table, geo-triggered news headlines, Sonar macro, search queries.
-    Does NOT contain Tavily Extract full text (see write_extract_archive). Fail-open.
+    Does not duplicate archived ledger full text. Fail-open.
     """
     try:
         ym_display = date_str[:7]
@@ -114,7 +91,22 @@ def write_context_log(
         lines.append(price_table.strip())
         lines.append("")
 
-        # Triggered news (geo-matched items only, not all 300)
+        if ledger is not None:
+            lines.append("### 标的账本摘要")
+            for entity in ledger.get("entities", []):
+                move = entity.get("move") or {}
+                coverage = entity.get("coverage") or {}
+                lead = (entity.get("items") or [{}])[0].get("title") or "无标题线索"
+                status = "异动待归因" if move.get("flags") else "无异动"
+                lines.append(
+                    f"- {entity['ticker']} {status}；主线索：{lead}；"
+                    f"Finnhub={coverage.get('finnhub', 0)}、Google News={coverage.get('google_news', 0)}、"
+                    f"RSS={coverage.get('rss', 0)}、Guardian={coverage.get('guardian', 0)}；"
+                    f"错误={'; '.join(coverage.get('errors') or []) or '无'}"
+                )
+            lines.append("")
+
+        # Legacy callers may still pass geo-matched NewsItem objects.
         triggered_items = [item for item in news_items if item.topics]
         if triggered_items:
             lines.append("### 触发新闻（命中地缘/异动相关）")
@@ -145,101 +137,6 @@ def write_context_log(
         logger.info(f"Context log written → {path.name}")
     except Exception as e:
         logger.warning(f"Context log write failed (non-fatal): {e}")
-
-
-def _candidate_origin_label(url: str, reserved_by_url: dict | None) -> str:
-    """`预留:TICKER` for a reserved Extract slot, otherwise `开放池`."""
-    ticker = (reserved_by_url or {}).get(url)
-    if ticker:
-        return f"预留:{ticker}"
-    return "开放池"
-
-
-def write_extract_archive(
-    date_str: str,
-    slot: str,
-    now_et: "datetime",
-    all_search_jobs: list,
-    filtered: list,
-    extract_results: list,
-    extra_keywords: list | None = None,
-    reserved_by_url: dict | None = None,
-) -> None:
-    """Write cleaned Tavily Extract full text to local archive outside Obsidian.
-    Never mined by MemPalace. Preserves original intelligence for audit/mid-term review.
-    Cleaning: lines < 60 chars stripped (nav/ads/links). Fail-open.
-    `extra_keywords` is build_keyword_set()'s output, threaded into the same
-    corroboration fingerprint used by format_extract_results() so both draw on the
-    same keyword vocabulary (issue #19 follow-up). Note this does NOT mean the two
-    always report identical corroboration counts for the same URL: this function is
-    called with the archive candidate list (reserved slots plus the open pool)
-    while format_extract_results() is called with that same reserved set plus
-    the wider prescreened open pool. `reserved_by_url` maps a URL to the
-    must-answer ticker that held it out of the global ranking (issue #82).
-    """
-    if not extract_results and not filtered:
-        return
-    try:
-        ym = date_str[:7].replace("-", "")
-        out_dir = ARCHIVE_DIR / ym
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"{date_str}-{slot}-extract.md"
-
-        lines: list[str] = []
-        lines.append(f"# Extract Archive: {date_str} {slot.upper()}")
-        lines.append(f"_生成时间: {now_et.strftime('%Y-%m-%d %H:%M %Z')}_\n")
-
-        # Search queries
-        if all_search_jobs:
-            lines.append("## 搜索任务")
-            for job in all_search_jobs:
-                lines.append(f"- {job.get('query', '')}")
-            lines.append("")
-
-        # Layer 2b filtered candidates (with score + URL)
-        if filtered:
-            lines.append("## 搜索结果候选（预留名额 + 开放池）")
-            for i, r in enumerate(filtered, 1):
-                title = (r.get("title") or r.get("url") or "")[:100]
-                url = r.get("url", "")
-                score = float(r.get("score") or 0)
-                origin = _candidate_origin_label(url, reserved_by_url)
-                lines.append(f"{i}. [{origin}] [score:{score:.2f}] {title}")
-                lines.append(f"   {url}")
-            lines.append("")
-
-        # Extract full text (cleaned)
-        if extract_results:
-            lines.append("## Extract 全文")
-            for r in extract_results:
-                url = r.get("url", "")
-                chunks = r.get("chunks") or []
-                raw = r.get("raw_content", "")
-                full_text = " ".join((c.get("content") or "") for c in chunks) or raw
-                lines.append(f"\n### {url}")
-                lines.append(f"[{_source_confidence_tags(url, full_text, filtered, extra_keywords)}]\n")
-                if chunks:
-                    for chunk in chunks:
-                        text = chunk.get("content") or ""
-                        # Strip lines < 60 chars (navigation, ads, single-word fragments)
-                        clean = "\n".join(
-                            ln for ln in text.splitlines() if len(ln.strip()) >= 60
-                        ).strip()
-                        if clean:
-                            lines.append(clean)
-                            lines.append("")
-                elif raw:
-                    clean = "\n".join(
-                        ln for ln in raw.splitlines() if len(ln.strip()) >= 60
-                    ).strip()
-                    if clean:
-                        lines.append(clean[:8000])  # cap raw fallback
-                        lines.append("")
-
-        path.write_text("\n".join(lines), encoding="utf-8")
-        logger.info(f"Extract archive written → archives/{ym}/{path.name}")
-    except Exception as e:
-        logger.warning(f"Extract archive write failed (non-fatal): {e}")
 
 
 # ── MemPalace drawer writer ───────────────────────────────────────────────────

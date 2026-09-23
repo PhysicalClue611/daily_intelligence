@@ -46,7 +46,7 @@ def build_ledger(wl: dict, as_of: datetime, slot: str, *, price_rows: list = (),
                  multiday_moves: dict | None = None, window_starts: dict[str, str] | None = None,
                  held: set[str] | None = None, weights: dict[str, float] | None = None,
                  replay: bool = False, only_tickers: list[str] | None = None,
-                 archive_root: Path = collect.ROOT / "archives") -> tuple[dict, Path]:
+                 archive_root: Path = collect.ROOT / "archives", archive: bool = True) -> tuple[dict, Path]:
     tickers = [t for t in wl["stocks"] if t not in collect.ETFS]
     if only_tickers is not None:
         tickers = [t for t in tickers if t in only_tickers]
@@ -70,7 +70,9 @@ def build_ledger(wl: dict, as_of: datetime, slot: str, *, price_rows: list = (),
             entity["coverage"]["errors"].append(alias_errors[entity["ticker"]])
     ledger = {"schema_version": 1, "date": as_of.astimezone(ET).date().isoformat(), "slot": slot,
               "as_of": as_of.isoformat(), "replay": replay, "entities": entities, "macro_digest": macro}
-    path = collect.archive_ledger(ledger, archive_root)
+    path = (collect.archive_ledger(ledger, archive_root) if archive else
+            archive_root / ledger["date"].replace("-", "")[:6] /
+            f"{ledger['date']}-{slot}-ledger.json")
     return ledger, path
 
 

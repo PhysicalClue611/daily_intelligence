@@ -1,29 +1,21 @@
 """Pass 2 background signals that are useful only when their state changes."""
 
 import json
-import os
 import re
+from datetime import datetime
 from pathlib import Path
 
 
-def read_state(path: Path) -> dict:
-    try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def write_state(path: Path, state: dict) -> None:
-    """Commit only after a Pass 2 report has been written successfully."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
-    try:
-        temp.write_text(json.dumps(state, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-        os.replace(temp, path)
-    finally:
-        temp.unlink(missing_ok=True)
+def read_previous_ledger_state(root: Path, before: datetime) -> dict:
+    """Read the newest previously completed report state from an archived ledger."""
+    for path in sorted(Path(root).glob("*/*-ledger.json"), reverse=True):
+        try:
+            ledger = json.loads(path.read_text(encoding="utf-8"))
+            if datetime.fromisoformat(ledger["as_of"]) < before and isinstance(ledger.get("context_state"), dict):
+                return ledger["context_state"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return {}
 
 
 def current_state(liquidity_section: str, weights: dict, stats: dict,

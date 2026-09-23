@@ -14,22 +14,21 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import intel_collect as collect
 import intel_pass0 as pass0
-import run_finance as finance
 from eval.evaluate_issue87 import score_case
 from intel_pass0 import _context_price_rows, build_ledger
 
 
 class PassZeroTest(unittest.TestCase):
-    def test_shadow_failure_is_caught_before_existing_search_path(self):
+    def test_collector_failure_keeps_anomaly_reportable(self):
+        from fetch_prices import PriceRow
+        from intel_render import emergency_ledger, should_report
         now = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
         moves = {"INTC": (16.0, 21.0)}
-        with patch.object(pass0, "build_ledger", side_effect=RuntimeError("free source failed")), \
-             patch.object(finance, "_get_core_holding_tickers", return_value=[]), \
-             patch.object(finance, "_get_portfolio_weights", return_value={}), \
-             patch.object(finance.logger, "warning") as warning:
-            finance._run_shadow_ledger({"stocks": ["INTC"]}, now, "pm", [], moves, "2026-09-21")
-        self.assertEqual(moves, {"INTC": (16.0, 21.0)})
-        self.assertIn("Pass0 shadow ledger failed", warning.call_args.args[0])
+        row = PriceRow("INTC", "Intel", 100, 90, 11, 25, True, "$", slot="pm")
+        ledger = emergency_ledger("2026-09-21", "pm", now, [row],
+                                  {"stocks": ["INTC"]}, moves, "collector: Timeout")
+        self.assertTrue(should_report(ledger))
+        self.assertIn("collector: Timeout", ledger["entities"][0]["coverage"]["errors"])
 
     def test_shadow_modules_have_no_paid_service_import_or_call(self):
         for name in ("intel_collect.py", "intel_pass0.py"):
