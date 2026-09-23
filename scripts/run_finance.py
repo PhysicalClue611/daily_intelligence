@@ -481,17 +481,20 @@ def _select_reserved_results(
 def _plan_reserved_and_open(
     raw_results: list[dict],
     must_answer_tickers: list[str],
-    anomaly_tickers: list[str],
     geo_keywords: dict,
     now: datetime,
 ) -> tuple[dict[str, dict], list[dict]]:
-    """Reserve must-answer hits, then rank everything else for the open pool."""
+    """Reserve must-answer hits, then rank everything else for the open pool.
+
+    Keyword bonus reads `must_answer_tickers`. It does not take a second
+    ticker list.
+    """
     reserved = _select_reserved_results(raw_results, must_answer_tickers, now=now)
     reserved_urls = {r["url"] for r in reserved.values()}
     open_input = [r for r in raw_results if r.get("url") not in reserved_urls]
     prescreened = score_and_filter(
         open_input,
-        anomaly_tickers,
+        must_answer_tickers,
         geo_keywords,
         top_n=OPEN_POOL_PRESCREEN_TOP_N,
         now=now,
@@ -499,11 +502,19 @@ def _plan_reserved_and_open(
     return reserved, prescreened
 
 
-def _annotate_job_results(job: dict, results: list[dict], now: datetime) -> list[dict]:
-    """7-day fence for must-answer jobs, then stamp `_source_ticker`."""
-    if job.get("_anomaly_query") or job.get("_unexplained_move_ticker"):
+def _annotate_job_results(
+    job: dict,
+    results: list[dict],
+    now: datetime,
+    must_answer_tickers: list[str],
+) -> list[dict]:
+    """7-day fence and `_source_ticker` follow `must_answer_tickers` only."""
+    ticker = job.get("_must_answer_ticker")
+    if ticker in must_answer_tickers:
         results = _drop_stale_dated_results(results, now=now, max_age_days=7)
-    source_ticker = job.get("_anomaly_ticker") or job.get("_unexplained_move_ticker")
+        source_ticker = ticker
+    else:
+        source_ticker = None
     for result in results:
         result["_source_ticker"] = source_ticker
     return results
@@ -522,23 +533,18 @@ def _extract_url_batches(urls: list[str], batch_size: int = 10) -> list[list[str
 
 
 def _extract_intent_queries(
-    anomaly_tickers: list[str],
-    reserved_tickers: list[str],
+    must_answer_tickers: list[str],
     geo_topics_str: str,
 ) -> tuple[str, str]:
     """Queries Tavily uses to rerank extracted chunks.
 
-    One query is applied to every URL in a call. Reserved pages therefore
-    get the must-answer tickers, including a quiet multi-day mover that is
-    not in the anomaly list. Open-pool pages keep the anomaly plus geopolitics
-    intent. The geo tail stays at 80 characters, matching the previous cap.
+    Both calls use the same must-answer names. The open call also gets the
+    geopolitics tail, still capped at 80 characters. There is no second
+    ticker slice.
     """
-    reserved_q = " ".join(dict.fromkeys(t for t in reserved_tickers if t))
-    open_q = (
-        " ".join(anomaly_tickers[:3])
-        + " " + (geo_topics_str or "")[:80]
-    ).strip()
-    return reserved_q, open_q
+    names = " ".join(dict.fromkeys(t for t in must_answer_tickers if t))
+    open_q = f"{names} {(geo_topics_str or '')[:80]}".strip()
+    return names, open_q
 
 
 def _extract_reserved_then_open(
@@ -562,15 +568,13 @@ def _extract_reserved_then_open(
 def _extract_search_results(
     reserved_results: dict[str, dict],
     open_urls: list[str],
-    anomaly_tickers: list[str],
+    must_answer_tickers: list[str],
     geo_topics_str: str,
     budget: dict,
     extract_fn=None,
 ) -> list[dict]:
     reserved_urls = [r["url"] for r in reserved_results.values() if r.get("url")]
-    reserved_q, open_q = _extract_intent_queries(
-        anomaly_tickers, list(reserved_results), geo_topics_str,
-    )
+    reserved_q, open_q = _extract_intent_queries(must_answer_tickers, geo_topics_str)
     return _extract_reserved_then_open(
         reserved_urls, open_urls, reserved_q, open_q, budget, extract_fn,
     )
@@ -1452,8 +1456,18 @@ def _anomaly_search_jobs(
             "max_results": 15,
             "_anomaly_query": True,
             "_anomaly_ticker": r.ticker,
+            "_must_answer_ticker": r.ticker,
         })
     return jobs
+
+
+def _must_answer_tickers(jobs: list[dict]) -> list[str]:
+    """Tickers this run must explain. The only place that list is built."""
+    return list(dict.fromkeys(
+        job["_must_answer_ticker"]
+        for job in jobs
+        if job.get("_must_answer_ticker")
+    ))
 
 
 def _anomaly_tickers_from_jobs(jobs: list[dict]) -> list[str]:
@@ -1626,6 +1640,7 @@ def _unexplained_move_search_jobs(
             "end_date": end_date,
             "max_results": 15,
             "_unexplained_move_ticker": ticker,
+            "_must_answer_ticker": ticker,
         })
     if jobs:
         names = ", ".join(j["_unexplained_move_ticker"] for j in jobs)
@@ -1969,6 +1984,8 @@ def _main_body():
         all_search_jobs.append(rotation_job)
         logger.info(f"Issue #33 rotation query: {rotation_job['_rotation_ticker']}")
 
+    must_answer_tickers = _must_answer_tickers(all_search_jobs)
+
     # 9. Layer 1 — Discovery: run all basic searches, accumulate raw results
     tavily_section = ""
     raw_results: list[dict] = []
@@ -1991,22 +2008,16 @@ def _main_body():
             start_date=start_date,
             end_date=end_date,
         )
-        results = _annotate_job_results(job, results, now_et)
+        results = _annotate_job_results(job, results, now_et, must_answer_tickers)
         raw_results.extend(results)
 
     reserved_results: dict[str, dict] = {}
     if raw_results:
-        # Layer 2 — reserved must-answer slots, then open-pool ranking.
-        # keyword_bonus still ranks geopolitics / rotation. It no longer
-        # decides whether an anomaly or unexplained-move ticker is seen.
-        must_answer_tickers = (
-            [j["_anomaly_ticker"] for j in anomaly_search_jobs if j.get("_anomaly_ticker")]
-            + [j["_unexplained_move_ticker"] for j in unexplained_jobs if j.get("_unexplained_move_ticker")]
-        )
+        # Layer 2 — reserved slots, then open-pool ranking. Both read
+        # must_answer_tickers. Keyword bonus does not keep its own ticker list.
         reserved_results, prescreened = _plan_reserved_and_open(
             raw_results,
             must_answer_tickers,
-            anomaly_ticker_syms,
             wl["geo_keywords"],
             now_et,
         )
@@ -2035,7 +2046,7 @@ def _main_body():
             if r.get("url") and r["url"] not in reserved_url_set
         ][:OPEN_POOL_SEMANTIC_TOP_N]
         extract_results = _extract_search_results(
-            reserved_results, open_urls, anomaly_ticker_syms, geo_topics_str, budget,
+            reserved_results, open_urls, must_answer_tickers, geo_topics_str, budget,
         )
 
         # split_phrases=False (scoring_utils.py): corroboration needs a narrower

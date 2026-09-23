@@ -129,11 +129,7 @@ def test_intc_best_result_is_reserved_without_keyword_bonus():
 def test_reserved_urls_are_removed_from_the_open_pool():
     raw = _scenario_20260922_pm()
     reserved, prescreened = rf._plan_reserved_and_open(
-        raw,
-        must_answer_tickers=["AMKR", "INTC", "NVDA"],
-        anomaly_tickers=["AMKR", "CL=F"],
-        geo_keywords=GEO,
-        now=NOW,
+        raw, ["AMKR", "INTC", "NVDA"], GEO, NOW,
     )
     assert "NVDA" not in reserved
     assert set(reserved) == {"AMKR", "INTC"}
@@ -155,9 +151,7 @@ def test_open_pool_prescreen_cap_is_25():
         )
         for i in range(30)
     ]
-    _, prescreened = rf._plan_reserved_and_open(
-        raw, [], ["AMKR"], GEO, NOW,
-    )
+    _, prescreened = rf._plan_reserved_and_open(raw, [], GEO, NOW)
     assert len(prescreened) == 25
 
 
@@ -171,21 +165,47 @@ def test_unexplained_move_results_get_the_7day_fence_and_ticker_tag():
     job = {
         "query": "INTC stock surged 27.5% over 5 trading days reason catalyst 2026-09-22",
         "_unexplained_move_ticker": "INTC",
+        "_must_answer_ticker": "INTC",
     }
     fresh = _hit("fresh", "https://example.com/fresh", 0.2, source=None)
     stale = _hit(
         "stale", "https://example.com/stale", 0.9, source=None,
         published="2026-08-01T12:00:00-04:00",
     )
-    out = rf._annotate_job_results(job, [fresh, stale], NOW)
+    out = rf._annotate_job_results(job, [fresh, stale], NOW, ["INTC"])
     assert [r["url"] for r in out] == ["https://example.com/fresh"]
     assert out[0]["_source_ticker"] == "INTC"
+
+
+def test_fence_reads_must_answer_list_not_category_flags():
+    """A new must-answer category needs no extra flag in the fence."""
+    job = {"query": "NEWCO catalyst", "_must_answer_ticker": "NEWCO"}
+    fresh = _hit("fresh", "https://example.com/fresh-new", 0.2)
+    stale = _hit(
+        "stale", "https://example.com/stale-new", 0.9,
+        published="2026-08-01T12:00:00-04:00",
+    )
+    out = rf._annotate_job_results(job, [fresh, stale], NOW, ["NEWCO"])
+    assert [r["url"] for r in out] == ["https://example.com/fresh-new"]
+    assert out[0]["_source_ticker"] == "NEWCO"
+
+    flagged = {
+        "_anomaly_query": True,
+        "_anomaly_ticker": "INTC",
+        "_unexplained_move_ticker": "INTC",
+    }
+    both = rf._annotate_job_results(flagged, [dict(fresh), dict(stale)], NOW, ["AMKR"])
+    assert [r["url"] for r in both] == [
+        "https://example.com/fresh-new",
+        "https://example.com/stale-new",
+    ]
+    assert all(r["_source_ticker"] is None for r in both)
 
 
 def test_open_discovery_results_are_tagged_with_no_ticker():
     job = {"query": "Trump Takaichi Taiwan", "search_depth": "basic"}
     hit = _hit("Trump Takaichi Taiwan strait", "https://example.com/geo", 0.5)
-    out = rf._annotate_job_results(job, [hit], NOW)
+    out = rf._annotate_job_results(job, [hit], NOW, ["INTC"])
     assert len(out) == 1
     assert out[0]["_source_ticker"] is None
 
@@ -229,24 +249,24 @@ def _capture_extract(anomaly, reserved, geo, open_urls):
 
 
 def test_quiet_multiday_extract_query_names_intc():
-    """2026-09-22 PM: INTC is reserved but not in the anomaly list."""
+    """The Extract query is the must-answer list, not the anomaly-symbol list."""
     calls = _capture_extract(
-        [],
+        ["INTC"],
         {"INTC": {"url": INTC_URL, "score": 0.25}},
         "Japan Taiwan Iran",
         [GEO_URL],
     )
-    reserved_call = calls[0]
-    assert reserved_call[0] == [INTC_URL]
-    assert "INTC" in reserved_call[1]
-    assert "AMKR" not in reserved_call[1]
+    assert calls[0] == ([INTC_URL], "INTC")
+    assert "INTC" in calls[1][1]
+    assert "Japan" in calls[1][1]
+    assert calls[0][1] != calls[1][1]
 
 
 def test_mixed_anomaly_and_unexplained_extract_queries():
-    """Anomaly pages keep the geo intent; the quiet mover is named on its own call."""
+    """Four must-answer names all survive. The old anomaly[:3] slice dropped the fourth."""
     amkr_url = "https://www.ft.com/content/amkr-group-move"
     calls = _capture_extract(
-        ["AMKR", "CL=F"],
+        ["AMKR", "QCOM", "TSLA", "INTC"],
         {
             "AMKR": {"url": amkr_url, "score": 0.22},
             "INTC": {"url": INTC_URL, "score": 0.25},
@@ -261,13 +281,53 @@ def test_mixed_anomaly_and_unexplained_extract_queries():
 
     intc_q = _query_for(INTC_URL)
     geo_q = _query_for(GEO_URL)
-    assert "INTC" in intc_q
-    assert "AMKR" in intc_q
+    assert intc_q == "AMKR QCOM TSLA INTC"
+    assert "Japan" not in intc_q
+    assert geo_q.startswith("AMKR QCOM TSLA INTC")
     assert "Japan" in geo_q
-    assert "AMKR" in geo_q
-    assert "CL=F" in geo_q
+    assert "CL=F" not in intc_q
+    assert "CL=F" not in geo_q
     assert intc_q != geo_q
-    assert len(geo_q) <= len("AMKR CL=F ") + 80
+    assert len(geo_q) <= len("AMKR QCOM TSLA INTC ") + 80
+
+
+def test_open_pool_keyword_bonus_uses_the_must_answer_list():
+    raw = [
+        _hit("INTC foundry shipment", "https://example.com/intc-note", 0.10, "INTC catalyst"),
+        _hit("ordinary session recap", "https://example.com/recap", 0.12, "indices mixed"),
+    ]
+    _, prescreened = rf._plan_reserved_and_open(raw, ["INTC"], GEO, NOW)
+    assert prescreened[0]["url"] == "https://example.com/intc-note"
+
+
+def test_job_builders_feed_the_one_must_answer_list():
+    from fetch_prices import PriceRow
+
+    amkr = PriceRow(
+        ticker="AMKR", display="AMKR", price=10.0, prev_close=9.0,
+        change_pct=6.0, week_change_pct=1.0, is_anomaly=True, unit="$", slot="pm",
+    )
+    quiet = PriceRow(
+        ticker="INTC", display="INTC", price=10.0, prev_close=10.0,
+        change_pct=1.0, week_change_pct=27.5, is_anomaly=False, unit="$", slot="pm",
+    )
+    anomaly_jobs = rf._anomaly_search_jobs([amkr], "pm", "2026-09-22", 1)
+    unexplained_jobs = rf._unexplained_move_search_jobs(
+        [quiet], {"INTC": (10.0, 27.5)}, set(), "pm", "2026-09-22", 1,
+    )
+    assert rf._must_answer_tickers(
+        anomaly_jobs + unexplained_jobs + [{"query": "Trump Takaichi"}]
+    ) == ["AMKR", "INTC"]
+
+
+def test_must_answer_list_ignores_category_fields():
+    jobs = [
+        {"_anomaly_ticker": "AMKR", "_anomaly_query": True, "_must_answer_ticker": "AMKR"},
+        {"_unexplained_move_ticker": "INTC", "_must_answer_ticker": "INTC"},
+        {"query": "rotation", "_rotation_ticker": "NVDA"},
+        {"_anomaly_ticker": "QCOM", "_unexplained_move_ticker": "TSLA"},
+    ]
+    assert rf._must_answer_tickers(jobs) == ["AMKR", "INTC"]
 
 
 def test_archive_labels_reserved_and_open_urls():
@@ -289,10 +349,14 @@ def run():
         test_open_pool_prescreen_cap_is_25,
         test_empty_must_answer_subset_reserves_nothing,
         test_unexplained_move_results_get_the_7day_fence_and_ticker_tag,
+        test_fence_reads_must_answer_list_not_category_flags,
         test_open_discovery_results_are_tagged_with_no_ticker,
         test_extract_batches_keep_ten_url_cap_and_cover_about_twenty,
         test_quiet_multiday_extract_query_names_intc,
         test_mixed_anomaly_and_unexplained_extract_queries,
+        test_open_pool_keyword_bonus_uses_the_must_answer_list,
+        test_job_builders_feed_the_one_must_answer_list,
+        test_must_answer_list_ignores_category_fields,
         test_archive_labels_reserved_and_open_urls,
     ]
     failed = []
