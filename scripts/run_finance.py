@@ -521,20 +521,59 @@ def _extract_url_batches(urls: list[str], batch_size: int = 10) -> list[list[str
     return [clean[i:i + batch_size] for i in range(0, len(clean), batch_size)]
 
 
+def _extract_intent_queries(
+    anomaly_tickers: list[str],
+    reserved_tickers: list[str],
+    geo_topics_str: str,
+) -> tuple[str, str]:
+    """Queries Tavily uses to rerank extracted chunks.
+
+    One query is applied to every URL in a call. Reserved pages therefore
+    get the must-answer tickers, including a quiet multi-day mover that is
+    not in the anomaly list. Open-pool pages keep the anomaly plus geopolitics
+    intent. The geo tail stays at 80 characters, matching the previous cap.
+    """
+    reserved_q = " ".join(dict.fromkeys(t for t in reserved_tickers if t))
+    open_q = (
+        " ".join(anomaly_tickers[:3])
+        + " " + (geo_topics_str or "")[:80]
+    ).strip()
+    return reserved_q, open_q
+
+
 def _extract_reserved_then_open(
     reserved_urls: list[str],
     open_urls: list[str],
-    query: str,
+    reserved_query: str,
+    open_query: str,
     budget: dict,
     extract_fn=None,
 ) -> list[dict]:
     """Extract reserved URLs first, then the open pool, 10 URLs per call."""
     extract_fn = extract_fn or tavily_extract
     extracted: list[dict] = []
-    batches = _extract_url_batches(reserved_urls) + _extract_url_batches(open_urls)
-    for batch in batches:
-        extracted.extend(extract_fn(batch, query, budget) or [])
+    for batch in _extract_url_batches(reserved_urls):
+        extracted.extend(extract_fn(batch, reserved_query, budget) or [])
+    for batch in _extract_url_batches(open_urls):
+        extracted.extend(extract_fn(batch, open_query, budget) or [])
     return extracted
+
+
+def _extract_search_results(
+    reserved_results: dict[str, dict],
+    open_urls: list[str],
+    anomaly_tickers: list[str],
+    geo_topics_str: str,
+    budget: dict,
+    extract_fn=None,
+) -> list[dict]:
+    reserved_urls = [r["url"] for r in reserved_results.values() if r.get("url")]
+    reserved_q, open_q = _extract_intent_queries(
+        anomaly_tickers, list(reserved_results), geo_topics_str,
+    )
+    return _extract_reserved_then_open(
+        reserved_urls, open_urls, reserved_q, open_q, budget, extract_fn,
+    )
 
 
 def score_and_filter(
@@ -1986,19 +2025,17 @@ def _main_body():
             top_n=OPEN_POOL_SEMANTIC_TOP_N,
         )
 
-        # Layer 3 — reserved batch, then open batches of 10. Each call checks budget.
+        # Layer 3 — reserved batch, then open batches of 10. Each call checks
+        # budget. The two batches use different rerank queries: Tavily applies
+        # one query to every URL in the call.
         reserved_urls = [r["url"] for r in reserved_results.values() if r.get("url")]
         reserved_url_set = set(reserved_urls)
         open_urls = [
             r["url"] for r in filtered
             if r.get("url") and r["url"] not in reserved_url_set
         ][:OPEN_POOL_SEMANTIC_TOP_N]
-        extract_q = (
-            " ".join(anomaly_ticker_syms[:3])
-            + " " + geo_topics_str[:80]
-        ).strip()
-        extract_results = _extract_reserved_then_open(
-            reserved_urls, open_urls, extract_q, budget,
+        extract_results = _extract_search_results(
+            reserved_results, open_urls, anomaly_ticker_syms, geo_topics_str, budget,
         )
 
         # split_phrases=False (scoring_utils.py): corroboration needs a narrower

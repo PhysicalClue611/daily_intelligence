@@ -205,10 +205,69 @@ def test_extract_batches_keep_ten_url_cap_and_cover_about_twenty():
         return [{"url": u} for u in urls]
 
     got = rf._extract_reserved_then_open(
-        reserved, opened, "INTC Japan", {"used": 0}, _fake_extract,
+        reserved, opened, "INTC", "Japan", {"used": 0}, _fake_extract,
     )
     assert calls == batches
     assert [r["url"] for r in got] == reserved + opened
+
+
+INTC_URL = "https://www.reuters.com/technology/intel-packaging-2026-09-22"
+GEO_URL = "https://www.reuters.com/world/geo-0"
+
+
+def _capture_extract(anomaly, reserved, geo, open_urls):
+    calls = []
+
+    def _fake(urls, query, budget):
+        calls.append((list(urls), query))
+        return [{"url": u, "query": query} for u in urls]
+
+    rf._extract_search_results(
+        reserved, open_urls, anomaly, geo, {"used": 0}, _fake,
+    )
+    return calls
+
+
+def test_quiet_multiday_extract_query_names_intc():
+    """2026-09-22 PM: INTC is reserved but not in the anomaly list."""
+    calls = _capture_extract(
+        [],
+        {"INTC": {"url": INTC_URL, "score": 0.25}},
+        "Japan Taiwan Iran",
+        [GEO_URL],
+    )
+    reserved_call = calls[0]
+    assert reserved_call[0] == [INTC_URL]
+    assert "INTC" in reserved_call[1]
+    assert "AMKR" not in reserved_call[1]
+
+
+def test_mixed_anomaly_and_unexplained_extract_queries():
+    """Anomaly pages keep the geo intent; the quiet mover is named on its own call."""
+    amkr_url = "https://www.ft.com/content/amkr-group-move"
+    calls = _capture_extract(
+        ["AMKR", "CL=F"],
+        {
+            "AMKR": {"url": amkr_url, "score": 0.22},
+            "INTC": {"url": INTC_URL, "score": 0.25},
+        },
+        "Japan Taiwan Iran Hormuz " + ("padding " * 30),
+        [GEO_URL],
+    )
+    def _query_for(url):
+        matched = [query for urls, query in calls if url in urls]
+        assert matched, url
+        return matched[0]
+
+    intc_q = _query_for(INTC_URL)
+    geo_q = _query_for(GEO_URL)
+    assert "INTC" in intc_q
+    assert "AMKR" in intc_q
+    assert "Japan" in geo_q
+    assert "AMKR" in geo_q
+    assert "CL=F" in geo_q
+    assert intc_q != geo_q
+    assert len(geo_q) <= len("AMKR CL=F ") + 80
 
 
 def test_archive_labels_reserved_and_open_urls():
@@ -232,6 +291,8 @@ def run():
         test_unexplained_move_results_get_the_7day_fence_and_ticker_tag,
         test_open_discovery_results_are_tagged_with_no_ticker,
         test_extract_batches_keep_ten_url_cap_and_cover_about_twenty,
+        test_quiet_multiday_extract_query_names_intc,
+        test_mixed_anomaly_and_unexplained_extract_queries,
         test_archive_labels_reserved_and_open_urls,
     ]
     failed = []
