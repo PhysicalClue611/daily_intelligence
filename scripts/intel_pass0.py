@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import intel_collect as collect
+from publication_window import _unexplained_publication_window
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -189,6 +190,38 @@ def _historical_prices(tickers: list[str], as_of: datetime):
     return rows
 
 
+def _historical_multiday_moves(price_rows: list, as_of: datetime, slot: str) -> dict:
+    """Rebuild the 3/5-session trigger from closes before the simulated run."""
+    import yfinance as yf
+    from fetch_prices import multiday_return_pct
+
+    report_date = as_of.astimezone(ET).date()
+    moves = {}
+    for row in price_rows:
+        if row.ticker == "AAOI":  # issue #80 excludes this observer from multi-day chasing
+            continue
+        d3, d5 = getattr(row, "change_3d_pct", None), getattr(row, "change_5d_pct", None)
+        if d3 is None or d5 is None:
+            try:
+                frame = yf.download(row.ticker, start=str(report_date - timedelta(days=24)),
+                                    end=str(report_date), interval="1d", progress=False, auto_adjust=True)
+                closes = frame["Close"]
+                if getattr(closes, "ndim", 1) > 1:
+                    closes = closes.iloc[:, 0]
+                closes = closes.dropna()
+                closes = closes[closes.index.date < report_date]
+                if slot == "am":
+                    numerator, before = float(closes.iloc[-1]), closes.iloc[:-1]
+                else:
+                    numerator, before = float(row.price), closes
+                d3 = multiday_return_pct(numerator, before, 3, allow_short=False)
+                d5 = multiday_return_pct(numerator, before, 5, allow_short=False)
+            except Exception as exc:
+                logger.warning("Replay multiday %s unavailable: %s", row.ticker, type(exc).__name__)
+        moves[row.ticker] = (d3, d5)
+    return moves
+
+
 def replay(date: str, slot: str, *, tickers: list[str] | None = None,
            archive_root: Path = collect.ROOT / "archives") -> tuple[dict, Path]:
     as_of = datetime.fromisoformat(f"{date} {'08:30' if slot == 'am' else '20:10'}").replace(tzinfo=ET)
@@ -202,7 +235,14 @@ def replay(date: str, slot: str, *, tickers: list[str] | None = None,
     price_source = "original_context_log" if prices else "daily_close_approximation"
     if not prices:
         prices = _historical_prices(candidates, as_of)
+    multiday_moves = _historical_multiday_moves(prices, as_of, slot)
+    window_starts = {}
+    for ticker, (d3, d5) in multiday_moves.items():
+        days = 5 if d5 is not None and abs(d5) >= 20 else (3 if d3 is not None and abs(d3) >= 15 else 0)
+        if days:
+            window_starts[ticker] = _unexplained_publication_window(date, days, slot)[0]
     ledger, path = build_ledger(wl, as_of, slot, price_rows=prices, replay=True,
+                                multiday_moves=multiday_moves, window_starts=window_starts,
                                 only_tickers=candidates, archive_root=archive_root)
     ledger["replay_price_source"] = price_source
     collect.archive_ledger(ledger, archive_root)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the 24 historical Pass 0 cases and enforce the collection recall gate.
 
-Only free Finnhub and Google News calls are used. No LLM, Tavily, report, email,
+Only free Finnhub, Google News, Guardian, and historical price calls are used. No LLM, Tavily, report, email,
 Telegram or Obsidian writes. Results go to a local JSON file for audit.
 """
 import argparse

@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,8 @@ ROOT = Path(__file__).resolve().parent.parent
 ETFS = {"QQQM", "VOO", "EWJ", "SGOL"}
 SUFFIXES = re.compile(r"\s+(?:Corp(?:oration)?|Inc(?:orporated)?|Holdings?|Ltd|Limited|PLC|Co)\.?$", re.I)
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DailyIntel/1.0)"}
+_GOOGLE_NEWS_LOCK = threading.Lock()
+_last_google_news_request = 0.0
 
 
 def _utc(value: datetime) -> datetime:
@@ -51,9 +54,17 @@ def item(title: str, summary: str, source: str, publisher_domain: str,
 
 
 def _request(url: str, *, params: dict | None = None, timeout: float = 8) -> httpx.Response:
+    global _last_google_news_request
     last = None
     for attempt in range(3):
         try:
+            if url == "https://news.google.com/rss/search":
+                # Pace actual HTTP attempts, including retries, across all callers.
+                with _GOOGLE_NEWS_LOCK:
+                    delay = 1.0 - (time.monotonic() - _last_google_news_request)
+                    if delay > 0:
+                        time.sleep(delay)
+                    _last_google_news_request = time.monotonic()
             response = httpx.get(url, params=params, headers=HEADERS, timeout=timeout, follow_redirects=True)
             response.raise_for_status()
             return response
@@ -69,7 +80,9 @@ def _request(url: str, *, params: dict | None = None, timeout: float = 8) -> htt
 def _word_match(text: str, word: str) -> bool:
     if not word.strip():
         return False
-    return re.search(r"\b" + re.escape(word.strip()) + r"\b", text,
+    boundary = (r"(?<![A-Za-z0-9])" + re.escape(word.strip()) + r"(?![A-Za-z0-9])"
+                if not re.search(r"[A-Za-z0-9]", word) else r"\b" + re.escape(word.strip()) + r"\b")
+    return re.search(boundary, text,
                      0 if len(word.strip()) <= 4 else re.I) is not None
 
 
@@ -307,27 +320,25 @@ def collect(tickers: list[str], aliases: dict[str, list[str]], held: set[str], w
     default_since = as_of - timedelta(hours=36 if slot == "am" else 24)
     since_by_ticker = {ticker: min(default_since, datetime.fromisoformat(moves[ticker]["window_start"]).replace(tzinfo=timezone.utc))
                        if moves.get(ticker, {}).get("window_start") else default_since for ticker in tickers}
+    pool_since = min(since_by_ticker.values(), default=default_since)
     errors = {ticker: [] for ticker in tickers}
     source = {ticker: {"finnhub": [], "google_news": [], "rss": [], "guardian": []} for ticker in tickers}
-    # Google News's unofficial RSS endpoint: one request per ticker, spaced >=1s.
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {(ticker, "finnhub"): pool.submit(fetch_finnhub, ticker, since_by_ticker[ticker], as_of, finnhub_key)
+    # Separate pools prevent a backlog of Finnhub jobs from bunching Google
+    # News requests. The actual HTTP attempts are paced in _request().
+    with ThreadPoolExecutor(max_workers=5) as finnhub_pool, ThreadPoolExecutor(max_workers=3) as google_pool:
+        futures = {(ticker, "finnhub"): finnhub_pool.submit(fetch_finnhub, ticker, since_by_ticker[ticker], as_of, finnhub_key)
                    for ticker in tickers}
-        for index, ticker in enumerate(tickers):
-            if index:
-                time.sleep(1)
-            futures[(ticker, "google_news")] = pool.submit(fetch_google_news, aliases[ticker][0], since_by_ticker[ticker], as_of)
+        for ticker in tickers:
+            futures[(ticker, "google_news")] = google_pool.submit(fetch_google_news, aliases[ticker][0], since_by_ticker[ticker], as_of)
         for (ticker, kind), future in futures.items():
             try:
                 source[ticker][kind] = future.result()
             except Exception as exc:
                 errors[ticker].append(f"{kind}: {type(exc).__name__}")
-    pooled, pool_errors = ([], ["rss: skipped in replay", "guardian: skipped in replay"]) if replay else (None, [])
-    if not replay:
-        pooled, rss_errors = fetch_rss_pool(default_since, as_of)
-        guardian, guardian_errors = fetch_guardian_pool(default_since, as_of, guardian_key)
-        pool_errors = rss_errors + guardian_errors
-        pooled.extend(guardian)
+    pooled, rss_errors = ([], ["rss: skipped in replay"]) if replay else fetch_rss_pool(pool_since, as_of)
+    guardian, guardian_errors = fetch_guardian_pool(pool_since, as_of, guardian_key)
+    pool_errors = rss_errors + guardian_errors
+    pooled.extend(guardian)
     macro_items = []
     for row in pooled:
         matches = match_entities(row["title"] + " " + row["summary"], aliases)
@@ -336,7 +347,7 @@ def collect(tickers: list[str], aliases: dict[str, list[str]], held: set[str], w
             for ticker in matches:
                 if _in_window(datetime.fromisoformat(row["published_at"]), since_by_ticker[ticker], as_of):
                     source[ticker][kind].append(row)
-        else:
+        elif _in_window(datetime.fromisoformat(row["published_at"]), default_since, as_of):
             macro_items.append(row)
     entities = [assemble_entity(ticker, aliases[ticker][0], aliases[ticker], ticker in held, weights.get(ticker),
                                 moves.get(ticker, {}), source[ticker], errors[ticker] + pool_errors, as_of)
