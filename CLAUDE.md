@@ -59,7 +59,7 @@ PR #95：Adanos/Reddit 只查非 ETF 个股（`_social_tickers()`），避免 `C
 
 2026-09-23 PM 报告在第一节半句处断掉，却按成功发出。根因是 `report_pass2`（`gpt-6-luna`/xhigh）的 `max_tokens` 仍为 16000，推理吃掉预算后 `finish_reason=length`；`llm_client.py` 只拒绝空正文，残缺正文照常返回，无重试、无 fallback、无告警。现在 `parse_json=False` 的截断正文一律视为失败：同模型重试、fallback，最后用代码摘要并发 TG 告警。`max_tokens` 提到 32000，HTTP 超时改为 `max(180, max_tokens // 50)`。`test_llm_config.py` 30/30。Obsidian 设计文档与开发日志待宿主机 session 同步（云端 session 无法访问 vault）。
 
-## 当前系统状态（2026-09-23，issue #82 / PR #83，已合并 `cf9cc33`）
+## 当前系统状态（2026-09-23，issue #82 / PR #83，已合并 `cf9cc33`）（**已被 PR #89 取代**：下述机制已从主流程移除，保留作历史）
 
 **Extract 名额预留**。异动最多 3 个、未解释大涨最多 2 个，各自预留一条 Extract URL，不参加开放池的 `score_and_filter`。开放池预筛 25、语义过滤约 15。`tavily_extract()` 仍是每次最多 10 个 URL；预留先发，开放池再分批。满载约 20 个 URL、最多 4cr。日上限仍是 25。
 
@@ -67,11 +67,11 @@ PR #95：Adanos/Reddit 只查非 ETF 个股（`_social_tickers()`），避免 `C
 
 测试 `scripts/test_issue82_extract_reservation.py` 15/15，外加 #72/#76/语义过滤/#80。未跑付费报告。不改 `telegram_commands.py`。issue #74 仍未改。
 
-## 当前系统状态（2026-09-23，issue #80 / PR #81，已合并 `9a05d3f`）
+## 当前系统状态（2026-09-23，issue #80 / PR #81，已合并 `9a05d3f`）（**已被 PR #89 取代**：下述机制已从主流程移除，保留作历史）
 
 **多日累计涨跌强制追因**。个股 3 个交易日绝对涨跌 ≥15%，或 5 日 ≥20%，即使当天不是单日异动，也生成一条写明真实幅度的 basic Tavily query。与当日异动 job 去重，每次最多 2 条，排在异动之后、Pass 1 之前。不持久化“是否已解释”。商品/FX/指数 ETF（`GC=F`、`CL=F`、`^TNX`、`USDCNY=X`、`USDJPY=X`、`DX-Y.NYB`、`QQQM`、`VOO`、`EWJ`）和观察标的 `AAOI` 不进入这层。发布日期由 job 自己设定：行情第一个交易日再往前 2 个自然日，到报告日；AM 锚点比 PM 同窗口多回一个交易日。日线不足 3 或 5 个交易日时该档为空、不触发；价格表 5 日涨跌仍可用最早收盘价。全市场无单日异动且无地缘命中时，只要这层有 query，运行不退出。`blacktomb42` 三处 REQUEST_CHANGES 已在 `0d2f110` 修入后 squash。不改 `telegram_commands.py`。issue #74 仍未改。
 
-## 当前系统状态（2026-09-22，issue #76 / PR #79）
+## 当前系统状态（2026-09-22，issue #76 / PR #79）（**已被 PR #89 取代**：下述机制已从主流程移除，保留作历史）
 
 **PM 异动追因覆盖 + Finnhub 公平截取**。AM/PM 现在都会为按 `|change_pct|` 排序的前 3 大异动生成独立 Tavily basic query；Finnhub 仅作为补充信息源，不再短路 PM 异动搜索。每个 anomaly job 带 `_anomaly_ticker`，Pass1 `{anomaly_tickers_note}` 与 issue #33 rotation 去重只使用实际生成 job 的 ticker 集合，而不是全量异动列表，因此第 4 名及以后异动仍可由 Pass1 或 rotation 搜索。
 
@@ -79,7 +79,7 @@ PR #95：Adanos/Reddit 只查非 ETF 个股（`_social_tickers()`），避免 `C
 
 ---
 
-## 当前系统状态（2026-09-21，issue #72 / PR #73，已合并 `4a54d39`）
+## 当前系统状态（2026-09-21，issue #72 / PR #73，已合并 `4a54d39`）（**已被 PR #89 取代**：下述机制已从主流程移除，保留作历史）
 
 **异动归因搜索精度（issue #72 / PR #73，squash `4a54d39`）**。2026-09-21 AM 正确把 INTC 盘前 +5.47% 标为异动，但 Pass 2 只能引用 Sonar 泛化归因；真实驱动是 Digitimes 首发的英特尔-友达 Micro LED 先进封装。三处缺口：RSS 无台湾半导体贸易媒体；异动 query 是 `"{tickers} stock news earnings"` 且多标的合并；INTC 被异动 / Pass1 / rotation 各查一次。
 
@@ -796,18 +796,18 @@ _Tavily: N/10_
 3. **OR flex fallback 首次实战验证**：观察 DeepSeek 再次不可达时日志是否出现 `OR flex fallback succeeded` 且报告正常生成；关注 flex 延迟是否在可接受范围（预期 <30s 单次调用）
 4. **追问流水线多 query 效果验证**：Step 1 新增 `search_queries` 双 query（事件角度 + 量化/技术角度），观察 Parallel.ai 是否能拿到期权 IV、历史财报模式等深层数据；对比单 query 和双 query 的内容质量差异
 5. **watchlist 调整**：根据实际报告质量增减 ticker 或地缘政治主题
-6. **gemma-4-31b-it 生产观察**（issue #53/PR #54，2026-07-23 起）：确认 `/tmp/daily_intelligence.log` 中 `Semantic filter tokens:` 行的 `reasoning=` 字段持续为 0（或至少不再吃满 `max_tokens`），`Semantic filter failed` 不再出现；观察新的 usage/finish_reason 日志是否足以在下次异常时免去外部付费调用排查
+6. **[已失效，PR #89]** 语义过滤 stage 已删除。 原文：**gemma-4-31b-it 生产观察**（issue #53/PR #54，2026-07-23 起）：确认 `/tmp/daily_intelligence.log` 中 `Semantic filter tokens:` 行的 `reasoning=` 字段持续为 0（或至少不再吃满 `max_tokens`），`Semantic filter failed` 不再出现；观察新的 usage/finish_reason 日志是否足以在下次异常时免去外部付费调用排查
 7. **`tg_gap_detect`/`tg_preprocess` 切换 gemma-4-31b-it 后的真实使用观察**（issue #11，2026-07-25 起）：`tg_gap_detect` 此前疑似从未真正生效过（deepseek 隐藏推理烧光60-token预算），观察 TG 追问日志里 `Step 4 tokens` 前是否开始出现真实的"补搜第3条 query"命中；`tg_preprocess` 观察日常加/删 ticker、地缘关键词等指令是否不再出现分类错误或截断（此前 deepseek 在简单指令上出现过 3 次调用 3 种错误结果）
 8. **`llm_config.json` 实际使用观察**（issue #11，2026-07-25 起）：目前该文件内容与 DEFAULTS 完全一致（零覆盖），观察是否有实际调整需求（如某 stage 换模型、调预算）；每次编辑后确认 `/tmp/daily_intelligence.log` 或 `/tmp/finance_telegram.log` 出现对应的 `LLM config override:` 日志，验证改动真的生效
-9. **`report_pass1`/`am_calibration` 切 gemma-4-31b-it 后的生产观察**（issue #59/PR #61，2026-08-04 起）：模型选型本身已用真实 prompt 验证完成（6/6 通过，见上方状态章节），不需要再跑付费验证；观察项改为 `grep "LLM tokens \[report_pass1/google/gemma-4-31b-it\]\|LLM tokens \[am_calibration/google/gemma-4-31b-it\]" /tmp/daily_intelligence.log`，确认 `reasoning=0`、`finish_reason=stop` 在真实 AM/PM 报告运行中持续成立，不再出现 `finish_reason=length` 告警
+9. **[已失效，PR #89]** `report_pass1` 已删除，仅 `am_calibration` 的观察仍有效。 原文：**`report_pass1`/`am_calibration` 切 gemma-4-31b-it 后的生产观察**（issue #59/PR #61，2026-08-04 起）：模型选型本身已用真实 prompt 验证完成（6/6 通过，见上方状态章节），不需要再跑付费验证；观察项改为 `grep "LLM tokens \[report_pass1/google/gemma-4-31b-it\]\|LLM tokens \[am_calibration/google/gemma-4-31b-it\]" /tmp/daily_intelligence.log`，确认 `reasoning=0`、`finish_reason=stop` 在真实 AM/PM 报告运行中持续成立，不再出现 `finish_reason=length` 告警
 10. **issue #65 残余上涨 / 24h 日切**（2026-08-13 起，主泄漏已修）：PID 31487 13h 58MB、约 2MB/h。确认次日 ~03:34 后 PID 换新、日志有 `Recycling telegram bot process after 24h uptime`；若日切失败且斜率不减速，两周可到 ~700MB
 11. **issue #60/PR #62 生产观察**（2026-08-05 起，已实施+已合并，见上方状态章节）：`tg_followup`/`report_pass2` 均已切至 `gpt-5.6-luna`+`reasoning.effort=high`，2026-08-04 当晚已用真实生产双跑验证过一次（质量优于旧模型，见上方状态章节完整记录）；后续观察 `grep "LLM tokens \[report_pass2/openai/gpt-5.6-luna\]\|Step 4 tokens \[openai/gpt-5.6-luna\]" /tmp/daily_intelligence.log /tmp/finance_telegram.log`，确认 `finish_reason=stop` 持续成立、`provider=OpenAI` 稳定路由（硬 pin 不允许 fallback，需要留意是否出现非429 4xx 导致的静默降级到 Pass1-only report_md，PR #62 review 已识别此风险并记入 `llm_client.py` 注释，未做代码修复）
 12. **真实成本核算**（issue #60 遗留缺口）：`gpt-5.6-luna` 与 `deepseek-v4-pro`/`deepseek-v4-flash` 的实际生产量级成本差异尚未核算，观察一段时间后可用 OR 账单核实
 13. **issue #67/PR #68 生产观察**（2026-08-13 起，主路径已并入 #63 的 quiet logger）：下次 AM/PM 后 `grep -E "possibly delisted|yfinance daily bulk" /tmp/daily_intelligence.log`——期望不再出现 yfinance `possibly delisted` ERROR；bulk 抖时可见 `yfinance daily bulk incomplete` WARNING（及可选 `retry recovered` INFO），报告仍发出。52 周路径仍走同一套 `_quiet_yfinance_logs()`
-14. **issue #72/#76 生产观察**（2026-09-21 起）：Digitimes 触发命中率；AM/PM 前 3 大异动各一条、Finnhub 仅补充、rotation 只与实际 anomaly job ticker 去重后 Tavily 日消耗；`anomaly fence: dropped` 与 `Issue #33 rotation skipped` 日志。
-15. **issue #74**（未实现）：rotation 30 天材料与异动证据同池，污染【价格异动】归因。改善方向见该 issue，不在 #72 / #80 范围。
-16. **issue #80 生产观察**（2026-09-23 起）：安静日是否仍为 3 日 ≥15% 或 5 日 ≥20% 的个股发出追因；日志 `Issue #80 unexplained-move queries`；Tavily 日消耗是否仍留在 25cr 内。AAOI 不应出现在这层。
-17. **issue #82 生产观察**（2026-09-23 起）：日志 `Issue #82 reserved extract slots` 是否含未解释大涨 ticker；Extract 存档里该 URL 标为预留；日消耗是否仍在 25cr 内。
+14. **[已失效，PR #89]** 异动 query、7 天围栏、rotation 已删除；Digitimes 仍在 RSS 源里。 原文：**issue #72/#76 生产观察**（2026-09-21 起）：Digitimes 触发命中率；AM/PM 前 3 大异动各一条、Finnhub 仅补充、rotation 只与实际 anomaly job ticker 去重后 Tavily 日消耗；`anomaly fence: dropped` 与 `Issue #33 rotation skipped` 日志。
+15. **[已失效，PR #89]** rotation 已删除，问题前提不再存在，issue #74 仍 OPEN 待关闭。 原文：**issue #74**（未实现）：rotation 30 天材料与异动证据同池，污染【价格异动】归因。改善方向见该 issue，不在 #72 / #80 范围。
+16. **[已失效，PR #89]** 多日追因 query 已删除；3/5 日阈值现在只用于代码 Pass 1 选标的。 原文：**issue #80 生产观察**（2026-09-23 起）：安静日是否仍为 3 日 ≥15% 或 5 日 ≥20% 的个股发出追因；日志 `Issue #80 unexplained-move queries`；Tavily 日消耗是否仍留在 25cr 内。AAOI 不应出现在这层。
+17. **[已失效，PR #89]** 预留名额与开放池已删除，Extract 规则见第 18-20 条。 原文：**issue #82 生产观察**（2026-09-23 起）：日志 `Issue #82 reserved extract slots` 是否含未解释大涨 ticker；Extract 存档里该 URL 标为预留；日消耗是否仍在 25cr 内。
 18. **report_pass2 xhigh 推理峰值**（PR #94，2026-09-24 起）：`grep "LLM tokens \[report_pass2" /tmp/daily_intelligence.log` 看 `reasoning=`，若超过约 25000 就重新评估 `max_tokens=32000`（目前只有 09-23 补跑一个样本：reasoning 10358，被截断那次为 15781/16000）
 19. **直链解析耗时**（PR #96）：`Deepen direct leads` 日志里各标的的 `Finnhub redirects resolved a/b` 与耗时，用来决定要不要做并发解析或单标的解析上限（09-23 PM 串行 HEAD 静默 76s）
 20. **Extract 补齐命中率**（PR #96）：`Deepen Extract top-up` 日志出现频率与补入条数，以及快照 `extract_topup_count`/`extract_success_count`
