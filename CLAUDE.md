@@ -29,13 +29,13 @@ PR #88 已合并；独立回放 22/24，零 LLM 调用。合并后的影子观�
 
 ---
 
-## 开发中：issue #87 PR #89（Pass 2 去套话 + PR3 切换，尚未合并）
+## issue #87 PR #89（Pass 2 去套话 + PR3 切换，已合并 `65816d9`）
 
 owner 已要求把原规划 PR3 并入 #89。主流程在价格与多日涨跌计算后调用 `intel_pass0.build_intel_snapshot(archive=False)` 收集免费信源；收集异常时生成带错误覆盖记录的应急情报快照。只有标的异动/新闻或命中地缘话题才出报告。`intel_deepen.py` 用代码选绝对涨跌最大的最多 5 个异动标的，每标的挑最多 2 条不同域名且标题命中别名的 direct/Finnhub 302 链接做 Extract；没有可用链接才搜索 `Why is {公司名} stock {up|down}`，最多 3 次 basic 搜索、10 个 Extract URL，合计最多 5 Tavily credit。SerpApi fallback 保留。正文片段和覆盖记录写回同一个原子情报快照存档；停止新写 `*-extract.md`。
 
 `intel_render.py` 把异动标的最多 25 条（标题、来源、时间、摘要、此前已报道标记、正文与覆盖）、无异动持仓最多 8 个标题、无异动观察标的一行、地缘话题最多 8 条/话题且总数最多 40 条送入 Pass 2。Pass 2 总在有报告材料时运行，直接对情报快照归因；三状态为已知原因、线索待核实、未找到原因（附覆盖）；检索失败写“未能完成检索”。无文本/异常时发送代码渲染情报快照摘要并发 TG 告警。SAS 候选抽取读相同情报快照段落，JSON 输出格式不变；运行状态消息按情报快照来源覆盖和深挖结果显示。
 
-近 5 个 NYSE 交易日的历史报告按异动/多日阈值标的抽取实体段落，跨月读取、同档只取首份、排除当前档，每标的最多 600 字符，提示只写新增事实。FRED 档位、15% 仓位跨越和 52 周新高/低按上次成功报告的情报快照 `context_state` 比较，仅变化时注入。社交舆情只对报告出现的标的每个注入一行。旧 LLM Pass 1、语义过滤、开放池、预留名额、异动/多日/轮询搜索 job、Brave 主流程调用及旧 RSS 分桶已移除，`llm_config.json` 删除旧两个 stage。Layer A 私有文件的旧“结论必须可操作”句运行时精确替换，其余个人原则保留。未运行付费报告，也未改 Obsidian 或部署；PR 状态以 GitHub 为准。
+近 5 个 NYSE 交易日的历史报告按异动/多日阈值标的抽取实体段落，跨月读取、同档只取首份、排除当前档，每标的最多 600 字符，提示只写新增事实。FRED 档位、15% 仓位跨越和 52 周新高/低按上次成功报告的情报快照 `context_state` 比较，仅变化时注入。社交舆情只对报告出现的标的每个注入一行。旧 LLM Pass 1、语义过滤、开放池、预留名额、异动/多日/轮询搜索 job、Brave 主流程调用及旧 RSS 分桶已移除，`llm_config.json` 删除旧两个 stage。Layer A 私有文件的旧“结论必须可操作”句运行时精确替换，其余个人原则保留。之后的后续修正见 2026-09-23 晚 / 09-24 状态段（PR #94–#97）。
 ---
 
 ## [强制] "打扫战场"必须包含设计文档更新
@@ -520,14 +520,14 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
 
 ---
 
-## 运行逻辑（run_finance.py；PR #89 待合并）
+## 运行逻辑（run_finance.py）
 
 ```
 0.  FINANCE_FORCE_DATE / FINANCE_FORCE_SLOT / FINANCE_FORCE_RUN 覆盖，NYSE 交易日与月度报告同档防重检查
 1.  读取 watchlist、预算和价格；AM 使用盘前价，PM 使用今日收盘和盘后价，并计算单日及 3/5 交易日涨跌
 2.  免费 Pass 0：intel_pass0.build_intel_snapshot(archive=False) 按标的收集 Finnhub、Google News、RSS、Guardian；多日异动扩大各来源发表窗口；收集整体失败时保留价格与窗口，生成带错误记录的应急情报快照
 3.  无标的异动、标的新闻或命中地缘话题则退出；否则读取 KB，收集 Sonar 宏观、社交舆情和 FRED 流动性背景
-4.  代码 Pass 1：intel_deepen.py 按触发的绝对涨跌选最多 5 个标的，优先每标的 2 个不同落地域名的直接文章/Finnhub 302 链接；无链接才按同一发表窗口搜索。最多 3 次 basic 搜索、10 个 Extract URL（最多 2cr），总 Tavily 预算最多 5cr，SerpApi 可作回退
+4.  代码 Pass 1：intel_deepen.py 按触发的绝对涨跌选最多 5 个标的，优先每标的 2 个不同落地域名的直接文章/Finnhub 302 链接；无链接才按同一发表窗口搜索（`max_results=3`，前 2 条进首轮 Extract，第 3 条留作补齐）。首轮后按涨跌强弱把 Extract URL 补到下一个 5 的倍数（最多 10）：先补同标的下一条不同域名直链，再补搜索第 3 条；补齐 URL 排末尾，预算不足先截（PR #96）。最多 3 次 basic 搜索 + 1 次 Extract（≤10 URL，2cr），单次运行合计 ≤5cr，SerpApi 可作回退
 5.  将深挖正文、来源覆盖、此前已报道标记写回情报快照并存档；按异动/安静持仓/地缘话题的数量上限渲染 Pass 2 输入，加入最近 5 个既往交易日报告与发生变化的背景信号
 6.  Pass 2 直接按情报快照归因，输出 Markdown；空响应或异常时改用代码渲染的情报快照摘要并发 TG 告警。SAS 候选提取仍为独立 JSON 调用，PM 校准仍运行
 7.  写入月度 Obsidian 报告、情报快照上下文和 MemPalace；发送邮件、Telegram 报告及独立运行状态消息
@@ -579,7 +579,7 @@ OBSIDIAN_PATH="~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview
 
 - 上限：25 credits/日，`finance_tavily_budget.json` 按 ET 日期自动重置（从 10→15→20→25 逐步调整）
 - Search：basic=1cr，advanced=2cr（已弃用，全部改 basic）；Extract：**5 URLs = 1 credit**（`math.ceil(n/5)`），单次最多 10 URLs = 2cr
-- 主报告：AM/PM 全 basic search，加上预留 Extract 和开放池分批，Extract 最多约 4cr。日上限仍是 25。某一批余额不够就跳过该批，预留批次先发
+- 主报告：每次运行最多 3 次 basic 搜索（只对没有直链的异动标的，`max_results=3`）+ 一次 Extract（≤10 个 URL，2cr，按 `ceil(n/5)` 补齐到同一 credit 档），合计 ≤5cr。日上限 25。Extract 前按剩余额度截断 URL 列表，补齐的 URL 最先被截掉
 - TG 追问不消耗 Tavily（Sonar 内建搜索）
 - Tavily 断连自动 fallback SerpApi（250次/月）；两者均耗尽则跳过搜索继续生成基础报告
 
@@ -785,6 +785,7 @@ _Tavily: N/10_
 92. 主路径 `yf.download` 8d/2d 假 delisted ERROR 刷屏（#63 只盖了 52 周）；重试不可整表覆盖、不可把坍缩单列认成别的 ticker → 详见 `docs/PITFALLS.md#92`
 93. 7 天围栏若打在 pooled `score_and_filter` 上会把 issue #33 rotation 的 30 天窗砍成 7 天；年龄必须用 `now_et` 不能用墙钟 → 详见 `docs/PITFALLS.md#93`
 94. 「必须解释的 ticker」若在围栏、keyword bonus、Extract query 各拼一次，新增一类 ticker 会漏改 → 详见 `docs/PITFALLS.md#94`
+95. `call_llm()` 免 JSON 路径只拒绝空正文、接受 length 截断的非空正文；推理提档（xhigh）而 `max_tokens` 不跟着加，残缺报告被当成功发出；`max_tokens` 翻倍时 HTTP 超时也要放宽 → 详见 `docs/PITFALLS.md#95`
 
 ---
 
@@ -807,6 +808,11 @@ _Tavily: N/10_
 15. **issue #74**（未实现）：rotation 30 天材料与异动证据同池，污染【价格异动】归因。改善方向见该 issue，不在 #72 / #80 范围。
 16. **issue #80 生产观察**（2026-09-23 起）：安静日是否仍为 3 日 ≥15% 或 5 日 ≥20% 的个股发出追因；日志 `Issue #80 unexplained-move queries`；Tavily 日消耗是否仍留在 25cr 内。AAOI 不应出现在这层。
 17. **issue #82 生产观察**（2026-09-23 起）：日志 `Issue #82 reserved extract slots` 是否含未解释大涨 ticker；Extract 存档里该 URL 标为预留；日消耗是否仍在 25cr 内。
+18. **report_pass2 xhigh 推理峰值**（PR #94，2026-09-24 起）：`grep "LLM tokens \[report_pass2" /tmp/daily_intelligence.log` 看 `reasoning=`，若超过约 25000 就重新评估 `max_tokens=32000`（目前只有 09-23 补跑一个样本：reasoning 10358，被截断那次为 15781/16000）
+19. **直链解析耗时**（PR #96）：`Deepen direct leads` 日志里各标的的 `Finnhub redirects resolved a/b` 与耗时，用来决定要不要做并发解析或单标的解析上限（09-23 PM 串行 HEAD 静默 76s）
+20. **Extract 补齐命中率**（PR #96）：`Deepen Extract top-up` 日志出现频率与补入条数，以及快照 `extract_topup_count`/`extract_success_count`
+21. **供给事件例外效果**（PR #97）：解禁、增发/ATM、配售、指数调整是否在生效日前后都出现在报告里；生效日当天无新闻时是否漏掉，据此评估要不要做代码按日期注入的“供给事件日历”
+22. **SAS 候选命中频率**（#89 之后）：`SAS候选证据日志.md` 的新增频率；#89 后 SAS 抽取输入只剩情报快照（不含 Sonar），据此决定是否把 Sonar 加回 SAS 输入
 
 ---
 
