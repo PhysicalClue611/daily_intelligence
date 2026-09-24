@@ -1437,7 +1437,7 @@ Pass 2 提示词在“无进展就省略”规则后加例外：已排期的供�
 - `sas_candidate_extract` 的 `completion=13` 即 `{"sas_candidates": []}`，是正常空结果。AAOI 是观察标的，按规则不进 SAS；解禁、增发这类短期供给事件属于正文职责，不是 SAS 的职责。
 - 信息量偏少除截断外，#89 本身有结构性原因：输入收窄（无开放池，地缘话题无全文）且提示词要求“无进展就省略”。需观察几天正常报告后单独评估，#94–#97 均未处理。
 
-## 变更记录追加：2026-09-24 — issue #99 首日复盘（尚未合并）
+## 变更记录追加：2026-09-24 — issue #99 / #101（PR #102，已合并 `a9b6991`）
 
 2026-09-23 AM 把 QQQM 19% 写成应修剪到 12–13%。15% 线针对个股 Alpha 层；`changed_background()` 对全部权重判断，且第一次运行没有上一次状态时把 `old is None` 当成跨越。52 周新高/低同样会在没有上次记录时注入。
 
@@ -1454,4 +1454,4 @@ Pass 2 提示词在“无进展就省略”规则后加例外：已排期的供�
 
 设计里的开放点：降到 high 之后若仍截断，按设计默认直接 fallback，没有再降到 medium。测试 `scripts/test_issue99_pass2_review.py`。未跑付费报告。Obsidian 文档留给合并后的验证方。
 
-同一 PR 包含 issue #101。TG 的 `_section_add`、`_section_remove`、`_geo_add`、`_geo_remove` 原先用 `(\n## |\Z)` 当边界，写回时把下一节的 `\n## ` 吃掉。收件人还被 `", "` 拼成一行，`load_watchlist()` 会把整行当成一个地址。`_write_watchlist()` 直接 `write_text`。现在四处共用前瞻边界 `(?=\n## |\Z)`；收件人一行一条；个股、商品、汇率仍是逗号一行；地缘关键词仍是 `话题: 词1, 词2`。写回先序列化，空正文不覆盖非空文件，临时文件 `os.replace` 后再读回核对。`load_watchlist()` 的解析没改。测试 `scripts/test_issue101_watchlist_edit.py`，只用临时文件和字符串。合并后需要重启 `com.daily-intel.finance.telegram`。
+同一 PR 包含 issue #101。TG 的 `_section_add`、`_section_remove`、`_geo_add`、`_geo_remove` 原先用 `(\n## |\Z)` 当边界，写回时把下一节的 `\n## ` 吃掉。收件人还被 `", "` 拼成一行，`load_watchlist()` 会把整行当成一个地址。`_write_watchlist()` 直接 `write_text`。现在四处共用前瞻边界 `(?=\n## |\Z)`；收件人一行一条；个股、商品、汇率仍是逗号一行；地缘关键词仍是 `话题: 词1, 词2`。写回先序列化，空正文不覆盖非空文件，临时文件 `os.replace` 后再读回核对。`load_watchlist()` 的解析没改。测试 `scripts/test_issue101_watchlist_edit.py`，只用临时文件和字符串。`com.daily-intel.finance.telegram` 已于 2026-09-24 06:21 ET 重启。
