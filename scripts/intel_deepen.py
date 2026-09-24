@@ -64,7 +64,7 @@ def resolve_article_url(url: str) -> str | None:
 def _direct_leads(entity: dict, limit: int = 2, cache: dict | None = None) -> list[tuple[str, dict]]:
     """Up to `limit` title-matching article links with distinct landing domains.
 
-    Finnhub 302 links are resolved one HEAD at a time; `cache` keeps results
+    Finnhub 302 links are resolved one request at a time (headers-only GET); `cache` keeps results
     so the Extract top-up pass does not resolve the same link twice. Each call
     logs how many redirects it resolved and how long it took (2026-09-23 PM
     spent 76s here with no log line)."""
