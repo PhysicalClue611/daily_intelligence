@@ -714,10 +714,10 @@ def build_status_message(today_et: str, slot_label: str, budget: dict,
         lines.append(f"SerpApi本月已用: {serpapi_budget['used']}/{SERPAPI_MONTHLY_LIMIT}（本次用 {serpapi_used_run}）")
     entities = intel_snapshot.get("entities", [])
     totals = {key: sum((e.get("coverage") or {}).get(key, 0) for e in entities)
-              for key in ("finnhub", "google_news", "rss", "guardian")}
+              for key in ("finnhub", "google_news", "rss", "guardian", "sec_8k", "yahoo_rss")}
     errors = list(dict.fromkeys(err for e in entities for err in (e.get("coverage") or {}).get("errors", [])))
     lines += ["", "情报来源:",
-              f"- Pass 0: {len(entities)} 标的；Finnhub {totals['finnhub']}、Google News {totals['google_news']}、RSS {totals['rss']}、Guardian {totals['guardian']}",
+              f"- Pass 0: {len(entities)} 标的；Finnhub {totals['finnhub']}、Google News {totals['google_news']}、RSS {totals['rss']}、Guardian {totals['guardian']}、SEC 8-K {totals['sec_8k']}、Yahoo RSS {totals['yahoo_rss']}",
               f"- 来源错误: {'；'.join(errors[:5]) if errors else '无'}",
               f"- Pass 1（代码）: 搜索 {intel_snapshot.get('search_count', 0)}，Extract {intel_snapshot.get('extract_success_count', 0)}/{intel_snapshot.get('extract_url_count', 0)} URL"]
     for ticker, status in (intel_snapshot.get("deepen_status") or {}).items():

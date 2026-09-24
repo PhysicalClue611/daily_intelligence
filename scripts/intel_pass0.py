@@ -82,8 +82,9 @@ def render_summary(intel_snapshot: dict) -> str:
         coverage = entity["coverage"]
         lines.append(f"- {entity['ticker']}: {len(entity['items'])} items, "
                      f"move={entity['move']}; "
-                     f"Finnhub={coverage['finnhub']}, Google News={coverage['google_news']}, "
-                     f"RSS={coverage['rss']}, Guardian={coverage['guardian']}; "
+                     f"Finnhub={coverage.get('finnhub', 0)}, Google News={coverage.get('google_news', 0)}, "
+                     f"RSS={coverage.get('rss', 0)}, Guardian={coverage.get('guardian', 0)}, "
+                     f"SEC 8-K={coverage.get('sec_8k', 0)}, Yahoo RSS={coverage.get('yahoo_rss', 0)}; "
                      f"errors={'; '.join(coverage['errors']) or 'none'}")
     lines.append(f"\nMacro items: {len(intel_snapshot['macro_digest']['items'])}")
     return "\n".join(lines) + "\n"

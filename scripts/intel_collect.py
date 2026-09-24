@@ -24,14 +24,29 @@ import httpx
 from fetch_news import RSS_FEEDS, NewsItem
 from intel_sources import FINNHUB_BASE
 from scoring_utils import _title_tokens_for_dedup, _token_jaccard
+from sec_edgar_utils import sec_user_agent
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
 ETFS = {"QQQM", "VOO", "EWJ", "SGOL"}
 SUFFIXES = re.compile(r"\s+(?:Corp(?:oration)?|Inc(?:orporated)?|Holdings?|Ltd|Limited|PLC|Co)\.?$", re.I)
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DailyIntel/1.0)"}
+YAHOO_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+}
+ENTITY_SOURCES = ("finnhub", "google_news", "rss", "guardian", "sec_8k", "yahoo_rss")
+SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_ATOM_URL = "https://www.sec.gov/cgi-bin/browse-edgar"
+YAHOO_RSS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline"
+CIK_CACHE = ROOT / "cik_cache.json"
 _GOOGLE_NEWS_LOCK = threading.Lock()
 _last_google_news_request = 0.0
+_SEC_LOCK = threading.Lock()
+_last_sec_request = 0.0
 
 
 def _utc(value: datetime) -> datetime:
@@ -53,7 +68,23 @@ def item(title: str, summary: str, source: str, publisher_domain: str,
             "url": url, "url_kind": url_kind, "published_at": _utc(published_at).isoformat()}
 
 
-def _request(url: str, *, params: dict | None = None, timeout: float = 8) -> httpx.Response:
+def _pace_sec() -> None:
+    """SEC fair-access cap is 10 requests/second, including retries."""
+    global _last_sec_request
+    with _SEC_LOCK:
+        wait = 0.12 - (time.monotonic() - _last_sec_request)
+        if _last_sec_request and wait > 0:
+            time.sleep(wait)
+        _last_sec_request = time.monotonic()
+
+
+def _sec_headers() -> dict:
+    return {"User-Agent": sec_user_agent(),
+            "Accept": "application/atom+xml, application/json;q=0.9, */*;q=0.8"}
+
+
+def _request(url: str, *, params: dict | None = None, timeout: float = 8,
+             headers: dict | None = None) -> httpx.Response:
     global _last_google_news_request
     last = None
     for attempt in range(3):
@@ -65,7 +96,9 @@ def _request(url: str, *, params: dict | None = None, timeout: float = 8) -> htt
                     if delay > 0:
                         time.sleep(delay)
                     _last_google_news_request = time.monotonic()
-            response = httpx.get(url, params=params, headers=HEADERS, timeout=timeout, follow_redirects=True)
+            if "sec.gov" in url:
+                _pace_sec()
+            response = httpx.get(url, params=params, headers=headers or HEADERS, timeout=timeout, follow_redirects=True)
             response.raise_for_status()
             return response
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
@@ -189,6 +222,105 @@ def fetch_google_news(name: str, since: datetime, as_of: datetime) -> list[dict]
     return out
 
 
+def resolve_ciks(tickers: list[str], cache_path: Path = CIK_CACHE) -> dict[str, str]:
+    """Ticker to 10-digit CIK. One SEC company_tickers download fills the cache."""
+    try:
+        cache = json.loads(Path(cache_path).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
+    missing = [ticker for ticker in tickers if ticker not in cache]
+    if missing:
+        data = _request(SEC_TICKERS_URL, headers=_sec_headers(), timeout=30).json()
+        rows = data.values() if isinstance(data, dict) else data
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("ticker") or "").upper()
+            if not symbol or symbol in cache:
+                continue
+            try:
+                cache[symbol] = f"{int(row['cik_str']):010d}"
+            except (KeyError, TypeError, ValueError):
+                continue
+        for ticker in missing:
+            cache.setdefault(ticker, "")
+        _atomic_json(Path(cache_path), cache)
+    return {ticker: str(cache.get(ticker) or "") for ticker in tickers}
+
+
+def _entry_time(entry) -> datetime | None:
+    raw = entry.get("updated") or entry.get("published")
+    if raw:
+        try:
+            return _utc(datetime.fromisoformat(str(raw)))
+        except ValueError:
+            parsed = _published(entry)
+            if parsed:
+                return parsed
+    filed = str(entry.get("filing-date") or "")
+    if filed:
+        try:
+            return datetime.fromisoformat(filed).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def _form_items(entry) -> list[str]:
+    text = " ".join(str(entry.get(key) or "") for key in ("summary", "items-desc"))
+    return list(dict.fromkeys(re.findall(r"\d+\.\d+", text)))
+
+
+def _accession(entry) -> str:
+    acc = str(entry.get("accession-number") or "")
+    if re.fullmatch(r"\d{10}-\d{2}-\d{6}", acc):
+        return acc
+    match = re.search(r"\d{10}-\d{2}-\d{6}", str(entry.get("summary") or ""))
+    return match.group(0) if match else ""
+
+
+def fetch_sec_8k(ticker: str, since: datetime, as_of: datetime, cik: str) -> list[dict]:
+    if not cik:
+        raise LookupError(f"CIK not found for {ticker}")
+    # dateb one day past as_of keeps a same-day filing on the page; the window drops the rest.
+    response = _request(SEC_ATOM_URL, params={
+        "action": "getcompany", "CIK": cik, "type": "8-K", "count": "40", "output": "atom",
+        "dateb": (_utc(as_of) + timedelta(days=1)).strftime("%Y%m%d"),
+    }, headers=_sec_headers(), timeout=20)
+    out = []
+    for entry in feedparser.parse(response.content).entries:
+        form = str(entry.get("filing-type") or entry.get("title") or "")
+        if "8-K" not in form:
+            continue
+        published = _entry_time(entry)
+        if not published or not _in_window(published, since, as_of):
+            continue
+        nums = _form_items(entry)
+        acc = _accession(entry)
+        title = ("8-K Item " + ", ".join(nums)) if nums else "8-K"
+        if acc:
+            title = f"{title} {acc}"
+        link = entry.get("link") or entry.get("filing-href") or ""
+        out.append(item(title, entry.get("summary", ""), "SEC 8-K", "sec.gov", link, "sec_filing", published))
+    return out
+
+
+def fetch_yahoo_rss(ticker: str, since: datetime, as_of: datetime) -> list[dict]:
+    response = _request(YAHOO_RSS_URL, params={"s": ticker, "region": "US", "lang": "en-US"},
+                        headers=YAHOO_HEADERS, timeout=12)
+    out = []
+    for entry in feedparser.parse(response.content).entries:
+        published = _published(entry)
+        if not published or not _in_window(published, since, as_of) or not entry.get("title"):
+            continue
+        link = entry.get("link", "")
+        out.append(item(entry["title"], entry.get("summary", ""), "Yahoo RSS",
+                        _domain(link), link, "direct", published))
+    return out
+
+
 def fetch_rss_pool(since: datetime, as_of: datetime) -> tuple[list[dict], list[str]]:
     def one(source: str, url: str) -> tuple[list[dict], str | None]:
         try:
@@ -268,7 +400,7 @@ def assemble_entity(ticker: str, name: str, aliases: list[str], held: bool, weig
     error_list = [f"{key}: {value}" for key, value in errors.items()] if isinstance(errors, dict) else list(errors)
     coverage = {source: len([row for row in source_items.get(source, [])
                              if datetime.fromisoformat(row["published_at"]) <= _utc(as_of)])
-                for source in ("finnhub", "google_news", "rss", "guardian")}
+                for source in ENTITY_SOURCES}
     coverage["errors"] = error_list
     rows = [row for group in source_items.values() for row in group
             if datetime.fromisoformat(row["published_at"]) <= _utc(as_of)]
@@ -329,22 +461,66 @@ def collect(tickers: list[str], aliases: dict[str, list[str]], held: set[str], w
                        if moves.get(ticker, {}).get("window_start") else default_since for ticker in tickers}
     pool_since = min(since_by_ticker.values(), default=default_since)
     errors = {ticker: [] for ticker in tickers}
-    source = {ticker: {"finnhub": [], "google_news": [], "rss": [], "guardian": []} for ticker in tickers}
-    # Separate pools prevent a backlog of Finnhub jobs from bunching Google
-    # News requests. The actual HTTP attempts are paced in _request().
-    with ThreadPoolExecutor(max_workers=5) as finnhub_pool, ThreadPoolExecutor(max_workers=3) as google_pool:
-        futures = {(ticker, "finnhub"): finnhub_pool.submit(fetch_finnhub, ticker, since_by_ticker[ticker], as_of, finnhub_key)
-                   for ticker in tickers}
+    source = {ticker: {name: [] for name in ENTITY_SOURCES} for ticker in tickers}
+    spans = {"sec_8k": [], "yahoo_rss": []}
+    span_lock = threading.Lock()
+
+    def timed(name, fn, *args):
+        started = time.monotonic()
+        try:
+            return fn(*args)
+        finally:
+            with span_lock:
+                spans[name].append((started, time.monotonic()))
+
+    try:
+        ciks = timed("sec_8k", resolve_ciks, tickers) if tickers else {}
+    except Exception as exc:
+        ciks = {}
+        message = f"sec_8k: {type(exc).__name__}"
         for ticker in tickers:
-            futures[(ticker, "google_news")] = google_pool.submit(fetch_google_news, aliases[ticker][0], since_by_ticker[ticker], as_of)
+            errors[ticker].append(message)
+    # Separate pools keep a Finnhub backlog from bunching Google News.
+    # HTTP attempts are paced in _request().
+    with (ThreadPoolExecutor(max_workers=5) as finnhub_pool,
+          ThreadPoolExecutor(max_workers=3) as google_pool,
+          ThreadPoolExecutor(max_workers=4) as sec_pool,
+          ThreadPoolExecutor(max_workers=4) as yahoo_pool):
+        futures = {}
+        for ticker in tickers:
+            futures[(ticker, "finnhub")] = finnhub_pool.submit(
+                fetch_finnhub, ticker, since_by_ticker[ticker], as_of, finnhub_key)
+            futures[(ticker, "google_news")] = google_pool.submit(
+                fetch_google_news, aliases[ticker][0], since_by_ticker[ticker], as_of)
+            if not any(err.startswith("sec_8k:") for err in errors[ticker]):
+                cik = ciks.get(ticker, "")
+                if not cik:
+                    errors[ticker].append("sec_8k: CIK not found")
+                else:
+                    futures[(ticker, "sec_8k")] = sec_pool.submit(
+                        timed, "sec_8k", fetch_sec_8k, ticker, since_by_ticker[ticker], as_of, cik)
+            if not replay:
+                futures[(ticker, "yahoo_rss")] = yahoo_pool.submit(
+                    timed, "yahoo_rss", fetch_yahoo_rss, ticker, since_by_ticker[ticker], as_of)
         for (ticker, kind), future in futures.items():
             try:
                 source[ticker][kind] = future.result()
             except Exception as exc:
                 errors[ticker].append(f"{kind}: {type(exc).__name__}")
+    def _wall(name: str) -> float:
+        rows = spans[name]
+        if not rows:
+            return 0.0
+        return max(end for _, end in rows) - min(start for start, _ in rows)
+    logger.info("Pass 0 sec_8k %.1fs", _wall("sec_8k"))
+    if replay:
+        logger.info("Pass 0 yahoo_rss skipped in replay")
+    else:
+        logger.info("Pass 0 yahoo_rss %.1fs", _wall("yahoo_rss"))
     pooled, rss_errors = ([], ["rss: skipped in replay"]) if replay else fetch_rss_pool(pool_since, as_of)
     guardian, guardian_errors = fetch_guardian_pool(pool_since, as_of, guardian_key)
-    pool_errors = rss_errors + guardian_errors
+    yahoo_errors = ["yahoo_rss: skipped in replay"] if replay else []
+    pool_errors = rss_errors + guardian_errors + yahoo_errors
     pooled.extend(guardian)
     macro_items = []
     for row in pooled:

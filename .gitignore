@@ -19,6 +19,7 @@ sas_tracked_tickers.json
 sas_review.lock
 finance_calibration_log.jsonl
 entity_alias_cache.json
+cik_cache.json
 
 # IBKR gateway — not distributed (broker-specific, contains platform binaries)
 ibkr/

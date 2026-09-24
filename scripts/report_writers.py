@@ -101,7 +101,8 @@ def write_context_log(
                 lines.append(
                     f"- {entity['ticker']} {status}；主线索：{lead}；"
                     f"Finnhub={coverage.get('finnhub', 0)}、Google News={coverage.get('google_news', 0)}、"
-                    f"RSS={coverage.get('rss', 0)}、Guardian={coverage.get('guardian', 0)}；"
+                    f"RSS={coverage.get('rss', 0)}、Guardian={coverage.get('guardian', 0)}、"
+                    f"SEC 8-K={coverage.get('sec_8k', 0)}、Yahoo RSS={coverage.get('yahoo_rss', 0)}；"
                     f"错误={'; '.join(coverage.get('errors') or []) or '无'}"
                 )
             lines.append("")
