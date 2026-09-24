@@ -1,6 +1,8 @@
 """Issue #87 code-only Pass 1: bounded Extract of free-source article leads."""
 from __future__ import annotations
 
+import logging
+import math
 import time
 from datetime import date, timedelta
 from urllib.parse import urlparse
@@ -9,6 +11,8 @@ import httpx
 
 from intel_collect import _word_match
 from scoring_utils import _source_confidence_tags
+
+logger = logging.getLogger(__name__)
 
 
 def _move_strength(entity: dict) -> float:
@@ -52,10 +56,19 @@ def resolve_article_url(url: str) -> str | None:
     return None
 
 
-def _direct_leads(entity: dict) -> list[tuple[str, dict]]:
+def _direct_leads(entity: dict, limit: int = 2, cache: dict | None = None) -> list[tuple[str, dict]]:
+    """Up to `limit` title-matching article links with distinct landing domains.
+
+    Finnhub 302 links are resolved one HEAD at a time; `cache` keeps results
+    so the Extract top-up pass does not resolve the same link twice. Each call
+    logs how many redirects it resolved and how long it took (2026-09-23 PM
+    spent 76s here with no log line)."""
+    cache = {} if cache is None else cache
     names = [entity["ticker"], *(entity.get("aliases") or [])]
     leads = []
     domains = set()
+    resolved = attempted = 0
+    started = time.monotonic()
     for row in sorted(entity.get("items", []), key=lambda x: x.get("published_at", ""), reverse=True):
         if row.get("url_kind") not in {"direct", "finnhub_redirect"}:
             continue
@@ -63,15 +76,21 @@ def _direct_leads(entity: dict) -> list[tuple[str, dict]]:
             continue
         url = row.get("url", "")
         if row.get("url_kind") == "finnhub_redirect":
-            url = resolve_article_url(url) or ""
+            if url not in cache:
+                attempted += 1
+                cache[url] = resolve_article_url(url) or ""
+                resolved += bool(cache[url])
+            url = cache[url]
         domain = (urlparse(url).hostname or "").removeprefix("www.").lower()
         if not domain or domain in domains:
             continue
         if url.startswith("https://"):
             leads.append((url, row))
             domains.add(domain)
-        if len(leads) == 2:
+        if len(leads) == limit:
             break
+    logger.info("Deepen direct leads %s: %d leads (limit %d), Finnhub redirects resolved %d/%d, %.1fs",
+                entity["ticker"], len(leads), limit, resolved, attempted, time.monotonic() - started)
     return leads
 
 
@@ -90,12 +109,14 @@ def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining) -
     owners = {}
     status = {}
     search_count = 0
+    cache: dict[str, str] = {}
+    spare_search: dict[str, list[tuple[str, dict]]] = {}
     for entity in selected:
         ticker = entity["ticker"]
         if len(urls) >= 10:
             status[ticker] = "extract cap reached"
             continue
-        leads = _direct_leads(entity)
+        leads = _direct_leads(entity, cache=cache)
         if not leads:
             if search_count >= 3 or remaining() < 1:
                 status[ticker] = "search cap or budget exhausted"
@@ -109,10 +130,11 @@ def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining) -
                 results = search(query, start, end) or []
             except Exception:
                 results = []
-            leads = [(row["url"], {"id": None, "title": row.get("title", ""),
+            found = [(row["url"], {"id": None, "title": row.get("title", ""),
                                          "publisher_domain": urlparse(row["url"]).hostname or "",
                                          "published_at": "", "summary": row.get("content", "")})
-                     for row in results[:2] if str(row.get("url", "")).startswith("https://")]
+                     for row in results if str(row.get("url", "")).startswith("https://")]
+            leads, spare_search[ticker] = found[:2], found[2:]
             status[ticker] = "search: found leads" if leads else "search: no leads"
         else:
             status[ticker] = "direct leads"
@@ -122,6 +144,30 @@ def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining) -
                 owners[url] = []
             if url in owners:
                 owners[url].append((entity, row))
+    # Extract bills ceil(urls / 5) credits, so 7 URLs cost the same 2cr as 10.
+    # Fill up to the next multiple of five with each mover's next distinct
+    # direct link or spare search result, strongest move first.
+    target = min(10, math.ceil(len(urls) / 5) * 5)
+    topped_up = 0
+    for entity in selected:
+        if len(urls) >= target:
+            break
+        known = {url for url, owned in owners.items() if any(e is entity for e, _ in owned)}
+        extra = []
+        if status.get(entity["ticker"]) in {"direct leads", "extract cap reached"}:
+            extra = [lead for lead in _direct_leads(entity, limit=len(known) + 1, cache=cache)
+                     if lead[0] not in known]
+        extra += spare_search.get(entity["ticker"], [])
+        for url, row in extra:
+            if len(urls) >= target:
+                break
+            if url in owners:
+                continue
+            urls.append(url)
+            owners[url] = [(entity, row)]
+            topped_up += 1
+    if topped_up:
+        logger.info("Deepen Extract top-up: +%d URLs to %d (same credit tier)", topped_up, len(urls))
     # This function calls Extract once, at most 10 URLs = 2 credits. Existing
     # budget helpers perform their own final preflight and accounting.
     affordable = min(len(urls), max(0, int(remaining())) * 5)
@@ -160,5 +206,6 @@ def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining) -
     intel_snapshot["search_jobs"] = jobs
     intel_snapshot["search_count"] = search_count
     intel_snapshot["extract_url_count"] = len(urls)
+    intel_snapshot["extract_topup_count"] = topped_up
     intel_snapshot["extract_success_count"] = len(successful_urls)
     return intel_snapshot

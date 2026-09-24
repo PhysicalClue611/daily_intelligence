@@ -51,6 +51,10 @@ owner 已要求把原规划 PR3 并入 #89。主流程在价格与多日涨跌�
 
 ---
 
+## 当前系统状态（2026-09-24，Extract 补齐 / 社交舆情只查个股）
+
+PR #95：Adanos/Reddit 只查非 ETF 个股（`_social_tickers()`），避免 `CL=F` 这类 422 消耗 Adanos 月额度。随后一 PR：`intel_deepen.py` 把 Extract URL 补齐到下一个 5 的倍数（最多 10，同一 credit 档），搜索 `max_results` 2→3；`_direct_leads()` 按标的记录 Finnhub 302 解析次数与耗时（09-23 PM 这里静默耗时 76s）。并发解析和单标的解析上限暂不实现。
+
 ## 当前系统状态（2026-09-23 晚，Pass 2 截断修复）
 
 2026-09-23 PM 报告在第一节半句处断掉，却按成功发出。根因是 `report_pass2`（`gpt-6-luna`/xhigh）的 `max_tokens` 仍为 16000，推理吃掉预算后 `finish_reason=length`；`llm_client.py` 只拒绝空正文，残缺正文照常返回，无重试、无 fallback、无告警。现在 `parse_json=False` 的截断正文一律视为失败：同模型重试、fallback，最后用代码摘要并发 TG 告警。`max_tokens` 提到 32000，HTTP 超时改为 `max(180, max_tokens // 50)`。`test_llm_config.py` 30/30。Obsidian 设计文档与开发日志待宿主机 session 同步（云端 session 无法访问 vault）。

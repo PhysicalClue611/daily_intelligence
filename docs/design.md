@@ -1106,3 +1106,7 @@ LLM 调用层的容错设计一直是"网络错误/5xx 重试，4xx 不重试"�
 
 修复：`parse_json=False` 路径（目前仅 `report_pass2`）新增 `_free_text()`，`finish_reason=length` 时即使正文非空也抛出可重试错误，依次走同模型重试、`fallback_model`，全部失败时由 `run_finance.py` 发送代码生成的情报快照摘要并发 TG 告警。`report_pass2.max_tokens` 16000→32000（`llm_config.py` DEFAULTS、`llm_config.json`、`llm_config.example.json` 同步）。`call_llm()` 非流式请求的超时由固定 180s 改为 `max(180, max_tokens // 50)`，32000 对应 640s，避免加大额度后读超时。PR #62 时“接受残缺正文”的测试改为“拒绝残缺正文并走 fallback”。
 
+### 变更记录追加：2026-09-24（Extract 补齐与直链解析日志）
+
+`intel_deepen.py`：Tavily Extract 按 `ceil(URL/5)` 计费，2026-09-23 PM 只送 7 个 URL 却付了 2cr。第一轮收集后按涨跌幅强弱顺序补齐到下一个 5 的倍数（最多 10）：先取该标的下一条不同落地域名的直链，再取搜索的第 3 条结果（`run_finance.py` 搜索 `max_results` 2→3，basic 搜索仍 1cr）。补齐 URL 排在末尾，预算不足时先被截掉。`_direct_leads()` 每次调用记录 `Deepen direct leads {ticker}: N leads, Finnhub redirects resolved a/b, X.Xs`，302 解析结果在同次运行内缓存，补齐轮不重复 HEAD。
+

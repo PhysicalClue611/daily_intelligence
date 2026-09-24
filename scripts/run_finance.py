@@ -976,7 +976,7 @@ def _main_body():
         intel_snapshot = deepen_intel_snapshot(
             intel_snapshot,
             search=lambda query, start, end: _do_search(
-                query, budget, serpapi_budget, search_depth="basic", max_results=2,
+                query, budget, serpapi_budget, search_depth="basic", max_results=3,
                 start_date=start, end_date=end,
             ),
             extract=lambda urls, query: tavily_extract(urls, query, budget),
