@@ -90,7 +90,7 @@ from report_writers import (
 from recent_coverage import build_recent_coverage_section
 from pass2_context import current_state, changed_background, read_previous_intel_snapshot_state
 from intel_pass0 import build_intel_snapshot
-from intel_collect import archive_intel_snapshot
+from intel_collect import ETFS, archive_intel_snapshot
 from intel_deepen import deepen_intel_snapshot
 from intel_render import (
     emergency_intel_snapshot, should_report, render_intel_snapshot_context,
@@ -669,6 +669,17 @@ fact 为一句话事实摘要（含关键数字/来源，不超过80字）。宁
 
 
 
+def _social_tickers(anomaly_tickers: list[str], stocks: list[str], limit: int = 4) -> list[str]:
+    """Individual stocks for Adanos/Reddit: anomalies first, then the rest.
+
+    Price anomalies also cover commodities, FX and ETFs (CL=F drew an Adanos
+    422 on 2026-09-23 and still counted against the monthly quota); only
+    watchlist stocks outside the intel ETF set are sent."""
+    eligible = [t for t in stocks if t not in ETFS]
+    ordered = [t for t in anomaly_tickers if t in eligible] + eligible
+    return list(dict.fromkeys(ordered))[:limit]
+
+
 # ── TG-only run status message ──────────────────────────────────────────────
 
 def build_status_message(today_et: str, slot_label: str, budget: dict,
@@ -945,9 +956,7 @@ def _main_body():
     try:
         adanos_budget = load_adanos_budget()
         polymarket_section = _polymarket_brief(list(wl["geo_keywords"].keys()))
-        social_tickers = list(dict.fromkeys(
-            anomaly_ticker_syms + [t for t in wl["stocks"] if t not in anomaly_ticker_syms]
-        ))[:4]
+        social_tickers = _social_tickers(anomaly_ticker_syms, wl["stocks"])
         adanos_section = _adanos_x_sentiment(social_tickers, adanos_budget)
         save_adanos_budget(adanos_budget)
         apify_budget = load_apify_budget()

@@ -236,6 +236,14 @@ class SwitchTest(unittest.TestCase):
         self.assertNotIn("forum noise", result)
         self.assertNotIn("NVDA", result)
 
+    def test_social_tickers_keep_only_individual_stocks(self):
+        import run_finance as rf
+        stocks = ["QQQM", "INTC", "NVDA", "SPCX", "AAOI", "PLTR", "VOO"]
+        # 2026-09-23 PM: CL=F led the anomaly list and drew an Adanos 422.
+        self.assertEqual(rf._social_tickers(["CL=F", "QQQM", "AAOI", "^TNX", "SPCX"], stocks),
+                         ["AAOI", "SPCX", "INTC", "NVDA"])
+        self.assertEqual(rf._social_tickers([], ["VOO", "EWJ", "SGOL"]), [])
+
 
 if __name__ == "__main__":
     unittest.main()
