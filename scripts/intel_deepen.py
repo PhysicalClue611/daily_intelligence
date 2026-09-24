@@ -37,16 +37,21 @@ def candidate_entities(entities: list[dict]) -> list[dict]:
 
 
 def resolve_article_url(url: str) -> str | None:
-    """Resolve Finnhub's 302 Location without downloading an article body."""
+    """Resolve Finnhub's 302 Location without downloading an article body.
+
+    Uses GET, not HEAD: Finnhub answers HEAD with "302 Location: /" and only GET
+    carries the article URL (issue #106). The response is streamed and closed
+    after the headers, so no body is read."""
     if not url.startswith("https://finnhub.io/"):
         return None
     for attempt in range(3):
         try:
-            response = httpx.head(url, follow_redirects=False, timeout=8)
-            location = response.headers.get("location", "")
-            if response.status_code == 302 and location.startswith("https://"):
+            with httpx.stream("GET", url, follow_redirects=False, timeout=8) as response:
+                status = response.status_code
+                location = response.headers.get("location", "")
+            if status == 302 and location.startswith("https://"):
                 return location
-            if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+            if status in (429, 500, 502, 503, 504) and attempt < 2:
                 time.sleep(0.5 * (attempt + 1))
                 continue
             return None
