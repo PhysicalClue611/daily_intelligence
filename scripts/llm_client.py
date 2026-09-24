@@ -103,6 +103,28 @@ def _resolve_content(msg: dict, finish_reason: str | None) -> str:
     return (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
 
 
+def _free_text(content: str, finish_reason: str | None) -> str:
+    """Visible text for parse_json=False stages, or JSONDecodeError to retry.
+
+    Empty text is the free-form equivalent of unparseable JSON. Truncated text
+    (finish_reason=="length") is rejected too: on 2026-09-23 PM, report_pass2
+    stopped mid-sentence after its first section and shipped as a success,
+    with no retry, fallback, or alert. A cut-off report now goes to retry,
+    then fallback_model, then the caller's deterministic summary + TG alert."""
+    text = _unwrap_legacy_json_report_md(_strip_code_fence(content))
+    if not text:
+        raise json.JSONDecodeError("empty completion text", content, 0)
+    if finish_reason == "length":
+        raise json.JSONDecodeError("truncated completion text (finish_reason=length)", content, 0)
+    return text
+
+
+def _http_timeout(max_tokens: int) -> int:
+    """Non-streaming read timeout. 180s held for <=16k-token completions;
+    report_pass2 at 32k with xhigh reasoning needs proportionally longer."""
+    return max(180, max_tokens // 50)
+
+
 def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
              stage: str = "report_pass2", parse_json: bool = True) -> dict:
     """Call the configured model for `stage` via OpenRouter, return a result dict.
@@ -155,7 +177,7 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                     **({"thinking": thinking_cfg} if thinking_cfg else {}),
                     **({"reasoning": reasoning_cfg} if reasoning_cfg else {}),
                 },
-                timeout=180,
+                timeout=_http_timeout(max_tokens),
             )
             resp.raise_for_status()
             content = ""
@@ -175,7 +197,8 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                         f"provider={data.get('provider', 'n/a')}")
             if choice.get("finish_reason") == "length":
                 logger.warning(f"LLM [{stage}]: hit max_tokens={max_tokens} (finish_reason=length) — "
-                               f"output truncated; raise max_tokens in llm_config.json if this recurs")
+                               f"output truncated; raise max_tokens in llm_config.json if this recurs"
+                               + ("; rejecting truncated text" if not parse_json else ""))
 
             msg = choice["message"]
             content = _resolve_content(msg, choice.get("finish_reason"))
@@ -190,16 +213,7 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                         f"parse_llm_json returned {type(result).__name__}, expected dict",
                         content, 0)
             else:
-                text = _strip_code_fence(content)
-                text = _unwrap_legacy_json_report_md(text)
-                if not text:
-                    # Empty text is the free-form-payload equivalent of an
-                    # unparseable JSON body — retry the same way, rather than
-                    # returning an empty report_md as if it were a success.
-                    # (Also reached when finish_reason=="length" and content
-                    # was empty: _resolve_content refuses to promote partial
-                    # reasoning as the answer, so content is "" here too.)
-                    raise json.JSONDecodeError("empty completion text", content, 0)
+                text = _free_text(content, choice.get("finish_reason"))
                 result = {"text": text}
             result["_llm_meta"] = {
                 "model": model,
@@ -269,7 +283,7 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                 "max_tokens": max_tokens,
                 "temperature": cfg["temperature"],
             },
-            timeout=180,
+            timeout=_http_timeout(max_tokens),
         )
         resp.raise_for_status()
         data = resp.json()
@@ -287,10 +301,7 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                     f"parse_llm_json returned {type(result).__name__}, expected dict",
                     content, 0)
         else:
-            text = _strip_code_fence(content)
-            text = _unwrap_legacy_json_report_md(text)
-            if not text:
-                raise json.JSONDecodeError("empty completion text", content, 0)
+            text = _free_text(content, choice.get("finish_reason"))
             result = {"text": text}
         logger.info(f"OR flex fallback succeeded: {fallback_model}")
         result["_llm_meta"] = {

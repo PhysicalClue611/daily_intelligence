@@ -500,7 +500,7 @@ stage 名与调用点对应：`am_calibration` / `report_pass2` / `sas_candidate
 | #   | 调用位置 | 用途 | 主力模型 | Fallback | max_tokens | 成本估算 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1b  | `calibration.py::_evaluate_am_predictions()`（stage `am_calibration`） | PM slot：对照实际数据核验 AM「可验证信号」，产出知识条目 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #59/#60——从 `report_pass1` stage 拆分为独立 stage，避免未来调 report_pass1 预算/模型时静默影响这个无关的判断） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.0005 |
-| 2   | `run_finance.py` Pass 2 | 整合情报快照、Sonar 与个人上下文生成最终报告 | `openai/gpt-5.6-luna`（非pro）via OR/OpenAI（provider锁定，不允许fallback到其他provider；`reasoning={"effort":"high"}`，issue #60——原 `deepseek-v4-pro+thinking` 真实数据对比暴露自相矛盾判断，见文末记录） | `google/gemini-3.5-flash` OR flex | 16000 | ~$0.02（未核实精确单价） |
+| 2   | `run_finance.py` Pass 2 | 整合情报快照、Sonar 与个人上下文生成最终报告 | `openai/gpt-6-luna` via OR/OpenAI（provider锁定，不允许fallback到其他provider；`reasoning={"effort":"xhigh"}`，issue #90；此前 issue #60 从 `deepseek-v4-pro+thinking` 换到 `gpt-5.6-luna`/high，见文末记录）。`finish_reason=length` 的截断正文视为失败：重试→fallback→代码摘要+TG告警（2026-09-23） | `google/gemini-3.5-flash` OR flex | 32000（HTTP 读超时 `max(180, max_tokens//50)`=640s） | ~$0.02（未核实精确单价） |
 | 2b  | `run_finance.py` Pass 2 后（stage `sas_candidate_extract`，issue #60） | 独立提取 SAS 候选证据（原是 Pass 2 JSON 的一个字段，见上文"SAS候选证据标注"说明） | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #60，9/9 真实对抗测试验证） | `google/gemini-3.1-flash-lite` OR flex | 800 | ~$0.0003 |
 | 4   | `intel_sources.py` step 6c（stage `macro_brief`） | Sonar 宏观快照（AM/PM 各一次） | `perplexity/sonar`（OR，`search_recency_filter="day"`，2026-07-02 加，见 issue #24） | 重试1次(5s) → `””` 空节 | 1500（issue #55 由 800 提高） | ~$0.005（含固定搜索费） |
 | 5   | `telegram_commands.py` Step 1（stage `tg_preprocess`） | 统一预处理：意图分类 + 2条 query 生成 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #11/#60） | `google/gemini-3.1-flash-lite` OR flex | 600 | ~$0.0001 |
@@ -1099,3 +1099,10 @@ LLM 调用层的容错设计一直是"网络错误/5xx 重试，4xx 不重试"�
 ## 变更记录追加：2026-09-23 — Extract 名额预留（issue #82/PR #83，已合并 `cf9cc33`）
 
 必须解释的 ticker 预留 Extract URL，不参加开放池打分。开放池 25 → 约 15。Extract 分批，最多约 20 URL / 4cr，日上限仍 25。围栏、keyword bonus、Extract query 只读 `_must_answer_tickers()`。测试 `test_issue82_extract_reservation.py` 15/15。不改 Telegram。issue #74 未改。
+
+### 变更记录追加：2026-09-23（Pass 2 截断被当成功发出）
+
+2026-09-23 PM 报告写完“要点”后在“INTC（持仓）收于$122.57，”处断句，随后直接拼接预判校验。`report_pass2` 自 issue #90 起为 `gpt-6-luna` + `reasoning.effort=xhigh`，但 `max_tokens` 仍为 16000，推理与正文共享预算。`llm_client.py::_resolve_content()` 只拒绝 `finish_reason=length` 且正文为空的情形；非空的残缺正文作为成功返回，没有重试、fallback 或 TG 告警，运行状态也显示 Pass 2 成功。
+
+修复：`parse_json=False` 路径（目前仅 `report_pass2`）新增 `_free_text()`，`finish_reason=length` 时即使正文非空也抛出可重试错误，依次走同模型重试、`fallback_model`，全部失败时由 `run_finance.py` 发送代码生成的情报快照摘要并发 TG 告警。`report_pass2.max_tokens` 16000→32000（`llm_config.py` DEFAULTS、`llm_config.json`、`llm_config.example.json` 同步）。`call_llm()` 非流式请求的超时由固定 180s 改为 `max(180, max_tokens // 50)`，32000 对应 640s，避免加大额度后读超时。PR #62 时“接受残缺正文”的测试改为“拒绝残缺正文并走 fallback”。
+

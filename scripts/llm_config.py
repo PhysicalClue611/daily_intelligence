@@ -117,13 +117,15 @@ DEFAULTS: dict[str, dict] = {
         # full excerpt). Also independently noted: deepseek-v4-pro
         # mischaracterized SPCX as an ETF in that same run, gpt-5.6-luna did
         # not. Issue #90 advances this report stage to GPT-6 Luna/xhigh;
-        # provider stays pinned to OpenAI and max_tokens stays at 16000.
+        # provider stays pinned to OpenAI. 16000 max_tokens truncated the
+        # 2026-09-23 PM report after its first section (xhigh reasoning
+        # shares the budget), so it is 32000.
         "gateway": "openrouter",
         "model": "openai/gpt-6-luna",
         "providers": {"order": ["OpenAI"], "allow_fallbacks": False},
         "thinking": None,
         "reasoning": {"effort": "xhigh"},
-        "max_tokens": 16000,
+        "max_tokens": 32000,
         "temperature": 0.2,
         "fallback_model": "google/gemini-3.5-flash",
     },

@@ -51,6 +51,10 @@ owner 已要求把原规划 PR3 并入 #89。主流程在价格与多日涨跌�
 
 ---
 
+## 当前系统状态（2026-09-23 晚，Pass 2 截断修复）
+
+2026-09-23 PM 报告在第一节半句处断掉，却按成功发出。根因是 `report_pass2`（`gpt-6-luna`/xhigh）的 `max_tokens` 仍为 16000，推理吃掉预算后 `finish_reason=length`；`llm_client.py` 只拒绝空正文，残缺正文照常返回，无重试、无 fallback、无告警。现在 `parse_json=False` 的截断正文一律视为失败：同模型重试、fallback，最后用代码摘要并发 TG 告警。`max_tokens` 提到 32000，HTTP 超时改为 `max(180, max_tokens // 50)`。`test_llm_config.py` 30/30。Obsidian 设计文档与开发日志待宿主机 session 同步（云端 session 无法访问 vault）。
+
 ## 当前系统状态（2026-09-23，issue #82 / PR #83，已合并 `cf9cc33`）
 
 **Extract 名额预留**。异动最多 3 个、未解释大涨最多 2 个，各自预留一条 Extract URL，不参加开放池的 `score_and_filter`。开放池预筛 25、语义过滤约 15。`tavily_extract()` 仍是每次最多 10 个 URL；预留先发，开放池再分批。满载约 20 个 URL、最多 4cr。日上限仍是 25。
