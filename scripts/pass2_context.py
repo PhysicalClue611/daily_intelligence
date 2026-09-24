@@ -7,6 +7,11 @@ from pathlib import Path
 
 from intel_collect import archived_intel_snapshot_paths
 
+# Beta (QQQM/VOO), defensive (EWJ/SGOL/BOXX), and cash. Manual section 1 keeps
+# the 15% line on active single names. Lives here so run_finance can re-export
+# it; importing the set from run_finance would cycle.
+CORE_HOLDING_EXCLUDE = {"QQQM", "VOO", "EWJ", "SGOL", "BOXX", "CASH"}
+
 
 def read_previous_intel_snapshot_state(root: Path, before: datetime) -> dict:
     """Read the newest previously completed report state from an intelligence snapshot."""
@@ -41,18 +46,22 @@ def changed_background(liquidity_section: str, current: dict, previous: dict) ->
     lines = []
     old_weights = previous.get("weights", {})
     for ticker, weight in current.get("weights", {}).items():
+        if ticker in CORE_HOLDING_EXCLUDE:
+            continue
         old = old_weights.get(ticker)
-        if (weight > 15 and (old is None or old <= 15)) or (old is not None and old > 15 >= weight):
+        if old is None:
+            continue
+        if (old <= 15 < weight) or (weight <= 15 < old):
             label = "超过15%" if weight > 15 else "降至15%及以下"
             lines.append(f"- {ticker} 占组合{weight}%（{label}）")
     old_extrema = previous.get("range_extrema", {})
     for ticker, item in current.get("range_extrema", {}).items():
         close = item.get("close")
-        old = old_extrema.get(ticker, {})
-        if close is None:
+        if close is None or ticker not in old_extrema:
             continue
-        if close >= item.get("high", float("inf")) and (not old or close > old.get("high", float("inf"))):
+        old = old_extrema.get(ticker) or {}
+        if close >= item.get("high", float("inf")) and close > old.get("high", float("inf")):
             lines.append(f"- {ticker} 收盘价{close}，52周新高")
-        elif close <= item.get("low", float("-inf")) and (not old or close < old.get("low", float("-inf"))):
+        elif close <= item.get("low", float("-inf")) and close < old.get("low", float("-inf")):
             lines.append(f"- {ticker} 收盘价{close}，52周新低")
     return liquidity, ("【本次变化的背景信号】\n" + "\n".join(lines)) if lines else ""

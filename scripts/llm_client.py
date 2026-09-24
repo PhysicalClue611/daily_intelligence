@@ -103,19 +103,64 @@ def _resolve_content(msg: dict, finish_reason: str | None) -> str:
     return (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
 
 
-def _free_text(content: str, finish_reason: str | None) -> str:
-    """Visible text for parse_json=False stages, or JSONDecodeError to retry.
+class _MalformedHTTPBody(Exception):
+    """resp.json() failed. Logged at the source; the retry loop just continues."""
 
-    Empty text is the free-form equivalent of unparseable JSON. Truncated text
-    (finish_reason=="length") is rejected too: on 2026-09-23 PM, report_pass2
-    stopped mid-sentence after its first section and shipped as a success,
-    with no retry, fallback, or alert. A cut-off report now goes to retry,
-    then fallback_model, then the caller's deterministic summary + TG alert."""
+
+class TruncatedCompletion(json.JSONDecodeError):
+    """Non-empty parse_json=False text cut off by finish_reason=length.
+
+    Subclassed so the empty-text JSONDecodeError retry path stays unchanged.
+    """
+
+
+# One step only. xhigh that is still truncated goes to fallback, not medium.
+_EFFORT_ORDER = ("xhigh", "high", "medium")
+
+
+def _downgrade_effort(effort: str | None) -> str | None:
+    if effort not in _EFFORT_ORDER:
+        return None
+    index = _EFFORT_ORDER.index(effort)
+    if index + 1 >= len(_EFFORT_ORDER):
+        return None
+    return _EFFORT_ORDER[index + 1]
+
+
+def _completion_meta(model: str, provider: str, usage: dict | None, finish_reason: str | None, *,
+                     attempts: int, fallback: bool, effort_used: str | None,
+                     truncation_downgrade: bool, primary_attempts: int | None = None) -> dict:
+    usage = usage or {}
+    details = usage.get("completion_tokens_details") or {}
+    meta = {
+        "model": model,
+        "provider": provider,
+        "attempts": attempts,
+        "fallback": fallback,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "reasoning_tokens": details.get("reasoning_tokens"),
+        "finish_reason": finish_reason,
+        "effort_used": effort_used,
+        "truncation_downgrade": truncation_downgrade,
+    }
+    if primary_attempts is not None:
+        meta["primary_attempts"] = primary_attempts
+    return meta
+
+
+def _free_text(content: str, finish_reason: str | None) -> str:
+    """Visible text for parse_json=False stages, or an error the caller handles.
+
+    Empty text is the free-form equivalent of unparseable JSON and stays on the
+    same-request retry path. Non-empty finish_reason=length raises
+    TruncatedCompletion: the caller downgrades reasoning.effort once, then
+    uses fallback_model, and does not send the same request again."""
     text = _unwrap_legacy_json_report_md(_strip_code_fence(content))
     if not text:
         raise json.JSONDecodeError("empty completion text", content, 0)
     if finish_reason == "length":
-        raise json.JSONDecodeError("truncated completion text (finish_reason=length)", content, 0)
+        raise TruncatedCompletion("truncated completion text (finish_reason=length)", content, 0)
     return text
 
 
@@ -145,85 +190,104 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
     model = cfg["model"]
     thinking_cfg = cfg.get("thinking")
     reasoning_cfg = cfg.get("reasoning")
+    # Copy so a one-call downgrade cannot write back into llm_config.
+    active_reasoning = dict(reasoning_cfg) if isinstance(reasoning_cfg, dict) else None
     max_tokens = cfg["max_tokens"]
     providers = cfg.get("providers")
     last_error = None
+    content = ""
+    primary_posts = 0
+    truncation_downgrade = False
+    truncated = False
+
+    def _send_primary(reasoning):
+        nonlocal content, primary_posts, last_error
+        primary_posts += 1
+        content = ""
+        resp = httpx.post(
+            OR_BASE_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                **OR_ATTRIBUTION_HEADERS,
+            },
+            json={
+                "model": model,
+                **({"provider": providers} if providers else {}),
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": max_tokens,
+                # GPT-6 reasoning requests reject temperature; keep it for
+                # the older primary models and the separate fallback call.
+                **({} if model.startswith("openai/gpt-6-") and reasoning
+                   and reasoning.get("effort") != "none"
+                   else {"temperature": cfg["temperature"]}),
+                **({"thinking": thinking_cfg} if thinking_cfg else {}),
+                **({"reasoning": reasoning} if reasoning else {}),
+            },
+            timeout=_http_timeout(max_tokens),
+        )
+        resp.raise_for_status()
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as e:
+            # HTTP body itself is not valid JSON (truncated/error page) — retryable
+            last_error = e
+            logger.warning(f"LLM attempt {primary_posts}: malformed HTTP JSON body: {e}")
+            raise _MalformedHTTPBody() from e
+        usage = data.get("usage", {})
+        choice = data["choices"][0]
+        logger.info(f"LLM tokens [{stage}/{model}]: prompt={usage.get('prompt_tokens')} "
+                    f"completion={usage.get('completion_tokens')} "
+                    f"reasoning={usage.get('completion_tokens_details', {}).get('reasoning_tokens')} "
+                    f"finish_reason={choice.get('finish_reason')} "
+                    f"provider={data.get('provider', 'n/a')}")
+        if choice.get("finish_reason") == "length":
+            logger.warning(f"LLM [{stage}]: hit max_tokens={max_tokens} (finish_reason=length) — "
+                           f"output truncated; raise max_tokens in llm_config.json if this recurs"
+                           + ("; rejecting truncated text" if not parse_json else ""))
+
+        msg = choice["message"]
+        content = _resolve_content(msg, choice.get("finish_reason"))
+        finish = choice.get("finish_reason")
+        if parse_json:
+            result = parse_llm_json(content, logger=logger)
+            if not isinstance(result, dict):
+                # A malformed outer object whose only cleanly-parsing substring is a
+                # nested array (e.g. tavily_queries) makes parse_llm_json return that
+                # array instead of the dict — treat as unparseable JSON, same as a
+                # JSONDecodeError, so it's retried rather than crashing on result[...].
+                raise json.JSONDecodeError(
+                    f"parse_llm_json returned {type(result).__name__}, expected dict",
+                    content, 0)
+        else:
+            text = _free_text(content, finish)
+            result = {"text": text}
+        effort_used = reasoning.get("effort") if isinstance(reasoning, dict) else None
+        result["_llm_meta"] = _completion_meta(
+            model, data.get("provider", "n/a"), usage, finish,
+            attempts=primary_posts, fallback=False, effort_used=effort_used,
+            truncation_downgrade=truncation_downgrade,
+        )
+        return result
+
     for attempt in range(max_retries + 1):
         try:
             if attempt > 0:
                 wait = 2 ** attempt
                 logger.info(f"LLM retry {attempt}/{max_retries} after {wait}s...")
                 time.sleep(wait)
-            resp = httpx.post(
-                OR_BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    **OR_ATTRIBUTION_HEADERS,
-                },
-                json={
-                    "model": model,
-                    **({"provider": providers} if providers else {}),
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": max_tokens,
-                    # GPT-6 reasoning requests reject temperature; keep it for
-                    # the older primary models and the separate fallback call.
-                    **({} if model.startswith("openai/gpt-6-") and reasoning_cfg
-                       and reasoning_cfg.get("effort") != "none"
-                       else {"temperature": cfg["temperature"]}),
-                    **({"thinking": thinking_cfg} if thinking_cfg else {}),
-                    **({"reasoning": reasoning_cfg} if reasoning_cfg else {}),
-                },
-                timeout=_http_timeout(max_tokens),
-            )
-            resp.raise_for_status()
-            content = ""
-            try:
-                data = resp.json()
-            except json.JSONDecodeError as e:
-                # HTTP body itself is not valid JSON (truncated/error page) — retryable
-                last_error = e
-                logger.warning(f"LLM attempt {attempt+1}: malformed HTTP JSON body: {e}")
-                continue
-            usage = data.get("usage", {})
-            choice = data["choices"][0]
-            logger.info(f"LLM tokens [{stage}/{model}]: prompt={usage.get('prompt_tokens')} "
-                        f"completion={usage.get('completion_tokens')} "
-                        f"reasoning={usage.get('completion_tokens_details', {}).get('reasoning_tokens')} "
-                        f"finish_reason={choice.get('finish_reason')} "
-                        f"provider={data.get('provider', 'n/a')}")
-            if choice.get("finish_reason") == "length":
-                logger.warning(f"LLM [{stage}]: hit max_tokens={max_tokens} (finish_reason=length) — "
-                               f"output truncated; raise max_tokens in llm_config.json if this recurs"
-                               + ("; rejecting truncated text" if not parse_json else ""))
-
-            msg = choice["message"]
-            content = _resolve_content(msg, choice.get("finish_reason"))
-            if parse_json:
-                result = parse_llm_json(content, logger=logger)
-                if not isinstance(result, dict):
-                    # A malformed outer object whose only cleanly-parsing substring is a
-                    # nested array (e.g. tavily_queries) makes parse_llm_json return that
-                    # array instead of the dict — treat as unparseable JSON, same as a
-                    # JSONDecodeError, so it's retried rather than crashing on result[...].
-                    raise json.JSONDecodeError(
-                        f"parse_llm_json returned {type(result).__name__}, expected dict",
-                        content, 0)
-            else:
-                text = _free_text(content, choice.get("finish_reason"))
-                result = {"text": text}
-            result["_llm_meta"] = {
-                "model": model,
-                "provider": data.get("provider", "n/a"),
-                "attempts": attempt + 1,
-                "fallback": False,
-            }
-            return result
+            return _send_primary(active_reasoning)
+        except TruncatedCompletion as e:
+            last_error = e
+            truncated = True
+            break
+        except _MalformedHTTPBody:
+            continue
         except json.JSONDecodeError as e:
-            # Model output wasn't parseable JSON (escaping error or truncation) — retryable
+            # Empty text or unparseable JSON — same request is retried.
             last_error = e
             logger.warning(f"LLM attempt {attempt+1}: returned invalid JSON: {e}\nContent: {content[:500]}")
             continue
@@ -260,14 +324,67 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
             logger.error(f"LLM call failed: {e}")
             return {}
 
-    logger.error(f"LLM exhausted {max_retries+1} attempts, last error: {last_error}")
+    if truncated:
+        current_effort = active_reasoning.get("effort") if isinstance(active_reasoning, dict) else None
+        nxt = _downgrade_effort(current_effort)
+        if nxt is None:
+            logger.warning(
+                "LLM [%s]: finish_reason=length at reasoning.effort=%s; entering fallback",
+                stage, current_effort,
+            )
+        else:
+            logger.warning(
+                "LLM [%s]: finish_reason=length at reasoning.effort=%s; downgrading once to %s",
+                stage, current_effort, nxt,
+            )
+            active_reasoning = dict(active_reasoning)
+            active_reasoning["effort"] = nxt
+            truncation_downgrade = True
+            try:
+                return _send_primary(active_reasoning)
+            except TruncatedCompletion as e:
+                last_error = e
+                logger.warning(
+                    "LLM [%s]: finish_reason=length at reasoning.effort=%s after one downgrade; entering fallback",
+                    stage, nxt,
+                )
+            except _MalformedHTTPBody:
+                logger.warning(
+                    "LLM [%s]: downgraded reasoning.effort=%s returned a malformed HTTP body; entering fallback",
+                    stage, nxt,
+                )
+            except json.JSONDecodeError as e:
+                last_error = e
+                logger.warning(
+                    "LLM [%s]: downgraded reasoning.effort=%s returned invalid text; entering fallback",
+                    stage, nxt,
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code >= 500 or e.response.status_code == 429:
+                    last_error = e
+                    logger.warning(f"LLM downgrade attempt: HTTP {e.response.status_code}; entering fallback")
+                else:
+                    logger.error(f"LLM HTTP {e.response.status_code}: {e}")
+                    return {}
+            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError,
+                    httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+                last_error = e
+                logger.warning(f"LLM downgrade attempt: {e}; entering fallback")
+            except Exception as e:
+                logger.error(f"LLM call failed: {e}")
+                return {}
+    else:
+        logger.error(f"LLM exhausted {max_retries+1} attempts, last error: {last_error}")
 
     # OR flex fallback (gemini via OpenRouter, service_tier=flex)
     fallback_model = cfg.get("fallback_model")
     if not fallback_model:
         logger.error(f"LLM [{stage}]: no fallback_model configured, giving up")
         return {}
-    logger.warning(f"OR primary unavailable, trying OR flex fallback: {fallback_model}")
+    if truncated:
+        logger.warning(f"LLM [{stage}]: trying fallback_model after truncated completion: {fallback_model}")
+    else:
+        logger.warning(f"OR primary unavailable, trying OR flex fallback: {fallback_model}")
     try:
         resp = httpx.post(
             OR_BASE_URL,
@@ -304,12 +421,11 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
             text = _free_text(content, choice.get("finish_reason"))
             result = {"text": text}
         logger.info(f"OR flex fallback succeeded: {fallback_model}")
-        result["_llm_meta"] = {
-            "model": fallback_model,
-            "provider": data.get("provider", "n/a"),
-            "fallback": True,
-            "primary_attempts": max_retries + 1,
-        }
+        result["_llm_meta"] = _completion_meta(
+            fallback_model, data.get("provider", "n/a"), usage, choice.get("finish_reason"),
+            attempts=1, fallback=True, effort_used=None,
+            truncation_downgrade=truncation_downgrade, primary_attempts=primary_posts,
+        )
         return result
     except json.JSONDecodeError as e:
         logger.error(f"OR flex fallback returned invalid JSON: {e}")

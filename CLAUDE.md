@@ -35,7 +35,7 @@ owner 已要求把原规划 PR3 并入 #89。主流程在价格与多日涨跌�
 
 `intel_render.py` 把异动标的最多 25 条（标题、来源、时间、摘要、此前已报道标记、正文与覆盖）、无异动持仓最多 8 个标题、无异动观察标的一行、地缘话题最多 8 条/话题且总数最多 40 条送入 Pass 2。Pass 2 总在有报告材料时运行，直接对情报快照归因；三状态为已知原因、线索待核实、未找到原因（附覆盖）；检索失败写“未能完成检索”。无文本/异常时发送代码渲染情报快照摘要并发 TG 告警。SAS 候选抽取读相同情报快照段落，JSON 输出格式不变；运行状态消息按情报快照来源覆盖和深挖结果显示。
 
-近 5 个 NYSE 交易日的历史报告按异动/多日阈值标的抽取实体段落，跨月读取、同档只取首份、排除当前档，每标的最多 600 字符，提示只写新增事实。FRED 档位、15% 仓位跨越和 52 周新高/低按上次成功报告的情报快照 `context_state` 比较，仅变化时注入。社交舆情只对报告出现的标的每个注入一行。旧 LLM Pass 1、语义过滤、开放池、预留名额、异动/多日/轮询搜索 job、Brave 主流程调用及旧 RSS 分桶已移除，`llm_config.json` 删除旧两个 stage。Layer A 私有文件的旧“结论必须可操作”句运行时精确替换，其余个人原则保留。之后的后续修正见 2026-09-23 晚 / 09-24 状态段（PR #94–#97）。
+近 5 个 NYSE 交易日的历史报告按异动/多日阈值标的抽取实体段落，跨月读取、同档只取首份、排除当前档，每标的最多 600 字符，提示只写新增事实。FRED 档位、个股 15% 仓位跨越和 52 周新高/低按上次成功报告的情报快照 `context_state` 比较，仅变化时注入。15% 不覆盖 QQQM/VOO/EWJ/SGOL/BOXX/CASH；上次没有该标的的权重或 52 周记录时不注入（issue #99）。社交舆情只对报告出现的标的每个注入一行。旧 LLM Pass 1、语义过滤、开放池、预留名额、异动/多日/轮询搜索 job、Brave 主流程调用及旧 RSS 分桶已移除，`llm_config.json` 删除旧两个 stage。Layer A 私有文件的旧“结论必须可操作”句运行时精确替换，其余个人原则保留。之后的后续修正见 2026-09-23 晚 / 09-24 状态段（PR #94–#97）。
 ---
 
 ## [强制] "打扫战场"必须包含设计文档更新
@@ -51,13 +51,17 @@ owner 已要求把原规划 PR3 并入 #89。主流程在价格与多日涨跌�
 
 ---
 
+## 当前系统状态（2026-09-24，issue #99，PR 待合并）
+
+15% 跨越只对个股，排除集合与 `_CORE_HOLDING_EXCLUDE` 相同（常量在 `pass2_context.py`，`run_finance` 再导出）。上次没有该标的权重时不注入；52 周新高/低同样要求上次已有该标的。Pass 2 提示词要求只陈述事实和传导，不逐条否定材料里没人提出的推论；持仓段只写当天有新事件、异动或已排期供给事件的标的。PM 盘后说明只在方向相反或达到异动阈值时写。`parse_json=False` 遇到 `finish_reason=length` 不重复同一请求：`reasoning.effort` 降一档重试一次（xhigh→high），再截断进入 fallback。情报快照 `pass2` 在成功时记录 `_llm_meta`，走代码摘要时记录失败原因。未合并，未跑付费报告。
+
 ## 当前系统状态（2026-09-24，Extract 补齐 / 社交舆情只查个股）
 
 PR #95：Adanos/Reddit 只查非 ETF 个股（`_social_tickers()`），避免 `CL=F` 这类 422 消耗 Adanos 月额度。随后一 PR：`intel_deepen.py` 把 Extract URL 补齐到下一个 5 的倍数（最多 10，同一 credit 档），搜索 `max_results` 2→3；`_direct_leads()` 按标的记录 Finnhub 302 解析次数与耗时（09-23 PM 这里静默耗时 76s）。并发解析和单标的解析上限暂不实现。Pass 2 提示词新增例外：已排期的供给事件（解禁、增发/ATM、配售、指数调整）在生效日前后都要保留，不算“无进展”。
 
 ## 当前系统状态（2026-09-23 晚，Pass 2 截断修复）
 
-2026-09-23 PM 报告在第一节半句处断掉，却按成功发出。根因是 `report_pass2`（`gpt-6-luna`/xhigh）的 `max_tokens` 仍为 16000，推理吃掉预算后 `finish_reason=length`；`llm_client.py` 只拒绝空正文，残缺正文照常返回，无重试、无 fallback、无告警。现在 `parse_json=False` 的截断正文一律视为失败：同模型重试、fallback，最后用代码摘要并发 TG 告警。`max_tokens` 提到 32000，HTTP 超时改为 `max(180, max_tokens // 50)`。`test_llm_config.py` 30/30。Obsidian 设计文档与开发日志待宿主机 session 同步（云端 session 无法访问 vault）。
+2026-09-23 PM 报告在第一节半句处断掉，却按成功发出。根因是 `report_pass2`（`gpt-6-luna`/xhigh）的 `max_tokens` 仍为 16000，推理吃掉预算后 `finish_reason=length`；`llm_client.py` 只拒绝空正文，残缺正文照常返回，无重试、无 fallback、无告警。当时改为：`parse_json=False` 的截断正文一律视为失败，同模型重试、fallback，最后用代码摘要并发 TG 告警。issue #99 起 length 不再同请求重试，改为 reasoning.effort 降一档一次，再截断则 fallback。`max_tokens` 提到 32000，HTTP 超时改为 `max(180, max_tokens // 50)`。`test_llm_config.py` 30/30。Obsidian 设计文档与开发日志待宿主机 session 同步（云端 session 无法访问 vault）。
 
 ## 当前系统状态（2026-09-23，issue #82 / PR #83，已合并 `cf9cc33`）（**已被 PR #89 取代**：下述机制已从主流程移除，保留作历史）
 
@@ -529,7 +533,7 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
 3.  无标的异动、标的新闻或命中地缘话题则退出；否则读取 KB，收集 Sonar 宏观、社交舆情和 FRED 流动性背景
 4.  代码 Pass 1：intel_deepen.py 按触发的绝对涨跌选最多 5 个标的，优先每标的 2 个不同落地域名的直接文章/Finnhub 302 链接；无链接才按同一发表窗口搜索（`max_results=3`，前 2 条进首轮 Extract，第 3 条留作补齐）。首轮后按涨跌强弱把 Extract URL 补到下一个 5 的倍数（最多 10）：先补同标的下一条不同域名直链，再补搜索第 3 条；补齐 URL 排末尾，预算不足先截（PR #96）。最多 3 次 basic 搜索 + 1 次 Extract（≤10 URL，2cr），单次运行合计 ≤5cr，SerpApi 可作回退
 5.  将深挖正文、来源覆盖、此前已报道标记写回情报快照并存档；按异动/安静持仓/地缘话题的数量上限渲染 Pass 2 输入，加入最近 5 个既往交易日报告与发生变化的背景信号
-6.  Pass 2 直接按情报快照归因，输出 Markdown；空响应或异常时改用代码渲染的情报快照摘要并发 TG 告警。SAS 候选提取仍为独立 JSON 调用，PM 校准仍运行
+6.  Pass 2 直接按情报快照归因，输出 Markdown；空响应走同请求重试，`finish_reason=length` 降一档 effort 一次后再 fallback，仍失败则改用代码渲染的情报快照摘要并发 TG 告警。SAS 候选提取仍为独立 JSON 调用，PM 校准仍运行
 7.  写入月度 Obsidian 报告、情报快照上下文和 MemPalace；发送邮件、Telegram 报告及独立运行状态消息
 ```
 
@@ -813,6 +817,7 @@ _Tavily: N/10_
 20. **Extract 补齐命中率**（PR #96）：`Deepen Extract top-up` 日志出现频率与补入条数，以及快照 `extract_topup_count`/`extract_success_count`
 21. **供给事件例外效果**（PR #97）：解禁、增发/ATM、配售、指数调整是否在生效日前后都出现在报告里；生效日当天无新闻时是否漏掉，据此评估要不要做代码按日期注入的“供给事件日历”
 22. **SAS 候选命中频率**（#89 之后）：`SAS候选证据日志.md` 的新增频率；#89 后 SAS 抽取输入只剩情报快照（不含 Sonar），据此决定是否把 Sonar 加回 SAS 输入
+23. **issue #99 合并后由验证方看**（实现方不跑报告）：连续 3 个交易日防御性否定句比例是否低于 10%；没有事件的标的是否还单独成段；快照 `pass2` 里的 token 与 `finish_reason`；QQQM 是否还出现在仓位段
 
 ---
 
