@@ -29,6 +29,27 @@ def item(title, domain, url, kind="direct", when="2026-09-21T12:00:00+00:00"):
             "seen_before": False}
 
 
+def fake_stream(answer, calls=None):
+    """Stand-in for httpx.stream: answer(url) -> (status, location). Reading the body fails."""
+    class Response:
+        def __init__(self, status, location):
+            self.status_code = status
+            self.headers = {"location": location} if location is not None else {}
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def read(self):
+            raise AssertionError("downloaded article body")
+        def iter_bytes(self, *args, **kwargs):
+            raise AssertionError("downloaded article body")
+    def stream(method, url, follow_redirects=True, timeout=None):
+        if calls is not None:
+            calls.append((method, url, follow_redirects))
+        return Response(*answer(url))
+    return stream
+
+
 class SwitchTest(unittest.TestCase):
     def test_unarchived_pass0_can_be_enriched_before_first_write(self):
         import intel_pass0 as pass0
@@ -101,14 +122,26 @@ class SwitchTest(unittest.TestCase):
                          ["MULTI", "T6", "T5", "T4", "T3"])
 
     def test_redirect_reads_only_302_location(self):
-        class Response:
-            status_code = 302
-            headers = {"location": "https://publisher.example/article"}
-        with patch("intel_deepen.httpx.head", return_value=Response()) as head, \
+        calls = []
+        with patch("intel_deepen.httpx.stream", side_effect=fake_stream(
+                lambda url: (302, "https://publisher.example/article"), calls)), \
              patch("intel_deepen.httpx.get", side_effect=AssertionError("downloaded article")):
             self.assertEqual(resolve_article_url("https://finnhub.io/api/news?id=1"),
                              "https://publisher.example/article")
-        self.assertFalse(head.call_args.kwargs["follow_redirects"])
+        self.assertEqual(calls, [("GET", "https://finnhub.io/api/news?id=1", False)])
+
+    def test_redirect_ignores_head_relative_location(self):
+        # issue #106: Finnhub answers HEAD with "302 Location: /"; only GET carries the article URL.
+        head = SimpleNamespace(status_code=302, headers={"location": "/"})
+        with patch("intel_deepen.httpx.head", return_value=head), \
+             patch("intel_deepen.httpx.stream", side_effect=fake_stream(
+                 lambda url: (302, "https://www.fool.com/investing/2026/09/24/a/"))):
+            self.assertEqual(resolve_article_url("https://finnhub.io/api/news?id=794749"),
+                             "https://www.fool.com/investing/2026/09/24/a/")
+
+    def test_redirect_relative_location_is_rejected(self):
+        with patch("intel_deepen.httpx.stream", side_effect=fake_stream(lambda url: (302, "/"))):
+            self.assertIsNone(resolve_article_url("https://finnhub.io/api/news?id=1"))
 
     def test_redirects_deduplicate_by_landing_domain_after_resolution(self):
         rows = [item(f"INTC Intel report {i}", "finnhub.io", f"https://finnhub.io/news/{i}", "finnhub_redirect",
@@ -199,22 +232,21 @@ class SwitchTest(unittest.TestCase):
         entities = [entity("INTC", d1=10, items=redirects)]
         intel_snapshot = {"date": "2026-09-21", "slot": "pm", "entities": entities,
                           "macro_digest": {"items": [], "geo_topics_hit": []}}
-        heads = []
-        def fake_head(url, follow_redirects=False, timeout=8):
-            heads.append(url)
-            return SimpleNamespace(status_code=302, headers={"location": f"https://site{url[-1]}.example/a"})
+        calls = []
         extracted = []
-        with patch("intel_deepen.httpx.head", side_effect=fake_head):
+        with patch("intel_deepen.httpx.stream", side_effect=fake_stream(
+                lambda url: (302, f"https://site{url[-1]}.example/a"), calls)):
             deepen_intel_snapshot(intel_snapshot, search=lambda *_: [],
                                   extract=lambda urls, q: extracted.extend(urls) or [],
                                   remaining=lambda: 25)
         self.assertEqual(len(extracted), 3)  # 2 first pass + 1 top-up toward 5
-        self.assertEqual(sorted(heads), ["https://finnhub.io/r0", "https://finnhub.io/r1", "https://finnhub.io/r2"])
+        self.assertEqual(sorted(url for _, url, _ in calls),
+                         ["https://finnhub.io/r0", "https://finnhub.io/r1", "https://finnhub.io/r2"])
 
     def test_budget_exhaustion_stops_spend_and_keeps_items(self):
         intel_snapshot = {"date": "2026-09-21", "slot": "am", "entities": [entity("INTC", d1=6)],
                   "macro_digest": {"items": [], "geo_topics_hit": []}}
-        with patch("intel_deepen.httpx.head", side_effect=AssertionError("no links")):
+        with patch("intel_deepen.httpx.stream", side_effect=AssertionError("no links")):
             result = deepen_intel_snapshot(intel_snapshot, search=lambda *_: self.fail("spent search"),
                                    extract=lambda *_: self.fail("spent extract"), remaining=lambda: 0)
         self.assertEqual(result["entities"][0]["items"], [])
