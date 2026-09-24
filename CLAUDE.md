@@ -53,7 +53,7 @@ owner 已要求把原规划 PR3 并入 #89。主流程在价格与多日涨跌�
 
 ## 当前系统状态（2026-09-24，issue #99，PR 待合并）
 
-15% 跨越只对个股，排除集合与 `_CORE_HOLDING_EXCLUDE` 相同（常量在 `pass2_context.py`，`run_finance` 再导出）。上次没有该标的权重时不注入；52 周新高/低同样要求上次已有该标的。Pass 2 提示词要求只陈述事实和传导，不逐条否定材料里没人提出的推论；持仓段只写当天有新事件、异动或已排期供给事件的标的。PM 盘后说明只在方向相反或达到异动阈值时写。`parse_json=False` 遇到 `finish_reason=length` 不重复同一请求：`reasoning.effort` 降一档重试一次（xhigh→high），再截断进入 fallback。情报快照 `pass2` 在成功时记录 `_llm_meta`，走代码摘要时记录失败原因。未合并，未跑付费报告。
+15% 跨越只对个股，排除集合与 `_CORE_HOLDING_EXCLUDE` 相同（常量在 `pass2_context.py`，`run_finance` 再导出）。上次没有该标的权重时不注入；52 周新高/低同样要求上次已有该标的。Pass 2 提示词要求只陈述事实和传导，不逐条否定材料里没人提出的推论；持仓段只写当天有新事件、异动或已排期供给事件的标的。PM 盘后说明只在方向相反或达到异动阈值时写。`parse_json=False` 遇到 `finish_reason=length` 不重复同一请求：`reasoning.effort` 降一档重试一次（xhigh→high），再截断进入 fallback。情报快照 `pass2` 在成功时记录 `_llm_meta`，走代码摘要时记录失败原因。同一 PR 还修 TG 改 watchlist：节边界用前瞻，不再吃掉下一节标题；收件人一行一条；`_write_watchlist()` 改为临时文件加 `os.replace`，空正文不覆盖非空文件。未合并，未跑付费报告。合并后需要重启 `com.daily-intel.finance.telegram`。
 
 ## 当前系统状态（2026-09-24，Extract 补齐 / 社交舆情只查个股）
 
@@ -818,6 +818,7 @@ _Tavily: N/10_
 21. **供给事件例外效果**（PR #97）：解禁、增发/ATM、配售、指数调整是否在生效日前后都出现在报告里；生效日当天无新闻时是否漏掉，据此评估要不要做代码按日期注入的“供给事件日历”
 22. **SAS 候选命中频率**（#89 之后）：`SAS候选证据日志.md` 的新增频率；#89 后 SAS 抽取输入只剩情报快照（不含 Sonar），据此决定是否把 Sonar 加回 SAS 输入
 23. **issue #99 合并后由验证方看**（实现方不跑报告）：连续 3 个交易日防御性否定句比例是否低于 10%；没有事件的标的是否还单独成段；快照 `pass2` 里的 token 与 `finish_reason`；QQQM 是否还出现在仓位段
+24. **issue #101**：合并后重启 `com.daily-intel.finance.telegram`。TG 加删个股、关键词、收件人后，下一节标题仍在，收件人按行分开。
 
 ---
 

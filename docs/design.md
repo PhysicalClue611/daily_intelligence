@@ -2,7 +2,7 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-09-24（issue #99：15% 跨越只比较个股且必须已有上一次权重，52 周新高/低同样要求上次已有该标的；Pass 2 不否定材料里没人提出的推论，持仓段只写有新事件、异动或已排期供给事件的标的；`finish_reason=length` 时 reasoning.effort 降一档一次，再截断则 fallback；情报快照写入 `pass2`。此前同日：同步 2026-09-23/24 云端 session 合并的 PR #94–#97：Pass 2 截断正文判为失败 + `max_tokens` 32000 + HTTP 超时 640s（#94）；社交舆情只查非 ETF 个股（#95）；Extract 补齐到同一 credit 档、搜索 `max_results=3`、直链解析日志（#96）；Pass 2 供给事件例外（#97）。同时把第二节流程图、§5.1/§5.1b/§5.2/§5.4、第八节选型表、第十节目录结构改写为 issue #87 PR #89（已合并）之后的情报快照架构；#89 之前的 Search+Extract 三层设计降为 §5.1c 历史记录。另回补仓库版独有的 2026-08-04（#59/PR #61）变更记录，更正 Parallel SDK 版本，标注 §8.3 追问成本表过时。仓库 `docs/design.md` 同日按本版整体同步。详见文末变更记录）
+> **最后更新**：2026-09-24（issue #99 与 #101：TG 编辑 watchlist 不再吃掉下一节标题，收件人一行一条，写回改为原子替换。issue #99：15% 跨越只比较个股且必须已有上一次权重，52 周新高/低同样要求上次已有该标的；Pass 2 不否定材料里没人提出的推论，持仓段只写有新事件、异动或已排期供给事件的标的；`finish_reason=length` 时 reasoning.effort 降一档一次，再截断则 fallback；情报快照写入 `pass2`。此前同日：同步 2026-09-23/24 云端 session 合并的 PR #94–#97：Pass 2 截断正文判为失败 + `max_tokens` 32000 + HTTP 超时 640s（#94）；社交舆情只查非 ETF 个股（#95）；Extract 补齐到同一 credit 档、搜索 `max_results=3`、直链解析日志（#96）；Pass 2 供给事件例外（#97）。同时把第二节流程图、§5.1/§5.1b/§5.2/§5.4、第八节选型表、第十节目录结构改写为 issue #87 PR #89（已合并）之后的情报快照架构；#89 之前的 Search+Extract 三层设计降为 §5.1c 历史记录。另回补仓库版独有的 2026-08-04（#59/PR #61）变更记录，更正 Parallel SDK 版本，标注 §8.3 追问成本表过时。仓库 `docs/design.md` 同日按本版整体同步。详见文末变更记录）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -831,7 +831,7 @@ tail -f /tmp/ibkr_keepalive.log                 # keepalive（每 5 分钟 auth 
 │   ├── sec_edgar_utils.py          封装 edgartools：Form 4 内部人买入过滤 + 10-K risk factors 取值
 │   ├── backfill_drawers.py         MemPalace 历史 drawer 一次性回填（已完成，保留供参考）
 │   ├── migrate_reports.py          旧格式迁移（一次性）
-│   └── test_*.py                   无 pytest 依赖的回归测试（2026-09-24 共 14 个；含 test_issue99_pass2_review、test_issue87_pass0/pass2/switch、test_llm_config 等；#72/#80/#82 与语义过滤测试随 PR #89 删除）
+│   └── test_*.py                   无 pytest 依赖的回归测试（2026-09-24 共 15 个；含 test_issue99_pass2_review、test_issue101_watchlist_edit、test_issue87_pass0/pass2/switch、test_llm_config 等；#72/#80/#82 与语义过滤测试随 PR #89 删除）
 ├── .venv/
 ├── llm_config.example.json         LLM 选型 schema 与默认值说明模板（git 追踪，issue #11）
 ├── llm_config.json                 实际生效的 LLM 选型覆盖（git 追踪，目前内容与 DEFAULTS 完全一致——没有覆盖，可直接编辑，不需 PR）
@@ -1452,4 +1452,6 @@ Pass 2 提示词在“无进展就省略”规则后加例外：已排期的供�
 - `parse_json=False` 遇到 `finish_reason=length` 时不重复同一请求。`reasoning.effort` 按 xhigh→high→medium 降一档重试一次；再截断，或已经是最低档/没有 effort，就进入 fallback。不写回 `llm_config`。空正文、网络错误、5xx、429 的重试不变。
 - 情报快照 `pass2`：成功写入 `_llm_meta`（含 token、finish_reason、`effort_used`、`truncation_downgrade`）；代码降级摘要写入 `fallback_summary` 和 `reason`。
 
-设计里的开放点：降到 high 之后若仍截断，按设计默认直接 fallback，没有再降到 medium。测试 `scripts/test_issue99_pass2_review.py`。未跑付费报告。不改 `telegram_commands.py`。Obsidian 文档留给合并后的验证方。
+设计里的开放点：降到 high 之后若仍截断，按设计默认直接 fallback，没有再降到 medium。测试 `scripts/test_issue99_pass2_review.py`。未跑付费报告。Obsidian 文档留给合并后的验证方。
+
+同一 PR 包含 issue #101。TG 的 `_section_add`、`_section_remove`、`_geo_add`、`_geo_remove` 原先用 `(\n## |\Z)` 当边界，写回时把下一节的 `\n## ` 吃掉。收件人还被 `", "` 拼成一行，`load_watchlist()` 会把整行当成一个地址。`_write_watchlist()` 直接 `write_text`。现在四处共用前瞻边界 `(?=\n## |\Z)`；收件人一行一条；个股、商品、汇率仍是逗号一行；地缘关键词仍是 `话题: 词1, 词2`。写回先序列化，空正文不覆盖非空文件，临时文件 `os.replace` 后再读回核对。`load_watchlist()` 的解析没改。测试 `scripts/test_issue101_watchlist_edit.py`，只用临时文件和字符串。合并后需要重启 `com.daily-intel.finance.telegram`。
