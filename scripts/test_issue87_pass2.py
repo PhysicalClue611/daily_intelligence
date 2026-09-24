@@ -170,6 +170,10 @@ class PromptContractTest(unittest.TestCase):
         self.assertNotIn("独立域名佐证", template)
         self.assertNotIn("驱动因素归类（能力圈内外）", template)
         self.assertIn("FRED 档位变化或52周新高/新低，也允许写仓位小节", template)
+        # Scheduled supply events (SPCX lockup, AAOI ATM on 2026-09-23) must not
+        # be dropped as "no progress" around their effective date.
+        self.assertIn("已排期的供给事件", template)
+        self.assertIn("不算“无进展”", template)
         fields = {name: "" for _, name, _, _ in Formatter().parse(template) if name}
         fields.update(date="2026-09-18", intel_snapshot_section="### INTC\n- [news.example] Intel new deal",
                       recent_coverage_section="## 近 5 个交易日已报道（同一标的）\n### INTC\n[09-17 PM] Intel update",
