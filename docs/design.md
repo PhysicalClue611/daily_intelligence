@@ -2,11 +2,9 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-09-23（issue #87 PR #89：免费情报快照切换、代码 Pass 1、Pass 2 新输入和降级；部署状态以运行环境为准）
+> **最后更新**：2026-09-24（同步 2026-09-23/24 云端 session 合并的 PR #94–#97：Pass 2 截断正文判为失败 + `max_tokens` 32000 + HTTP 超时 640s（#94）；社交舆情只查非 ETF 个股（#95）；Extract 补齐到同一 credit 档、搜索 `max_results=3`、直链解析日志（#96）；Pass 2 供给事件例外（#97）。同时把第二节流程图、§5.1/§5.1b/§5.2/§5.4、第八节选型表、第十节目录结构改写为 issue #87 PR #89（已合并）之后的情报快照架构；#89 之前的 Search+Extract 三层设计降为 §5.1c 历史记录。另回补仓库版独有的 2026-08-04（#59/PR #61）变更记录，更正 Parallel SDK 版本，标注 §8.3 追问成本表过时。仓库 `docs/design.md` 同日按本版整体同步。详见文末变更记录）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
-
-> **issue #87 PR1，PR #88 已合并（历史阶段）**：PR1 当时在旧报告流水线旁新增了只做免费收集的 Pass 0 影子情报快照，尚未切换旧 Pass 1/Tavily/Pass 2/写出。`scripts/intel_collect.py` 按标的保留完整 Finnhub company-news、按公司名查询的 Google News RSS、现有 7 源 RSS 与 Guardian；拉丁词边界与中文 ASCII 边界实体匹配、标题去重与每来源覆盖/错误记录。Google News 的实际 HTTP 尝试至少间隔 1 秒且与 Finnhub 分池；多日异动时 RSS/Guardian 从所有标的最早起点抓取、再逐标的裁剪；报告与回放共用 `scripts/publication_window.py` 的交易日窗口计算。PR1 时 `scripts/intel_pass0.py` 在旧主流程跳过判断前旁路运行，原子归档 `archives/YYYYMM/*-intel-snapshot.json`；条目按上次运行情报快照的归一化标题标 `seen_before`。回放命令仍只写本地 JSON/Markdown，RSS 标为 skipped、Guardian 用历史日期窗读取；价格优先取当时 context log 的盘前/日内涨跌，读不到才用日线近似，并从历史日线重建 3/5 日阈值。`entity_alias_cache.json` 忽略追踪。PR1 独立回放 22/24、零 LLM 调用。PR #89 将这套收集器接入主报告路径，并由代码深挖和情报快照驱动的 Pass 2 接续处理；现行架构见下文第二节及 5.1b、5.2 节。权威 Obsidian 文档由合并后验证方同步。
 
 ---
 
@@ -36,63 +34,77 @@ Daily Intelligence 是一套面向**个人主动投资者**的每日财经情报
 ## 二、系统架构总览
 
 ```
-launchd AM/PM → run_finance.py（交易日/锁/防重）
-  → fetch_prices（价格与当日/多日异动，不变）
-  → intel_pass0.build_intel_snapshot（Finnhub、Google News、RSS、Guardian 免费收集）
-  → 无异动/实体新闻/地缘话题则跳过
-  → intel_deepen（代码选最多 5 个异动标的；直接 URL 优先，最多 3 搜索 + 10 Extract URL）
-  → archive_intel_snapshot（原子保存条目、覆盖和正文片段）
-  → Sonar 宏观 + 社交舆情 + FRED（收集不变，按标的/变化注入）
-  → Pass 2（情报快照 + 最近 5 交易日已报道 + 持仓框架；失败则代码摘要并 TG 告警）
-  → SAS 候选独立抽取 + PM 校准（输出契约不变）
-  → 月度报告 / Context Log / MemPalace / 邮件 / Telegram（不变）
+每日定时任务（launchd）
+  AM  5:30 AM PT = 8:30 AM ET   开盘前简报
+  PM  5:10 PM PT = 20:10 ET     夜盘动向（NYSE 盘后结束后 10 分钟）
+      │
+      ▼
+run_finance.py —— 主入口：NYSE 交易日检查 → 并发锁 → 防重（月度文件）
+      │
+      ▼
+fetch_prices —— 价格 + 当日异动 + 3/5 日累计涨跌（issue #80 阈值：3 日 ≥15% / 5 日 ≥20%）
+      │
+      ▼
+Pass 0（intel_pass0.build_intel_snapshot，免费，零 LLM / 零 Tavily）
+      按标的收集 Finnhub company-news、公司名 Google News RSS、7 RSS + Guardian
+      → 别名边界匹配、标的内去重、seen_before 标记；收集整体失败则生成带错误覆盖的应急快照
+      │
+      ▼
+代码层 skip —— 无标的异动、无标的新闻、无命中地缘话题 → 退出（零付费调用）
+      │
+      ▼ 背景采集
+  ├─ memory_context：MemPalace + Obsidian，Layer B 持仓框架
+  ├─ Sonar 宏观快照（perplexity/sonar，~$0.005）
+  ├─ 社交舆情：Polymarket + Adanos X + Apify Reddit（只查非 ETF 个股，_social_tickers，最多 4 个，PR #95）
+  └─ FRED 流动性快照（档位与上次成功报告不同才注入 Pass 2）
+      │
+      ▼
+代码 Pass 1（intel_deepen.deepen_intel_snapshot，无 LLM）
+      按绝对涨跌取最多 5 个异动/多日阈值标的；每标的最多 2 条不同落地域名的直链或 Finnhub 302
+      无直链才发 `Why is {公司名} stock {up|down}` basic 搜索（max_results=3，SerpApi fallback）
+      最多 3 次搜索 + 1 次 Extract（≤10 URL，补齐到同一 credit 档，PR #96），单次运行 ≤5cr
+      → 正文片段 + 置信度标签回填快照 → archive_intel_snapshot 原子存档
+      │
+      ▼
+LLM Pass 2 —— openai/gpt-6-luna via OR/OpenAI，reasoning.effort=xhigh，max_tokens 32000（issue #90 / PR #94）
+              输入：价格表 + intel_render 渲染的情报快照 + Sonar + 报告涉及标的的社交舆情
+                    + 状态变化的背景信号 + 近 5 个交易日已报道内容 + 持仓框架
+              Layer A: SYSTEM_PROMPT_P2（Layer_A_Prompt.md）；输出裸 markdown
+              空文本 / 异常 / finish_reason=length 截断 → 同模型重试 → fallback → 代码摘要 + TG 告警
+      │
+      ▼
+SAS 候选独立抽取（gemma-4-31b-it，只读情报快照）+ PM 预判校准
+      │
+      ▼ 输出
+  ├─ Obsidian 月度报告 + 月度 Context Log
+  ├─ MemPalace per-day drawer
+  └─ 邮件 + Telegram 推送（Markdown→HTML，超4096字自动分段）
+                        + 独立运行状态消息（build_status_message()）
 ```
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│              Telegram Bot（常驻 long polling）               │
-│              独立 bot token，与宿主 Agent 隔离               │
-└───────────────────────┬─────────────────────────────────────┘
-                        │ 用户发消息 → 立即回"收到，处理中..."
-              ┌─────────▼──────────┐
-              │  Step 1            │
-              │  V4 Flash 统一预处理│
-              │  via OR/Novita     │
-              │  意图分类+搜索词   │
-              │  +tickers+框架考量 │
-              └─────────┬──────────┘
-                        │
-          ┌─────────────┼─────────────────────────┐
-          ▼             ▼                          ▼
-    指令执行        状态报告                  自然语言追问
-  (改watchlist)   (系统状态)               ┌──────────────┐
-                                           │  Step 2      │
-                                           │  yfinance    │
-                                           │  实时行情+新闻│
-                                           │  （free）    │
-                                           └──────┬───────┘
-                                                  │
-                                           ┌──────▼───────┐
-                                           │  Step 3      │
-                                           │  Parallel.ai │
-                                           │  search+     │
-                                           │  extract（主）│
-                                           │  → Sonar     │
-                                           │  → Exa（fallback）
-                                           └──────┬───────┘
-                                                  │
-                                           ┌──────▼───────┐
-                                           │  Step 4      │
-                                           │  V4 Flash    │
-                                           │  via OR/Novita│
-                                           │  持仓框架     │
-                                           │  +MemPalace  │
-                                           │  个人化推理   │
-                                           │  fallback:   │
-                                           │  Grok 4.3    │
-                                           └──────┬───────┘
-                                                  │
-                                           月度文件 append
+Telegram Bot（常驻 long polling，独立 bot token，与宿主 Agent 隔离）
+      │ 用户发消息 → 立即回"收到，处理中..."
+      ▼
+Step 1 —— V4 Flash 统一预处理（via OR/DigitalOcean→Venice）
+         意图分类 + 搜索词 + relevant_tickers + framework_focus
+      │
+      ▼ 按 action 分流（三路）
+  ├─ 指令执行（改 watchlist）
+  ├─ 状态报告（系统状态）
+  └─ 自然语言追问：
+        Step 2 —— yfinance 实时行情+新闻（免费，session-aware 三层路由）
+              │
+              ▼
+        Step 3 —— Parallel.ai search+extract（主）→ Sonar（fallback）→ Exa（再 fallback）
+              │
+              ▼
+        Step 4 —— openai/gpt-5.6-luna（非pro）via OR/OpenAI，reasoning.effort=high（主，自管重试，issue #60）
+                 持仓框架 + MemPalace + question_intent → 个人化推理
+                 fallback: x-ai/grok-4.5（via OR，reasoning.effort=medium）
+              │
+              ▼
+        月度文件 append（## 追问 YYYY-MM-DD HH:MM ET）
 ```
 
 ---
@@ -200,7 +212,7 @@ user@example.com
 | slot | 主数据源 | price 含义 | change_pct 基准 | 异动触发 |
 |---|---|---|---|---|
 | `am` | 日线（prev_close/week）+ 1m prepost=True（盘前） | 9:30前最新成交价 | vs 昨收 | 盘前涨跌超阈值 |
-| `pm` | 日线（今收）+ 1m prepost=True（盘后） | 今日收盘价 | vs 昨收 | 日内超阈值 OR 盘后超阈值 |
+| `pm` | 1m prepost=True（今日常规时段收盘/开盘+盘后，issue #69 起主源）+ 日线（仅 prev_close/5日涨幅） | 今日收盘价 | vs 昨收 | 日内超阈值 OR 盘后超阈值 |
 | `daily` | 日线（兜底） | 最新日线收盘 | vs 前一日收盘 | 日内涨跌超阈值 |
 
 `PriceRow` 新增字段：`afterhours_price`、`afterhours_pct`、`slot`。`format_price_table(slot)` 按 slot 输出不同列：AM 显示「盘前价/盘前涨跌（vs昨收）」，PM 增加「盘后涨跌」列。
@@ -208,6 +220,8 @@ user@example.com
 yfinance 失败时 fallback 到 Finnhub `/api/v1/quote`（免费60 req/min）；Finnhub 无盘前/盘后数据，记 warning，返回日线等价数据。商品/FX（`GC=F`、`^TNX`、汇率等）在 Finnhub 免费 tier 无数据则跳过并记录。
 
 日线 `period=8d` 与 AM/PM 盘前盘后 `period=2d` 均经 `_yf_download()`：拉取期间将 yfinance logger 提到 CRITICAL（issue #63 的 `_quiet_yfinance_logs()`，issue #67 扩到主路径），避免库对瞬时空响应打 `possibly delisted` ERROR 触发 Homepage 巡检。日线任一 ticker Close 有效行不足时 sleep 1s 再拉一次，用 `_merge_daily_ohlc()` 只把「第一次缺失、第二次可用」的 Close/Open 叠回第一帧——不整表替换（否则一次更差的 retry 会丢掉 Finnhub 补不上的商品/FX）。取值必须列名或 `Series.name` 等于目标 ticker，防止 yfinance 把多标的 bulk 收成单列时把幸存者价格写到别的 ticker 上。
+
+**[已修复] issue #69（2026-09-03 发现，PR #70 squash `d457455` 已合并至 main，上表 PM 行“日线（今收）”描述已过时，实际主源已改为 intraday）**：上表 PM 行描述的“日线（今收）”这个数据源在 20:10 ET 运行时**不保证**已经落库当天这一行——2026-09-02/09-03 连续两个交易日，Yahoo 后端日线批量在收盘后 4h10min 仍未写入当天数据，PM 分支旧代码在 `_closes_today` 为空时静默回退成“批量表最后一行”（=昨天），导致 `price == prev_close`，18个标的的 `change_pct` 集体归零且**无任何日志信号**——直到用户拿手机 App 真实数据肉眼核对才发现（PLTR 报告写“收盘 $169.46”，真实收盘 $182.53）。修复后 PM“今日收盘/今日开盘”改由同一次运行里已经拉取的 `period=2d, interval=1m, prepost=True` intraday 提供（`_get_pm_prices()` 扩展为同时返回今日开盘，原先只被丢弃的今日常规时段收盘价现被启用），批量日线只保留给 5 日涨幅这类需要多日窗口的计算（`week_change_pct` 相应改为以批量表「今天之前」的最后一行为锚点往前数 5 个交易日，修正了旧代码假设批量表最后一行=今天导致的窗口错位）。若 intraday 也没有今天数据，不允许任何静默兜底，该 ticker 直接从 `rows` 中剔除 + WARNING 日志，由 `run_finance.py` 既有的失败标的检测机制接管，向 Pass1/2 prompt 注入禁引声明（沿用 2026-06-18 那次 yfinance 早间故障已验证的模式，非新发明）。排查记录、方案权衡、设计契约见 issue #69；实现细节、测试、review 与合并记录（已合并 `d457455`）见文末变更记录与开发部署日志。
 
 **IBKR Client Portal Gateway（`ibkr/quotes.py`，隔夜/周末实时数据源）**：IBKR 自有 REST API，通过本地 gateway 代理，覆盖 ATS/OTC 隔夜时段和周末场外报价——这是 yfinance/Polygon 免费 tier 均无法覆盖的窗口。
 
@@ -222,7 +236,7 @@ yfinance 字段按时段选择：`preMarketPrice`（04:00-09:29）/ `regularMark
 
 `# FUTURE`：待 IBKR gateway 稳定后翻转优先级，改为 IBKR 全时段主力。代码中已用注释标出两处修改点。
 
-**新闻（RSS 7个源 + Guardian API）**：
+**新闻（RSS 7个源 + Guardian API；issue #85 起停用五个综合新闻源）**：
 
 | 源 | 定位 |
 |---|---|
@@ -235,9 +249,23 @@ yfinance 字段按时段选择：`preMarketPrice`（04:00-09:29）/ `regularMark
 | Digitimes | 台湾/大陆半导体供应链贸易媒体（issue #72） |
 | Guardian API | 国际/财经/政治，结构化 JSON，20条/次 |
 
-**停用（issue #85）**：NYT Business/World/Politics、BBC Business/World、Al Jazeera、AP、WSJ（后两者经 Google News RSS）移入 `RSS_FEEDS_DISABLED`，不再抓取，URL 保留以便恢复。2026-09-23 实测这五个源占 RSS 总量 57%，与持仓/科技/宏观相关的只有约 10%；在子串匹配打地缘标签、每个话题桶只留最新 5 条的情况下，它们把持仓相关新闻挤出了 prompt。停用后地缘面由 FT、Reuters、Foreign Policy、Guardian API 和 Sonar 宏观快照覆盖。
+**停用（issue #85/PR #86，2026-09-23）**：NYT Business/World/Politics、BBC Business/World、Al Jazeera、AP、WSJ（后两者经 Google News RSS）移入 `RSS_FEEDS_DISABLED`，不抓取，URL 保留，挪回 `RSS_FEEDS` 即恢复。实测这五个源占 RSS 总量 57%，与持仓/科技/宏观相关的只有约 10%；在子串匹配打地缘标签、每个话题桶只留最新 5 条的情况下，它们把持仓新闻挤出了 prompt。停用后地缘面由 FT、Reuters、Foreign Policy、Guardian API 和 Sonar 宏观快照覆盖。这是情报收集重构（按持仓组织）的第一步。
 
 过去 24h，按地缘政治关键词分类。Guardian API（`content.guardianapis.com/search`）fail-open，`GUARDIAN_API_KEY` 控制，结果合并进 RSS 统一时间排序。不可达：Politico（403）；Reuters/AP/WSJ 直连受阻，已通过 Google News 代理覆盖。
+
+**Brave News（独立西方搜索引擎，issue #14，2026-07-15；PR #89 起主报告不再调用，`fetch_brave_news()` 与预算文件保留，以下为原设计）**：区别于 Serper/SerpApi 这类 Google 搜索代理，Brave Search API 是独立索引的搜索引擎。`fetch_brave_news()` 按 anomaly ticker + geo topic 逐条查询，最多4条/次，结果并入跨源去重流程后再供 Pass 1/2 使用。Brave Search API 于 2026 年取消免费层，现为 $5/月预付额度用完后按量计费（$0.003-0.005/次），因此加了硬性月度预算上限（`BRAVE_MONTHLY_LIMIT=800`，`finance_brave_budget.json`，到量自动停用不再调用，绝不产生额外扣费）。`BRAVE_API_KEY` 存于 `.env`。
+
+**跨源标题去重（`score_and_filter()`，issue #14，同日；PR #89 起随开放池一起移出主流程，现在的去重是 Pass 0 按标的别名归类后的标的内去重，以下为原设计）**：多个新闻源同时报道同一事件（实测存档验证过真实案例：同一财报事件 4 份变体标题抢占 4/10 名额）时，字符级相似度（`difflib.SequenceMatcher`）实测对同事件不同措辞的标题失效（相似度仅 0.33-0.73），改用 token 重叠度（Jaccard，去停用词），且限定只在标题命中同一个 tracked ticker/geo 关键词时才比较，避免不相关新闻因共享通用财经词被误判重复。
+
+**社交舆情与预测市场情报（`social_sentiment_section` 注入槽，issue #17，2026-06-25 起分三步接入）**：三个数据源按固定顺序拼接为同一个 prompt 注入槽（Polymarket + Adanos + Reddit；FRED 流动性 PR #89 起改为独立的 `liquidity_section`）。PR #89 起该槽经 `filter_social_lines()` 过滤，只保留情报快照中出现的标的，每个标的一行：
+
+1. **Polymarket 预测市场**（`_polymarket_brief()`）：查询与 watchlist 关键词相关的预测市场当前赔率，作为市场对未来事件概率的隐含定价参考，免费公开 API，fail-open。
+2. **Adanos X（Twitter）舆情**（`_adanos_x_sentiment()`）：按 ticker 查询社交媒体讨论热度（buzz/bullish/mentions/trend），月度预算 `ADANOS_MONTHLY_LIMIT`（`finance_adanos_budget.json`）。
+3. **Reddit 舆情**（`_reddit_sentiment_brief()`，issue #17 第三步，2026-07-16）：官方 Reddit API 免费层限定非商业用途且 100 req/min 达不到本项目需求，改用第三方聚合 actor `benthepythondev/stock-sentiment-intelligence`（Apify 平台，专精 WSB/r-stocks/r-investing 股票情绪聚合，非通用 Reddit 爸虫），按次计费（$0.001/result + $0.00005/run），一次 API 调用批量查询全部待测 ticker（复用 Adanos 同一份异动优先级列表，最多4个），月度预算 `APIFY_MONTHLY_LIMIT=60` runs（`finance_apify_budget.json`）。
+
+**Adanos/Reddit 标的列表只含个股（PR #95，2026-09-24）**：`run_finance._social_tickers()` 只保留 watchlist 个股中不在 `intel_collect.ETFS`（QQQM/VOO/EWJ/SGOL）里的标的，异动个股排在前面，最多 4 个，Adanos 与 Apify Reddit 共用这份列表。此前列表直接取异动标的，商品/FX/ETF 也会被送出：2026-09-23 PM 把 `CL=F` 发给 Adanos 收到 422，而 Adanos 只要收到 HTTP 响应就计入月度额度，这次调用白白消耗了额度。
+
+**第三方字段消毒（issue #38，2026-07-21）**：以上三个数据源返回的字段（Polymarket question/outcome、Adanos buzz/bullish/mentions/trend、Apify ticker/signal/mentions_24h/rank_change）在拼进 markdown 前统一经过 `_sanitize_field()`（折叠空白+剔除控制字符+长度截断）和 `_sanitize_ticker()`（`^[A-Z]{1,5}$` 白名单，Apify 回传的 ticker 因是第三方在响应里给出、不可信，额外做请求集合成员校验）处理——未消毒时第三方响应里的换行符可伪造出假的 `##` markdown 小节边界，误导 Pass 1/2 对 prompt 结构的解读。
 
 **Sonar 宏观快照（step 6c，AM + PM）**：`_sonar_macro_brief(slot, stocks, commodities, fx, geo_topics, now_et, portfolio_snapshot, price_table)` 调用 `perplexity/sonar`，query 从 watchlist 动态构建，随持仓变化自动演化。
 
@@ -246,23 +274,178 @@ yfinance 字段按时段选择：`preMarketPrice`（04:00-09:29）/ `regularMark
 | AM | 过去 12h 隔夜发展，对今日开盘有何影响 |
 | PM | 当日盘面驱动因素 + 盘后/隔夜风险 |
 
-system prompt 注入 portfolio 快照实现个人化。~$0.005/次，fail-open；日报主 Pass 2 读取该宏观快照。
+system prompt 注入 portfolio 快照实现个人化。~$0.005/次，fail-open。PR #89 起旧 LLM Pass 1 已删除，Sonar 输出用在三处：Pass 2 正文、PM 预判校准、Context Log。SAS 候选抽取的输入只剩情报快照（#89 之前还能看到 RSS、Finnhub、Sonar、社交舆情和 Tavily），是否把 Sonar 加回 SAS 输入尚未决定，待观察 SAS 候选命中频率。
 
 **防过时/防幻觉加固（issue #24，2026-07-02）**：Sonar 是搜索+合成模型，不是行情 feed，曾在同一份报告中与实时价格直接矛盾（声称 WTI 破 $100，实际价格 $68.58）。三重加固：① OR payload 加 `search_recency_filter: "day"`（实测确认 OpenRouter 会透传给 Perplexity，不会被静默丢弃），限制底层搜索只召回过去24小时发布的源；② 把 pipeline 中已经算好的 `price_table`（fetch_prices 输出）注入 system prompt 作为权威真实数据，要求若搜索结果与之冲突则以注入价格为准并明确标注冲突；③ prompt 要求每条具体断言必须带时间戳，若某话题无近 24 小时更新必须明说，不得拿旧信息冒充当前。`telegram_commands.py` 的 `_sonar_research()`（TG 追问流水线的 Sonar fallback，同模型同风险）同步加了 `search_recency_filter`。
 
-**Finnhub 公司新闻（issue #87 PR #89）**：主流程改用 `intel_collect.collect()` 每标的一次完整拉取，AM 默认 36h、PM 24h；#80 多日阈值扩展到对应涨跌起点。按实体归入情报快照，记录来源条数和错误，取代旧 `fetch_finnhub_news()` 最多 5 条的 prompt 注入。
+**Finnhub 公司新闻（issue #87 PR #88/#89，已合并）**：主流程改由 `intel_collect.collect()` 对每个个股做一次完整 `/company-news` 拉取，AM 默认 36h、PM 24h，#80 多日阈值标的扩到对应涨跌起点；按别名归入情报快照的实体，记录原始条数和错误，详见 §5.1b。旧 `fetch_finnhub_news()`（每 ticker 最多 5 条、摘要 100 字的 prompt 注入）已退出主报告，仅 `sas_review.py` 仍在调用。Finnhub 302 链接在代码 Pass 1 里用 HEAD 解析成直链再 Extract。
 
-**FRED 流动性水位快照（step 6e，AM+PM，issue #26，2026-07-02）**：`fetch_liquidity_snapshot()` 拉取银行准备金（`WRESBAL`）、SOFR（`SOFR`）、ON RRP 授予利率（`RRPONTSYAWARD`，注意不是 `RRPONTSYD`——后者是隔多逆回购**交易量**不是利率，实测数值差异巨大才发现搭错）、TGA余额（`WTREGEN`），按 `Hermes/Daily Intelligence/市场见顶预警指标.md` 的阈值分类【正常/观察/警戒】，整体取最高档；与上次成功报告情报快照的档位不同才注入 Pass 2。SRF用量 FRED 无对应序列，不自动化，留作文档里的人工检查项。选型理由：FRED 是比 Sonar 搜索更可靠的精确数据源（呼应 issue #24 的教训——LLM 搜索对精确数值不可靠，能用结构化权威数据源就不该靠 LLM 猜）。Pass 2 将它作为背景，不单独触发交易建议。
+**FRED 流动性水位快照（step 6e，AM+PM，issue #26，2026-07-02）**：`fetch_liquidity_snapshot()` 拉取银行准备金（`WRESBAL`）、SOFR（`SOFR`）、ON RRP 授予利率（`RRPONTSYAWARD`，注意不是 `RRPONTSYD`——后者是隔多逆回购**交易量**不是利率，实测数值差异巨大才发现搭错）、TGA余额（`WTREGEN`），按 `Hermes/Daily Intelligence/市场见顶预警指标.md` 的阈值分类【正常/观察/警戒】，整体取最高档。最初折进 `social_sentiment_section` 注入槽；PR #89 起改为独立的 `liquidity_section`，且只在档位与上次成功报告情报快照的 `context_state` 不同时才注入 Pass 2（`pass2_context.changed_background()`）。SRF用量 FRED 无对应序列，不自动化，留作文档里的人工检查项。选型理由：FRED 是比 Sonar 搜索更可靠的精确数据源（呼应 issue #24 的教训——LLM 搜索对精确数值不可靠，能用结构化权威数据源就不该靠 LLM 猜）。当前 Pass 2 prompt 规定：注入了 FRED 档位变化时允许写仓位小节，但只陈述本次背景变化，不把它当成单独的交易指令（旧版“第⑥条分析要求”随 PR #89 的新 prompt 替换）。
 
-### 5.1b 情报快照驱动的深挖（issue #87 PR #89，开发中）
+### 5.1b 情报快照与代码深挖（issue #87：PR #88/#89 已合并；PR #96 补齐）
 
-免费来源标题先按实体别名归入情报快照；旧 Search+Extract 开放池、脚本评分、语义过滤与预留名额已从本分支主流程移除。代码 Pass 1 按当日/#80 多日阈值选绝对涨跌最大的 5 个标的；每个标的最多 2 条标题命中别名、来源域名不同的 direct/Finnhub 302 链接直接 Extract。没有链接才用公司名和方向发 Tavily basic 搜索（SerpApi fallback）。每次最多 3 次搜索和 10 个 Extract URL，最坏 5 Tavily credit，预算不足依优先顺序截止。正文片段与来源置信度标签回填到情报快照 JSON；已有 `*-extract.md` 保留，但不再新写。
+**Pass 0 收集（`intel_pass0.py` / `intel_collect.py`，免费、零 LLM、零 Tavily）**：对 watchlist 个股（排除 QQQM/VOO/EWJ/SGOL）按标的收集 Finnhub company-news（AM 36h、PM 24h，多日阈值标的扩到涨跌起点）、公司名 Google News RSS（每次 HTTP 尝试含重试至少间隔 1s，与 Finnhub 使用独立线程池；链接只作线索，不解码原文）、现有 7 个 RSS 源和 Guardian。标题按别名边界匹配归入实体（中文别名用 ASCII 边界，拉丁别名用词边界）并做标的内去重。别名写在 watchlist `## 实体别名`（如 `INTC: Intel, 英特尔`），缺失时用 Finnhub profile2 补全并缓存到 gitignore 的 `entity_alias_cache.json`。与上一次运行快照归一化标题相同的条目标 `seen_before`。多日异动时 RSS/Guardian 共享抓取窗口扩到最早标的起点，再按各标的窗口分拣；报告与回放共用 `publication_window.py`。每个实体保存移动、覆盖（各来源原始条数与错误）、条目和 `fulltext`。收集整体异常时生成带错误覆盖记录的应急快照，不阻断报告。
 
-### 5.2 报告生成（issue #87 PR #89，开发中）
+**代码 Pass 1（`intel_deepen.deepen_intel_snapshot()`，无 LLM）**：
+- **候选**：当日异动或 #80 多日阈值（3 日 ≥15% / 5 日 ≥20%）标的，按触发项的绝对涨跌取最多 5 个。
+- **直链优先**：每标的最多 2 条标题命中别名、落地域名不同的 direct / Finnhub 302 链接。302 用 HEAD 解析 Location（不下载正文，最多 3 次尝试），结果在同一次运行内缓存，补齐轮不重复发 HEAD。`_direct_leads()` 每调用一次按标的记一行 INFO：`Deepen direct leads {ticker}: N leads (limit L), Finnhub redirects resolved a/b, X.Xs`（PR #96；背景是 2026-09-23 PM 在 FRED 与第一条 Tavily 之间有 76s 没有任何日志，时间耗在串行 HEAD 上）。并发解析和单标的解析上限暂不实现，先看日志数据。
+- **无直链才搜索**：`Why is {公司名} stock {up|down}`，Tavily basic、`max_results=3`（PR #96 由 2 提高，仍是 1cr），SerpApi 作 fallback。发表窗口取多日涨跌起点，否则为报告日前 2 天（AM）/ 1 天（PM）到报告日。每次运行最多 3 次搜索。前 2 条结果进入首轮 Extract，第 3 条留作补齐备选。
+- **Extract**：每次运行只调用一次，≤10 个 URL。
+- **补齐到同一 credit 档（PR #96，2026-09-24）**：Extract 按 `ceil(URL 数/5)` 计费，2026-09-23 PM 只送 7 个 URL 却付了 2cr，和 10 个一样。首轮后按涨跌幅从强到弱补到下一个 5 的倍数（最多 10）：先取该标的下一条不同落地域名的直链（只限原本就走直链、或因 Extract 名额满被跳过的标的），再取搜索结果的第 3 条。补进来的 URL 排在列表末尾，预算不够时最先被截掉；补齐发生时记 `Deepen Extract top-up: +N URLs to M (same credit tier)`，快照字段 `extract_topup_count`。
+- **预算**：最多 3 次 basic 搜索（3cr）+ 一次 Extract（≤10 URL，2cr），单次运行合计 ≤5cr；日上限 `TAVILY_DAILY_LIMIT=25`。Extract 前按剩余额度截断 URL 列表（`remaining × 5`），现有预算 helper 仍做最终预检与记账。
+- **回填与存档**：正文片段（每条 ≤1200 字）与 `_source_confidence_tags()` 置信度标签回填实体 `fulltext`；`deepen_status`/`search_jobs`/`search_count`/`extract_url_count`/`extract_topup_count`/`extract_success_count` 写入快照，由 `archive_intel_snapshot()` 原子写入 `archives/YYYYMM/YYYY-MM-DD-{slot}-intel-snapshot.json`。`*-extract.md` 停止新写，历史文件保留。深挖整体异常时保留免费源快照继续出报告。
 
-只有标的异动/新闻和宏观地缘话题都没有时才跳过。旧 LLM Pass 1 草稿与 query、异动/多日/轮询三类搜索任务已删除。Pass 2 使用 `openai/gpt-6-luna`（xhigh，issue #90），只读价格表、情报快照段落、Sonar、相关标的社交舆情、状态变化的背景指标和个人上下文。有异动标的最多 25 条含摘要和覆盖，安静持仓最多 8 个标题，安静观察标的一行，宏观每话题最多 8 条、总计 40 条。归因分已知原因/线索待核实/未找到原因（附覆盖），检索错误写“未能完成检索”；仓位段落只在例外事实出现。最近五个 NYSE 交易日已报道内容按实体提取，每标的最多 600 字，避免同一事件跨日重复。Pass 2 返回空文本或异常则用代码摘要照常写出与发送，并发 TG 告警。
+**Pass 2 输入渲染（`intel_render.py`）**：异动标的最多 25 条（标题、来源、时间、摘要、此前已报道标记、正文与覆盖）；无异动持仓最多 8 个标题；无异动观察标的一行；地缘话题每话题最多 8 条、总数最多 40 条。
 
-**错误韧性**：Pass 2 的 LLM 调用（`call_llm()`）在遇到网络/5xx 错误时自动重试 2 次（指数退避 2s/4s），4xx 和 JSON 解析错误不重试。`telegram_commands.py` 中 DeepSeek 调用通过 `_deepseek_post()` 直连，Claude/Sonar 调用通过 `_openrouter_post()` 走 OR，均使用相同重试策略（网络/5xx 自动重试 2 次）。
+**已知结构性取舍**：#89 收窄了输入（没有开放池，地缘话题只有标题没有全文），加上 Pass 2 要求“无进展就省略”，报告信息量可能偏少。这一点待观察几天正常报告后单独评估，PR #94–#97 均未处理。
+
+### 5.1c 历史设计：Search+Extract 三层架构（PR #89 之前的主流程，已移除）
+
+> 本节保留作决策记录：Search vs Extract 的成本比较、“LLM 判断必须在 Extract 之前”、关键词锚定的双精度设计等推理仍有参考价值。其中 LLM Pass 1、`score_and_filter` 开放池、语义过滤、必须解释 ticker 的预留名额（#82）、异动/多日/轮询搜索 job、7 天围栏、Extract 分批“约 20 URL / 4cr”均已随 issue #87 PR #89 移出主流程；`scoring_utils.py` 的置信度打标函数仍被 `intel_deepen.py` 复用。当前实现以 §5.1b 为准。
+
+#### 背景与问题
+
+原始流程：直接调用 Tavily advanced search（2 credits），返回 12 条结果并截断到 250-char 摘要。主要问题：
+- **内容截断**：250 字摘要不足以支撑深度分析，LLM 看到的是碎片
+- **无筛选层**：多条查询的原始结果直接堆叠，噪音多、token 浪费
+- **时间精度**：`days=N` 是粗粒度过滤，Tavily 新增 `start_date`/`end_date` 可达到天级精度
+
+#### 关键分析：Search vs Extract
+
+| 能力 | Tavily Search | Tavily Extract |
+|---|---|---|
+| 定位 | 全网发现（不知信源在哪） | 已知 URL 的实时内容获取 |
+| 返回 | URL + Tavily 算法摘要（200-300字）| 全文 chunk（600+字，基于 query 对齐）|
+| 时效 | 依赖 Tavily 索引，可能有索引时滞 | 实时抓取，不受索引时滞影响 |
+| 成本 | basic=1cr，advanced=2cr | basic=2cr（批量，最多 10 URLs）|
+
+**核心结论**：`basic search (1cr) × 3 + extract (2cr) = 5cr` 与 `advanced search (2cr) × 2 = 4cr` 的成本相近，但前者拿到的是完整正文 chunk，后者只有截断摘要。对于个人投资者的金融情报场景，正文内容对比摘要有明显价値。
+
+#### 筛选层设计：脚本 vs LLM
+
+40条搜索结果 → 10条 URL，应该用脚本还是 LLM？
+
+**已知可用信号**：Tavily 每条结果自带 `score`（0-1）、`published_date`、`url`、`content`（200-300字摘要）。这些信号已足够成原顺序：
+
+```
+综合分 = Tavily score（语义相关性）
+         + 可信域名加成（Reuters/Bloomberg/FT/WSJ 等 +0.15）
+         + 时效加成（24h内 +0.10，72h内 +0.05）
+         + 关键词命中（异动 ticker 或地缘主题出现，+0.05×n）
+```
+
+**何时必须用 LLM**：当筛选意图是语义层面的（如“判断这条新闻是否构成实质性监管风险”）——这种意图 keyword 小不覆盖。但对于个人投资情报场景，问题是“这条新闻与我的持仓和地缘主题相关吗”——Tavily score + 可信域名 + ticker 命中就能覆盖大部分情局。
+
+**关键原则：LLM 判断必须在 Extract 之前，不是之后**。先 Extract 40条再判断 = 浪费 2cr×40个 URL 的抓取消耗；先用摘要做分类再 Extract 前 10 = 按需投入。
+
+**语义过滤的非显然价值**：prompt 要求考虑上下游供应链和宏观传导，而非仅 ticker 名字命中。例：TSMC 产能收缩新闻即使不提 INTC，也与 INTC 高度相关。纯脚本关键词匹配覆盖不到这类语义关联。
+
+当前实现（issue #82，2026-09-23）：必须解释的 ticker 先各留一条 Extract URL，不参加开放池排名。开放池才走脚本预筛选（`score_and_filter`，25条）+ `google/gemma-4-31b-it` 语义排序（`_semantic_relevance_filter`，约15条；issue #53/PR #54 前身为 `_haiku_relevance_filter`）。语义过滤仍识别上下游供应链和宏观传导，而不只是 ticker 名字。
+
+#### 三层流程设计
+
+```
+Layer 1 — Discovery（basic search × 2-4，每条 1cr）
+  全部为 basic（不再使用 advanced，Extract 来补深度）
+  合并原始结果 raw_results（20-60 条）
+
+必须解释的名单（issue #82）
+  `_must_answer_tickers()` 是唯一组装点。异动 job 与未解释大涨 job 都写
+  `_must_answer_ticker`。7 天围栏、开放池 keyword bonus、两次 Extract 重排 query
+  只读这份列表，不再各自拼接类别字段。
+  每个名单内 ticker 在自己的结果里留一条 URL（域名/时效/视频页，不含 keyword bonus）。
+  子集为空则不占名额。选中的 URL 从开放池剔除。
+
+Layer 2a — 开放池脚本预筛（纯脚本，0cr）
+  score_and_filter: 开放池 → 25条，去重 + 综合评分
+  keyword bonus 的 ticker 来自 must-answer 名单，不是全量异动代码
+
+Layer 2b — google/gemma-4-31b-it 语义过滤（OR，不 pin provider，~$0.0001-0.00014/次，issue #53/PR #54）
+  _semantic_relevance_filter: 25条 → 约15条（前身为 _haiku_relevance_filter）
+  只排开放池。识别直接催化剂、上下游供应链、宏观传导渠道
+  fail-open：主+备均失败则回退到 script top-15
+
+Layer 3 — Extract（1cr/5 URLs；单次仍最多 10 URL = 2cr）
+  预留 URL 先调用，query 是整份 must-answer 名单（Tavily 用它重排 chunk）
+  开放池再按 10 个一批调用，query 是同一份名单加地缘词（地缘词仍截 80 字）
+  满载约 5 预留 + 15 开放 = 20 URL，最多 4cr。日上限仍是 25，本次不上调
+  chunks_per_source=2。Pass 2 拿到正文 chunk，不是 250 字摘要
+  归档候选标 `预留:TICKER` 或 `开放池`
+
+Layer 3.5 — 信源置信度打标（issue #19，2026-06-30）
+  每条 Extract 结果附加 [信源类型 | 发布时间 | 交叉印证] 标签行：
+    信源类型：_detect_low_structure() 识别视频聚合页/caption堆叠（无独立时间戳，谨慎）
+    发布时间：_lookup_published_date() 从 extract 前的 search 结果池按 URL 反查
+              （Tavily /extract 响应本身不带日期字段，只有 /search 有）
+    交叉印证：_compute_corroboration() 规则式事实指纹匹配（专有名词短语+日期/数字token+
+              build_keyword_set() 提供的关键词锚定），统计候选池中有多少个其他独立域名与本条
+              内容重叠——零 API/LLM 成本的启发式，存在假阴性，0 不代表"确认单一信源"而是
+              "本规则未找到重叠"
+  标签同时写入 Pass 2 prompt（LLM 参考）和本地 Extract Archive（审计留痕）
+  背景：Reuters 视频聚合页孤立 caption（无时间戳）曾被 Pass 2 当作确定事实写入报告
+  （"签署仪式定于周五"，用户核实后其他信源查无此消息）
+
+  **关键词锚定的双精度设计（PR #46，2026-07-18）**：build_keyword_set(anomaly_tickers,
+  geo_keywords, split_phrases) 同时服务两个精度要求不同的下游——score_and_filter() 的
+  排序打分/标题去重（split_phrases=True，含 anomaly ticker + 多词地理关键词拆分出的单词，
+  如"Middle East"→"middle"/"east"，单个词命中只贡献 +0.05 排序权重，误报代价低）和
+  _compute_corroboration() 的跨源印证判定（split_phrases=False，只保留 watchlist.md 字面
+  配置的关键词，不拆分、不含 ticker）。最初两者共用同一份宽松关键词表，上线前被 review
+  发现真实假阳性：两篇无关报道仅共享拆分词"east"、或两篇同 ticker 不同事件的报道仅共享
+  ticker 本身，都被误判为"已交叉印证"——因为"独立信源确认了同一事实"这个判定的误报代价
+  远高于排序打分的误报代价。详见 docs/PITFALLS.md#81。
+```
+
+**语义过滤设计细节（Layer 2b）：**
+
+输入：开放池预筛后最多 25 条摘要（每条 title + URL[:70] + snippet[:130]）+ 当日异动 ticker + geo 主题 + 持仓 ticker。必须解释的 ticker 不在这 25 条里重复占位，它们已有预留 URL。
+输出：JSON 数组，按相关性排序，目标约 15 条。
+总 token：~300-500 input + ~40 output = **~$0.000035/次**（DeepSeek 直连，原 Haiku/Bedrock 约 $0.0021，降低 60 倍）。
+
+判断标准（优先级递减）：
+1. 直接催化剂（财报、交易、监管行动）
+2. 上下游供应链（上游元件提供商、下游 OEM 客户、代工厂）
+3. 行业性监管/出口管制（直接解释异动原因）
+4. 地缘事件对市场的可量化传导（制裁、冲突升级）
+5. 宏观信号与持仓暴露相关（联储/利率/汇率/商品供应冲击）
+
+**budget 触发规则（issue #82 起按批检查，不再为整次 Extract 做一次预检）：**
+
+| 余额 | 行为 |
+|---|---|
+| 该批 `ceil(n/5)` 够 | 发出这一批。预留批次先于开放池 |
+| 该批不够 | 跳过这一批。已经提取的批次保留；搜索摘要仍可作 fallback |
+| 搜索阶段 < 1cr | 停止后续 search |
+| = 0cr | 跳过搜索，继续生成 Pass 1 基础报告 |
+
+**信用消耗对比：**
+
+| 场景 | 旧流程 | 新流程 |
+|---|---|---|
+| AM 有异动 | 1 advanced(2) + 3 basic(3) = **5cr** | 4 basic(4) + 1 extract(2) = **6cr**，但全文 |
+| PM 有异动 | 4 basic(4) = **4cr** | 前3异动各 1 basic + Pass1 basic + 1 extract；删除 Finnhub 短路后最多增加 **3cr**，Finnhub 仅补充 |
+| 仅 geo，无异动 | 3 basic(3) = **3cr** | 2 basic(2) + 1 extract(2) = **4cr** |
+
+Tavily 日预算为 25cr。issue #82 把单次运行的 Extract 从最多 2cr 提高到最多 4cr（预留最多 1cr，开放池 15 个 URL 为 3cr），日上限本次不改，先看真实消耗。
+
+---
+
+### 5.2 报告生成（Pass 2）
+
+**代码层 skip**：`should_report(intel_snapshot)` 在没有标的异动（含 #80 多日阈值）、没有标的新闻、也没有命中地缘话题的宏观条目时退出（日志 `No entity move, company item, or macro item; skipping`），零付费调用。旧 LLM Pass 1（草稿 + `tavily_queries`）、异动/多日/轮询三类搜索 job 均已随 PR #89 删除，其演化过程见 §5.1c 与文末 #72/#76/#80/#82 变更记录。
+
+**Pass 2（有报告材料时必跑，不再依赖是否有付费搜索结果）**：`report_pass2` stage，`openai/gpt-6-luna` + `reasoning.effort=xhigh`（issue #90/PR #91），`max_tokens` 32000（PR #94）。输入：价格表、情报快照段落（§5.1b 的渲染上限）、Sonar 宏观、报告涉及标的的社交舆情（每标的一行）、状态变化的背景信号（FRED 档位、15% 仓位跨越、52 周新高/低，只在与上次成功报告快照 `context_state` 不同时注入）、KB 上下文、AM 校准笔记、近 5 个 NYSE 交易日已报道内容（`recent_coverage.py`：按异动/多日阈值标的抽取实体段落，跨月读取，同档只取首份，排除当前档，每标的最多 600 字）、个人上下文（Layer B）。Layer A 私有文件里旧的“结论必须可操作”句在运行时精确替换，其余个人原则保留。
+
+**提示词规则（`USER_PROMPT_TEMPLATE_P2`）**：
+- 归因三状态：已知原因（附来源）/ 线索待核实（单一来源的强断言在句内标一次“未证实”）/ 未找到原因（只在这种情形下简短写来源覆盖）；检索失败且无条目写“未能完成检索”。价格变化本身不是原因，不凭空归因于情绪、资金流或风格轮动，也不因没找到线索就断言没有公司级催化。
+- 只写相对“此前已报道”及近五个交易日报告的新增事实；无进展时省略，或一句“延续 MM-DD 已报道的<事件>，今日无新进展”。
+- **供给事件例外（PR #97，2026-09-24）**：已排期的供给事件（限售股解禁、增发或 ATM 发行、配售、指数纳入或剔除调整）在生效日之前和之后的报告里都要保留，即使此前已报道也不算“无进展”；写明生效日期、规模，以及它与当日价格或成交的关系。这类事件的价格影响集中在生效日前后，按旧规则可能在生效当天被当作“无进展”省掉。触发案例：2026-09-23 PM 的 SPCX 约 3.28 亿股解禁、AAOI 至多 6 亿美元 ATM 发行。已知局限：规则只保证模型不删，不保证信息找得到——生效日当天如果没有相关新闻，Pass 2 根本看不到这个事件。候选方案是由代码按日期注入的“供给事件日历”，未实现。
+- 仓位小节只在认知提升、Alpha 大幅兑现、更高赔率机会、单一仓位被动跨过 15%，或注入了 FRED 档位变化 / 52 周新高新低时出现；否则省略，不逐股声明“无加减仓依据”。
+- 正文按主题写自然段，不写检索步骤、证据缺口清单或自我免责（PR #92）；直接输出 Markdown，不要 JSON 或代码围栏。
+
+**失败与降级**：Pass 2 返回空文本、异常，或 `finish_reason=length` 的截断正文（PR #94 起即使正文非空也判为失败），`call_llm()` 依次走同模型重试、`fallback_model`（`google/gemini-3.5-flash` OR flex）；全部失败时 `run_finance.py` 用代码渲染的情报快照摘要照常写出与发送，并发 TG 告警「Pass 2 失败」。SAS 候选抽取（独立 JSON 调用，只读情报快照）和 PM 校准照常运行。
+
+**错误韧性**：`call_llm()` 对网络/5xx/429 自动重试（指数退避），耗尽后进入 OR flex fallback；`parse_json=False` 路径的空文本或截断文本由 `_free_text()` 按解析失败处理、进入同一条重试路径。非流式 HTTP 读超时由 `_http_timeout()` 计算：`max(180, max_tokens // 50)`，32000 对应 640s（此前固定 180s，预算翻倍后会读超时）。`telegram_commands.py` 的 `_deepseek_post()`（沿用旧名，实际按 stage 配置走 OpenRouter）与 `_openrouter_post()` 使用相同的网络/5xx 重试策略。
 
 ### 5.3 防重与手动重跑
 
@@ -286,7 +469,8 @@ if f"## {today_et} {slot_label}" in monthly_file_content:
 |---|---|---|
 | Obsidian 月度报告 `Daily_Intel_report_YYYYMM.md` | append section（step 11） | 是 |
 | Obsidian 月度 Context Log `Daily_Intel_context_YYYYMM.md` | append section（step 11b）：价格快照 + 每标的情报快照摘要/覆盖 + Sonar 宏观原文 + 代码搜索任务列表 | 是 |
-| 情报快照 `archives/YYYYMM/YYYY-MM-DD-{slot}-intel-snapshot.json` | 免费来源条目、覆盖、正文片段、上次状态比较依据；原子写入 | 否 |
+| 情报快照 `~/Daily_Intelligence/archives/YYYYMM/YYYY-MM-DD-{slot}-intel-snapshot.json`（PR #89 起） | 免费来源条目、覆盖、Extract 正文片段与置信度标签、深挖状态/计数（含 `extract_topup_count`）、供下次比较的 `context_state`；原子写入 | 否（Obsidian 之外） |
+| Extract Archive `archives/YYYYMM/YYYY-MM-DD-{slot}-extract.md` | PR #89 起停止新写，历史文件保留 | 否 |
 | MemPalace per-day drawer | report_md 推送 bridge，wing=paperview, room=finance | — |
 | 邮件 | Gmail API（send+readonly scope） | — |
 | Telegram | Markdown → HTML，超 4096 字符自动分段 | — |
@@ -294,19 +478,19 @@ if f"## {today_et} {slot_label}" in monthly_file_content:
 
 **Context Log 与情报快照的设计分工：**
 - Context Log 存 Obsidian → MemPalace 矿化后可语义检索"某日早上市场context是什么"
-- 情报快照存本地 → 保留完整免费来源条目和 Extract 片段，用于审计和跨次状态比较
+- 情报快照存本地 → 不污染矿化索引，保留完整免费来源条目和 Extract 片段，用于审计、回放（`intel_pass0.py --replay`）和跨次状态比较（`seen_before`、背景信号变化）
 - Extract 全文刻意不进 Obsidian：原始网页抓取含导航/广告碎片，矿化会产生大量低质量向量
 
 ### 5.5 AM 预判校准闭环（issue #10，2026-07-02）
 
 **定位**：把原本"盘后对比版本"的设想改造成闭环学习机制——AM 报告输出可验证信号，PM 报告校验并沉淀为知识，知识反过来影响未来的 AM。不新增调度任务，折进现有 PM pipeline（PM 已在盘后跑，已经算好 EOD 价格表）。
 
-**AM 报告“可验证信号”清单**：`USER_PROMPT_TEMPLATE_P2` 使用 `VERIFIABLE_SIGNALS_INSTRUCTION_P2`，通过模板变量 `{verifiable_signals_rule}` 注入，仅 `run_slot=="am"` 生效。要求报告结尾固定追加"## 可验证信号"小节，2-4条条件-结果式可核验断言（如"WTI跌破$65→通胀预期继续下修"），不写模糊定性描述。报告主体的自由叙事写法不受影响（呼应 05-21"格式硬约束压制LLM深度"的教训，见踩坑记录#49）。
+**AM 报告新增"可验证信号"清单**：`USER_PROMPT_TEMPLATE_P2`（Pass 2）新增条件性指令常量 `VERIFIABLE_SIGNALS_INSTRUCTION_P2`（最初还有 Pass 1 的 `_P1`，随 PR #89 删除），通过模板变量 `{verifiable_signals_rule}` 注入，仅 `run_slot=="am"` 生效。要求报告结尾固定追加"## 可验证信号"小节，2-4条条件-结果式可核验断言（如"WTI跌破$65→通胀预期继续下修"），不写模糊定性描述。报告主体的自由叙事写法不受影响（呼应 05-21"格式硬约束压制LLM深度"的教训，见踩坑记录#49）。
 
 **PM 校验步骤**：新函数 `evaluate_am_calibration()`，插在报告标题修正后、`write_report()` 之前，仅 PM slot 执行：
 1. `_extract_report_section()` 定位当天 AM 报告 section——以下一个日期戳 `## YYYY-MM-DD` 为边界，不被报告内部的 `## 子标题`/`---`分隔符误判（复用 2026-05-04 修复 KG section 截断 bug 时确立的模式，见踩坑记录#25）
 2. `_extract_verifiable_signals()` 提取"可验证信号"小节内容
-3. `_evaluate_am_predictions()`：一次 LLM 调用（`llm_config.py` stage `am_calibration`，默认 `google/gemma-4-31b-it`，~$0.0005；issue #59 前曾复用 `report_pass1` stage 的 DeepSeek V4 Flash，2026-08-03 实测该模型隐式推理吃满预算导致 3/3 真实调用失败，PR #61 拆成独立 stage 并换模型），对照当日实际价格表+新闻上下文（情报快照+Sonar），逐条判定 hit/miss/inconclusive，提炼一段"知识条目"（不是罗列对错，是可迁移的教训或验证），并判断是否值得展示
+3. `_evaluate_am_predictions()`：一次 `am_calibration` stage 调用（最初为 DeepSeek V4 Flash，issue #59 起 `google/gemma-4-31b-it`，~$0.0005），对照当日实际价格表+新闻上下文（Finnhub+Sonar），逐条判定 hit/miss/inconclusive，提炼一段"知识条目"（不是罗列对错，是可迁移的教训或验证），并判断是否值得展示
 4. 若当天 AM 报告没有该小节（历史报告、或该步骤本身失败），静默跳过，不影响主流程——整个函数 fail-open
 
 **知识沉淀与备份（2026-07-02 修正：Obsidian 为主，不依赖 MemPalace）**：`_write_calibration_knowledge()` 写三份：
@@ -314,7 +498,7 @@ if f"## {today_et} {slot_label}" in monthly_file_content:
 2. **本地备份镜像**：`backups/预判校准记录_backup.md`（项目目录下，已加入 .gitignore，不进代码仓库），与 Obsidian 独立写入相同内容，防 Obsidian 侧丢失（sync 冲突、误删）
 3. **MemPalace drawer**（`room=finance`，锰上添花）：仅作为语义检索的可选增强层，不是任何环节的必需依赖
 
-**为什么不依赖 MemPalace**（用户 2026-07-02 提出）：最初设计假设"AM 能通过现有 `get_finance_context()` 的 MemPalace 搜索自动捕到校准知识"——这是个未经验证的假设，那个搜索是通用 query，不是针对校准知识专门设计的，而且对用户描述的"MemPalace finance room 最近已多次全部重建"这种故障零容错。已改为 `_load_recent_calibration_notes()` 直接读 Obsidian——不经 bridge、不经 MemPalace，若 Obsidian 文件缺失/不可读自动 fallback 到本地备份镜像。注入 AM Pass 2 模板变量 `{calibration_notes}`，仅 AM slot 生效，取最近 5 条。
+**为什么不依赖 MemPalace**（用户 2026-07-02 提出）：最初设计假设"AM 能通过现有 `get_finance_context()` 的 MemPalace 搜索自动捕到校准知识"——这是个未经验证的假设，那个搜索是通用 query，不是针对校准知识专门设计的，而且对用户描述的"MemPalace finance room 最近已多次全部重建"这种故障零容错。已改为 `_load_recent_calibration_notes()` 直接读 Obsidian——不经 bridge、不经 MemPalace，若 Obsidian 文件缺失/不可读自动 fallback 到本地备份镜像。注入 AM prompt（最初 Pass 1/2，PR #89 起只剩 Pass 2）新模板变量 `{calibration_notes}`，仅 AM slot 生效，取最近 5 条。
 
 **写入安全**：所有写入都是纯 append（`_append_calibration_entry()`），不用 `open(path,'w')` 截断覆盖，符合项目文件写入安全原则。
 
@@ -359,12 +543,8 @@ if f"## {today_et} {slot_label}" in monthly_file_content:
 ### 6.3 追问四步流水线
 
 ```
-Step 1  google/gemma-4-31b-it 统一预处理（~$0.0001，stage `tg_preprocess`，issue #11）
+Step 1  V4 Flash 统一预处理（~$0.0001）
         → 意图分类 + 精准英文搜索词 + relevant_tickers + 框架考量
-        注：非 deepseek-v4-flash——2026-07-25 用本 stage 真实 prompt 实测，temperature=0
-            下同一条简单指令（"删关键词 US-Iran blockade"）连续3次调用给出3种不同的错误结果
-            （枚举外的幻觉 action 值 / 预算耗尽 content 全空 / JSON 从中间截断），gemma 在5种
-            指令类型上全部正确复现，零 reasoning token
 
 Step 2  实时行情（三层路由）+ yfinance.news（免费，无配额）
         → _fetch_realtime_prices()：按 ET 时段路由数据源
@@ -375,7 +555,7 @@ Step 2  实时行情（三层路由）+ yfinance.news（免费，无配额）
         进度提示："获取实时行情及新闻（TICKER）..."
 
 Step 3  Parallel.ai search + extract（主，~$0.007-$0.012）
-        → _parallel_research(queries) → (brief, failure_kind|None, detail)：
+        → _parallel_research(queries: list[str])：
             search(search_queries=queries, objective=queries[0]) → 最多10条结果，单次请求
             dedup by title
             [P2] aggregator URL 优先排序：_AGGREGATOR_DOMAINS（stockanalysis/macrotrends/finviz/
@@ -391,37 +571,21 @@ Step 3  Parallel.ai search + extract（主，~$0.007-$0.012）
             Parallel 成功后，V4 Flash 判断是否存在明显盲区（缺价格路径/市场反应/基本面解释之一）
             有则生成第3条补漏 query 并再次调用 Parallel；无则直接进 Step 4
             触发时进度提示："情报补充（补漏查询）..."；fail-open，不影响主流程
-            issue #7 成本第一杠杆：dashboard credit < $5 时设 PARALLEL_P1_ENABLED=0，
-            只关 P1 补漏查询，主 Parallel 全文路径保持开启。
-        → 产品原则：Parallel 信息密度高于 Sonar、费用仅略高，有 key 就优先走 Parallel；
-          不因本地估算月度用量而提前改用 Sonar。
-        → 观测：finance_parallel_budget.json 记录 search/extract 估算成本（状态消息展示），
-          默认不做硬帽；PARALLEL_MONTHLY_BUDGET_USD>0 才启用可选灾难刹车。
-        → 降级条件：
-            ① Parallel 真实拒绝服务（余额不足/鉴权失败，含 401/402/403 与 billing 语义错误）
-               → 单独发一条 TG notice（6h 冷却防刷）→ Sonar/Exa
-            ② 可选硬帽触发 → 同样 TG notice → Sonar/Exa
-            ③ 其它技术失败/空结果 → fail-open 静默 Sonar，不发「余额不足」notice
         → 原始全文直接传入 Step 4，无预摘要损耗
         → 失败 fallback：Sonar（重试1次→Exa model="exa"）
         进度提示："情报检索（N条查询）..."
 
-Step 4  openai/gpt-5.6-luna（非pro）via OR（主，stage `tg_followup`，issue #60）
+Step 4  DeepSeek V4 Flash via OR/DigitalOcean→Venice（主，~$0.002）
         System: 投资框架（module-level cache）+ NYSE 时区推理要求
                 + 禁止对话体开场白（直接进入分析）
         User:   当前时刻(EDT/EST) + yfinance实时行情（价格基准） + yfinance.news
                 + Parallel.ai原文情报 + 持仓快照（均价，非现价）+ MemPalace
                 + question_intent
                 + 推理规则：以yfinance为价格唯一基准；无新催化剂直接声明动量延续
-        max_tokens=16000；reasoning={"effort":"high"}（OpenAI统一参数，issue #60，取代
-        DeepSeek的thinking.budget_tokens——后者实测是软上限而非强制上限，见下方issue #60记录）；
-        provider锁定{"order":["OpenAI"],"allow_fallbacks":false}；自管3次重试（timeout 180s）
-        fallback: x-ai/grok-4.5（via OR，reasoning.effort=medium，max_tokens 8000）
-        content 为空且 finish_reason=length 时报"预算耗尽"而非崩溃（issue #53 的崩溃形态）
+        max_tokens=8000；thinking=disabled；自管3次重试；fallback: x-ai/grok-4.3（via OR）
         输出：自由展开分析（不设字数上限，参考维度：驱动力/持仓含义/待验证信号/信息缺口）
         注：Step 4 绕过 _deepseek_post()，自管重试确保 model_label 精确、Grok fallback 正确触发
-        注：provider 路由与全部模型参数取自 llm_config stage `tg_followup`（issue #11），
-            可由 llm_config.json（git 追踪）运行时覆盖；bot 按文件 mtime 自动重载，无需重启
+        注：DS_OR_PROVIDERS={"order":["DigitalOcean","Venice"],"allow_fallbacks":True}（2026-06-02 起，NovitaAI 不再服务 V4 Flash）；经 OR 路由而非直连 DeepSeek 是全项目统一的隐私考量
 
 总成本：~$0.010/次追问（无 P1 触发）；P1 触发时 ~$0.015（+$0.005 额外 Parallel）
 ```
@@ -458,11 +622,16 @@ Step 4  openai/gpt-5.6-luna（非pro）via OR（主，stage `tg_followup`，issu
 
 **TG 追问流水线**（`telegram_commands.py::_load_framework()`）：从 `Finance/金融资产信息.md` 提取：总体构架（目标配置比例）+ Dream Bucket 逻辑（高弹性标的选择标准）。注入 Claude 的 system message，跨调用复用。
 
-**AM/PM 日报**（`run_finance.py::_load_framework()`）：从 `Finance/Investment Operating Manual v1.0.md` 提取第 6 节 Portfolio Construction 与第 7.4 节 Expectation Gap，连同持仓快照注入 Pass 2 user message。能力圈边界仅在 system prompt 写一句，不再要求对每只异动逐项归类或声明“无加减仓依据”。`sas_candidate_extract` 独立读情报快照段落和完整持仓信号，输出原有 `sas_candidates` JSON；`sas_review.py` 不变。
+**AM/PM 日报**（`run_finance.py::_load_framework()`，2026-07-08 起，issue #30）：改从 `Finance/Investment Operating Manual v1.0.md` 提取三段运行性规则——第2节能力边界、第6节 Portfolio Construction（含认知提升标准/减仓触发情形，2026-07-09 issue #34 起不再用字母代号标注）、第7.4节 Expectation Gap 内部信号清单——按标题正则定位，Manual 编辑后自动同步无需改代码。与 `_get_portfolio_snapshot()` 一同注入 **user message**（Layer B，非 system message）。Pass 2 prompt 同步新增以下分析要求（均为描述性小标题，不用编号，issue #34 一并把互相引用改为内联复述）：能力圈内外标注（圈外驱动因素须显式标注“不构成操作依据”），持仓异动核对（唯一允许给出加减仓建议的依据来源，对照认知提升/减仓具体标准逐条核对，不满足则明确声明不构成依据），SAS候选证据标注（命中7.4内部信号/认知提升标准时输出 `sas_candidates` 字段，见 issue #31）。不自动计算 SAS 分数（仍为人工季度任务，见 issue #32）。
 
 ### 7.1b 持仓计算信号（user message，纯计算，零LLM/搜索成本，issue #33）
 
-`fetch_52week_stats()` 与 `_get_portfolio_weights()` 仍提供代码计算事实。报告 Pass 2 只在 52 周创新高/低、单一持仓跨过 15% 阈值时注入；FRED 整体档位变化同理。上次状态取成功写出的前一份情报快照 `context_state`，无数据的单次拉取不会清空已知状态。SAS 候选提取继续接收完整计算信号。
+`_compute_holding_signals()` 将两项计算结果注入 Layer B，与持仓快照、投资框架并列：
+- **52周区间百分位+距历史高点回撤**（`fetch_prices.py::fetch_52week_stats()`，yfinance period="1y"；issue #63 起 bulk 缺失时 `Ticker.history` 重试一次，并在拉取期间压低 yfinance ERROR 以免 healthcheck 误报），对应 Manual 7.4 节"股价相对位置"信号，代码算好不让 LLM 从文本自行估算
+- **持仓占组合%**（`_get_portfolio_weights()`，市值÷组合总USD市值），对应 Manual 第6节的仓位结构性超载减仓情形（>15%），“持仓异动核对”那条分析要求直接读取这个计算值判断，不再让 LLM 自己从持仓快照文本估算百分比
+- 适用范围仅限核心主动个股（排除 QQQM/VOO/EWJ/SGOL/BOXX/CASH），与 Manual 第1节三层结构对齐
+
+**PR #89 起的注入方式**：Pass 2 不再每次注入全量数值。`pass2_context.current_state()` 把 FRED 档位、是否跨过 15%、52 周新高/新低记为 `context_state` 存入情报快照，`changed_background()` 与上次成功报告的快照比较，只把发生变化的项注入 Pass 2 的 Layer B（减少“15%/结构性超载”一类套话）。SAS 候选抽取仍拿全量持仓计算信号。
 
 ### 7.2 持仓快照（user message，每次追问刷新）
 
@@ -493,36 +662,35 @@ IB美股持仓（成本价为均价，浮盈%为报告日数据供参考，实�
 
 所有 LLM 调用统一走 **OpenRouter**（`https://openrouter.ai/api/v1/chat/completions`）。不再有任何 DeepSeek 直连。
 
-**选型不再硬编码在各脚本里（issue #11，2026-07-25）**：下表的模型、provider 路由、thinking 预算、max_tokens、temperature 全部来自 `scripts/llm_config.py` 的 stage 定义，可由项目根目录的 `llm_config.json`（**git 追踪，非 gitignore**——最初照搬 `tg_offset.json` 那类运行时状态文件的套路做成了 gitignore，后来意识到这是人手改的、有意图的配置决策，跟 `watchlist.md` 是同一类东西而非机器写的临时状态，且不含任何敏感信息，没理由不入库；追踪进 git 不影响"改了立即生效不用走 PR"这条特性——那是 loader 每次读文件决定的，git 只是白得一份可追溯的修改历史）在运行时覆盖，无需改代码/走 PR。`llm_config.py` 内置的 DEFAULTS 即下表内容，也是唯一的最终兜底：配置文件缺失、JSON 损坏、字段类型/取值非法时逐字段回退到默认值并记日志，不会让流水线崩掉。每一处生效的覆盖在加载时记 INFO 日志（`LLM config override: <stage>.<field>: old -> new`）——git log 能看出改了什么、什么时候提交，但看不出某个具体进程运行时是否真的读到了这次改动，INFO 日志补的是这一层。仓库内 `llm_config.example.json` 是 schema 与默认值的说明性模板（有测试断言它与 DEFAULTS 完全一致）。
-
-stage 名与调用点对应：`am_calibration` / `report_pass2` / `sas_candidate_extract` / `macro_brief` / `tg_preprocess` / `tg_gap_detect` / `tg_research` / `tg_followup`。
+**选型不再硬编码在各脚本里（issue #11，2026-07-25）**：下表全部来自 `scripts/llm_config.py` 的 stage 定义（当前 8 个：`am_calibration`/`report_pass2`/`sas_candidate_extract`/`macro_brief`/`tg_preprocess`/`tg_gap_detect`/`tg_research`/`tg_followup`；`report_pass1` 与 `semantic_filter` 已随 PR #89 删除），可由项目根目录 `llm_config.json`（**git 追踪，非 gitignore**——最初照搬 `tg_offset.json` 那类运行时状态文件的套路做成 gitignore，后来意识到这是人手改的、有意图的配置决策而非机器写的临时状态，跟 `watchlist.md` 是同一类东西，且不含任何敏感信息，没理由不入库；追踪进 git 不影响"改了立即生效不用走 PR"——那是 loader 每次读文件决定的，git 只是白得一份可追溯的修改历史）在运行时逐字段覆盖，无需改代码/走 PR。`llm_config.py` 内置 DEFAULTS 是唯一最终兜底：配置缺失/损坏/字段非法逐字段回退默认值并记 WARNING，不让流水线崩；新增跨字段校验——`max_tokens` 必须比 `thinking.budget_tokens` 多至少 500，否则两个字段一起回退（防止手改配置复现 issue #53 的预算耗尽）。每处生效覆盖记 INFO 日志（`LLM config override: <stage>.<field>: old -> new`）。仓库内 `llm_config.example.json` 是 schema 说明模板（有测试断言与 DEFAULTS 一致）。**语义过滤（#3）已于 2026-07-23（issue #53/PR #54）切换为非 DeepSeek 模型且不再 pin provider；`tg_gap_detect`（#6b）与 `tg_preprocess`（#5）已于 2026-07-25（issue #11）同样切换，原因是实测发现两处生产 bug（见表后新增注记与文末变更记录）。**
 
 | #   | 调用位置 | 用途 | 主力模型 | Fallback | max_tokens | 成本估算 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1b  | `calibration.py::_evaluate_am_predictions()`（stage `am_calibration`） | PM slot：对照实际数据核验 AM「可验证信号」，产出知识条目 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #59/#60——从 `report_pass1` stage 拆分为独立 stage，避免未来调 report_pass1 预算/模型时静默影响这个无关的判断） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.0005 |
-| 2   | `run_finance.py` Pass 2 | 整合情报快照、Sonar 与个人上下文生成最终报告 | `openai/gpt-6-luna` via OR/OpenAI（provider锁定，不允许fallback到其他provider；`reasoning={"effort":"xhigh"}`，issue #90；此前 issue #60 从 `deepseek-v4-pro+thinking` 换到 `gpt-5.6-luna`/high，见文末记录）。`finish_reason=length` 的截断正文视为失败：重试→fallback→代码摘要+TG告警（2026-09-23） | `google/gemini-3.5-flash` OR flex | 32000（HTTP 读超时 `max(180, max_tokens//50)`=640s） | ~$0.02（未核实精确单价） |
-| 2b  | `run_finance.py` Pass 2 后（stage `sas_candidate_extract`，issue #60） | 独立提取 SAS 候选证据（原是 Pass 2 JSON 的一个字段，见上文"SAS候选证据标注"说明） | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #60，9/9 真实对抗测试验证） | `google/gemini-3.1-flash-lite` OR flex | 800 | ~$0.0003 |
-| 4   | `intel_sources.py` step 6c（stage `macro_brief`） | Sonar 宏观快照（AM/PM 各一次） | `perplexity/sonar`（OR，`search_recency_filter="day"`，2026-07-02 加，见 issue #24） | 重试1次(5s) → `””` 空节 | 1500（issue #55 由 800 提高） | ~$0.005（含固定搜索费） |
-| 5   | `telegram_commands.py` Step 1（stage `tg_preprocess`） | 统一预处理：意图分类 + 2条 query 生成 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #11/#60） | `google/gemini-3.1-flash-lite` OR flex | 600 | ~$0.0001 |
-| 6   | `telegram_commands.py` Step 3 | 追问原文情报（2条 query + P1 可选第3条 + 3 URL extract，P2 聚合 URL 优先） | Parallel.ai SDK `parallel-web==0.4.2` | Sonar（重试1次→Exa） | — | ~$0.007（无P1）/ ~$0.012（P1触发） |
-| 6b  | `telegram_commands.py` Step 3 P1（stage `tg_gap_detect`） | gap detection：是否需要第3条 query | `google/gemma-4-31b-it`（OR，provider锁定OpenInference+allow_fallbacks，issue #11/#60——原 deepseek-v4-flash 在此 prompt 上实测烧光60-token预算于隐藏推理，功能实际从未跑成功过） | fail-open（不触发即跳过） | 60 | ~$0.0001 |
-| 7   | `telegram_commands.py` Step 4（stage `tg_followup`） | 个人化推理 | `openai/gpt-5.6-luna`（非pro）via OR/OpenAI（provider锁定，不允许fallback到其他provider；`reasoning={"effort":"high"}`，issue #60——原 `deepseek-v4-flash+thinking` 实测同样会无视 `budget_tokens` 软上限烧穿 `max_tokens`，7/7 真实调用验证新配置） | `x-ai/grok-4.5`（OR，`reasoning={"effort":"medium"}`，max_tokens 8000） | 16000 | ~$0.01（模型换成本结构不同，未核实精确单价） |
+| 1b  | `calibration.py::_evaluate_am_predictions()`（stage `am_calibration`） | PM slot：核验AM可验证信号 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference，issue #59——从report_pass1拆分为独立stage） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.0005 |
+| 2   | `run_finance.py` Pass 2（stage `report_pass2`） | 整合情报快照、Sonar 与个人上下文生成最终报告，report_md 直接输出裸 markdown | `openai/gpt-6-luna` via OR/OpenAI（provider 锁定不允许 fallback 到其他 provider；`reasoning={"effort":"xhigh"}`，issue #90/PR #91；此前 issue #60 从 `deepseek-v4-pro`+thinking 换到 `gpt-5.6-luna`/high，原因见文末变更记录）。**截断正文判为失败**（PR #94）：`finish_reason=length` 时即使正文非空，也依次走同模型重试 → fallback → 代码摘要 + TG 告警 | `google/gemini-3.5-flash` OR flex | 32000（PR #94 由 16000 提高；HTTP 读超时 `max(180, max_tokens//50)`=640s） | ~$0.02（未核实精确单价） |
+| 2b  | `run_finance.py` Pass 2后（stage `sas_candidate_extract`，issue #60） | 独立提取SAS候选证据（原是Pass 2 JSON的一个字段） | `google/gemma-4-31b-it`（OR，provider锁定OpenInference，9/9真实对抗测试验证） | `google/gemini-3.1-flash-lite` OR flex | 800 | ~$0.0003 |
+| 4   | `intel_sources.py::_sonar_macro_brief()`（stage `macro_brief`） | Sonar 宏观快照（AM/PM 各一次） | `perplexity/sonar`（OR，`search_recency_filter="day"`，2026-07-02 加，见 issue #24） | 重试1次(5s) → `””` 空节 | 1500（2026-07-23 起，issue #55；此前 800 会在 finish_reason=length 时静默截断且无日志可查） | ~$0.005（含固定搜索费） |
+| 5   | `telegram_commands.py` Step 1（stage `tg_preprocess`） | 统一预处理：意图分类 + 2条 query 生成 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference，issue #11/#60——实测 temperature=0 下 deepseek-v4-flash 对同一条简单指令连续3次调用给出3种不同错误结果，见第8.1节注记） | `google/gemini-3.1-flash-lite` OR flex | 600 | ~$0.0001 |
+| 6   | `telegram_commands.py` Step 3 | 追问原文情报（2条 query + P1 可选第3条 + 3 URL extract，P2 聚合 URL 优先） | Parallel.ai SDK `parallel-web==0.6.0` | Sonar（重试1次→Exa） | — | ~$0.007（无P1）/ ~$0.012（P1触发） |
+| 6b  | `telegram_commands.py` Step 3 P1（stage `tg_gap_detect`） | gap detection：是否需要第3条 query | `google/gemma-4-31b-it`（OR，provider锁定OpenInference，issue #11/#60——原 deepseek-v4-flash 在 60-token 预算下实测把预算全烧在隐藏推理上，`content=None`，自己的 try/except 静默吞掉异常返回 None，跟"正确判断无需补搜"完全无法区分——这个功能自 2026-05-23 上线起大概率从未真正生效过） | fail-open（不触发即跳过） | 60 | ~$0.0001 |
+| 7   | `telegram_commands.py` Step 4（stage `tg_followup`） | 个人化推理 | `openai/gpt-5.6-luna`（非pro）via OR/OpenAI（provider锁定，`reasoning={"effort":"high"}`，issue #60——原deepseek-v4-flash+thinking实测同样会无视budget_tokens软上限烧穿max_tokens） | `x-ai/grok-4.5`（OR，`reasoning={"effort":"medium"}`，max_tokens 8000） | 16000 | ~$0.01（未核实精确单价） |
 | 8   | `sas_review.py`（季度手动/自动触发，issue #32） | 直接打 SAS 四维度分（Strategic Space/Execution/Expectation Gap/Alpha Potential） | `~anthropic/claude-sonnet-latest`（OR） | 无（v1 故意不接，观察实际效果后再评估） | 4000 | ~$0.05（OR `usage.cost` 实际读取，无硬编码价格表） |
+
+**已删除的 stage（PR #89）**：#1 `report_pass1`（LLM Pass 1 草稿 + `tavily_queries`，最后为 `gemma-4-31b-it`）与 #3 `semantic_filter`（开放池语义排序，最后为 `gemma-4-31b-it`）随情报快照重构从主流程移除，`llm_config.py` DEFAULTS 与 `llm_config.json` 中已无这两个 stage。Pass 1 现为代码实现（`intel_deepen.py`，见 §5.1b）。表后关于 #3 的注记保留作选型记录。
 
 **OR provider 实测结论（2026-06-02）：**
 - **V4 Flash**：DigitalOcean（FP16，高精度）、Venice（US 机房，全精度，实测可用）、StreamLake（OR 默认路由，精度未知，已在 OR 账户排除）可用。NovitaAI 不再服务 V4 Flash。
-- **V4 Pro**：Together、Fireworks 可用，必须传 `thinking:enabled+budget_tokens`，否则 content=None。DigitalOcean 不服务 V4 Pro。
+- **V4 Pro**：2026-06-02 实测时 Together、Fireworks 可用且 DigitalOcean 不服务；**此结论已过时**——实际生产日志（2026-07-15至今）显示 Pass 2（v4-pro，thinking=enabled）绝大多数调用实际路由到 **DigitalOcean** 并成功返回内容，Together/Fireworks 从未在日志中出现过。偶尔 fallback 到 NextBit/Cloudflare/Alibaba（均非 pin 列表内，靠 `allow_fallbacks:True` 自然转移）。必须传 `thinking:enabled+budget_tokens` 的结论仍成立（否则 content=None），但“DigitalOcean 不服务 V4 Pro”这条已不再准确（2026-07-23 核实，未改代码仅修正本行描述）。
 - **thinking 参数兼容性**：Flash 不得传 `thinking:disabled`（StreamLake fallback 时会导致 content=None）；Pro 必须传 `thinking:enabled`。
-- **Flash 开 thinking 的适用边界（issue #11，2026-07-25）**：TG 追问 Step 4 显式开 `thinking:enabled`（budget 3000）——不开时开放式持仓推理的答案质量明显更差。但这只对"输出预算充裕"的调用成立：issue #53 的生产崩溃正是 `max_tokens=80` 的判别式小任务被 reasoning token 吃光预算、`content` 返回 null。因此 Step 4（12000）与 gap detection（60）在 `llm_config.py` 中是两个独立 stage，互不共享 thinking 设置；Step 4 的响应解析也不再直接 `.strip()` content，`content` 为空且 `finish_reason=length` 时给出明确的"预算耗尽"提示而非抛异常。
-- **判别式/分类式小任务优先用天生无 reasoning 开关的模型，而非"关掉 thinking 的 DeepSeek"（issue #11，2026-07-25，参考 Obsidian `Hermes/Homepage/LLM-No-Reasoning-eval设计与实现.md`）**：`deepseek-v4-flash` 未显式传 `thinking` key 时，OpenRouter 侧默认值是否为 enabled 不可控，且同一 prompt 反复调用的隐藏推理量本身不稳定——`tg_gap_detect`（60-token 预算）和 `tg_preprocess`（意图分类+字段抽取）两处实测均复现出真实故障（前者预算耗尽返回 null content；后者 temperature=0 下同一条指令 3 次调用给出 3 种不同错误结果，含枚举外的幻觉 action 值）。`google/gemma-4-31b-it` 在同一 prompt 上零 reasoning token、输出稳定，已在跨项目题库（`LLM-No-Reasoning-eval`，21 case × n=10 全量测试 100% 通过）验证为这类"精确抽取/分类/格式服从"任务的默认推荐，不需要每个项目各自重新测。已知代价：`tg_preprocess` 的 `relevant_tickers` 字段在跨标的关联问题上比 deepseek 曾经给出的结果更保守（如"高通被制裁"只标 QCOM，不主动带出 INTC/NVDA），但 deepseek 自己在同一测试里也未能稳定给出这个"更丰富"的结果，不能算可靠优势。
-- **`report_pass1`/`am_calibration` 同样属于该模式，只是发现得晚（issue #59，2026-08-03/04）**：两个 stage 均是"结构化生成+判断"任务而非开放式推理，此前误以为"不传 thinking key 就默认不推理"，2026-08-03 两次真实生产故障（AM 主报告、PM 校准分别 2/3、3/3 调用被 reasoning 吃满 `max_tokens`）证伪了这个假设。切至 `google/gemma-4-31b-it` 后用同日真实数据重建两种 prompt 形状验证 6/6 通过（`deepseek-v4-flash` 对照组同条件下 4/4 复现故障），PR #61 实现。同批核查发现 `tg_followup`（唯一保留 `deepseek-v4-flash` 的 stage，因需要真实开放式推理）在压力测试下也会无视 `thinking.budget_tokens` 软上限（1/3 次烧穿 `max_tokens`），因已有 fallback 兜底且真实生产 0 次失败，未与 report_pass1 同批处理，另开 issue #60 跟踪；候选 `openai/gpt-5.6-luna`（非pro）+`reasoning.effort=high` 已验证 7/7 可行但未实施（需要代码改动，非纯配置切换）。
+- **BYOK 对 provider pin 的实际影响（2026-07-23，issue #55）**：本账号在 OpenRouter 配置了 BYOK（Bring Your Own Key，DeepSeek 官方 API token）。issue #53 排查时观察到 `DS_OR_PROVIDERS` pin 到 `["DigitalOcean", "Venice"]` 仍有调用被路由到未 pin 的 `Alibaba`，当时归因为“OR provider pin 机制本身不可靠”——这个结论需要修正。更准确的解释是：BYOK 连接的 provider 容量/限流耗尽时，`allow_fallbacks: True` 会让请求自然降级到 pin 列表之外的 provider（如 Alibaba），这是预期行为，不是 pin 机制失效。下次遇到类似“路由到未 pin 的 provider”现象，应先查 BYOK 状态和该 provider 的限流情况，而不是怀疑 OR 路由逻辑本身。
 
 **注：**
-- #6 Parallel.ai SDK `parallel-web==0.4.2`（Hermes 容器版本），DI 宿主机使用同一版本；search 返回 WebSearchResult，extract 返回 ExtractResult；dedup → P2 聚合 URL 排序 → extract top 3；每篇正文截 4000 字
+- #6 Parallel.ai SDK：DI 宿主机 `requirements.txt` 为 `parallel-web==0.6.0`（2026-09-24 核对；此前文档写的 0.4.2 是 Hermes 容器版本）；search 返回 WebSearchResult，extract 返回 ExtractResult；dedup → P2 聚合 URL 排序 → extract top 3；每篇正文截 4000 字
 - #6 fallback 链：Parallel.ai 失败 → Sonar（重试1次5s）→ Exa model=”exa”
-- #7 历经 Claude Sonnet → Gemini 3.5 Flash（格式过于机械否决）→ DeepSeek V4 Flash via OR/DigitalOcean（当前，2026-07-25 起开 thinking）；决策依据：Hermes/DI 对比验证”数据质量 > 模型档次”原则。fallback 由 `x-ai/grok-4.3` 升级为 `x-ai/grok-4.5`（2026-07-25 用真实调用验证 slug 与 `reasoning.effort` 参数均被 OR 接受，provider=xAI）
-- #4 step 6c Sonar 失败：重试1次 → `””` 空节（RSS 14源 + Sonar Extract 已覆盖宏观面，不走 Exa）
+- #7 历经 Claude Sonnet → Gemini 3.5 Flash（格式过于机械否决）→ DeepSeek V4 Flash via OR/DigitalOcean → `openai/gpt-5.6-luna`/high（当前，issue #60）；决策依据：Hermes/DI 对比验证”数据质量 > 模型档次”原则
+- #4 Sonar 失败：重试1次 → `””` 空节（宏观面由 7 RSS 源 + Guardian 进入情报快照的地缘话题覆盖，不走 Exa）。Sonar 输出用于 Pass 2 正文、PM 校准和 Context Log，不进 SAS 候选抽取
 - OR flex 延迟实测约 12-15s，作为应急路径可接受；gemini 模型不接受 `thinking` 参数，fallback 调用自动去掉
+- #3 2026-07-22 生产环境真实崩溃：`deepseek-v4-flash` 即使不发 `thinking`/`reasoning` key，仍隐式产生 reasoning token 吃满 `max_tokens=80`，`content` 返回 `null`，`.strip()` 直接抛异常；同时确认 `DS_OR_PROVIDERS` provider pin 并未被 OpenRouter 可靠遵守（该次事故 Pass 1 两次调用都被路由到未 pin 的 Alibaba）。切换到 `google/gemma-4-31b-it`（姊妹项目 `PC611-homepage` 的 LLM-eval 框架测出的唯一 100% 通过模型，用真实 prompt 模板验证 `reasoning_tokens=0`），不再 pin provider，真实 provider 信息改为动态串联进 TG 状态消息（此前硬编码 `"OR/DigitalOcean"` 掩盖了真实路由数月）。函数 `_haiku_relevance_filter()` 同时改名为 `_semantic_relevance_filter()`（原名从未用过 Haiku）。详见 issue #53/PR #54
 
 ### 8.2 重要认知
 
@@ -554,6 +722,8 @@ gap detection（P1）：   —              —               ~$0.0001（fail-op
 
 fallback 时成本：Sonar($0.005) + V4 Flash($0.002) ≈ $0.007；Exa($0.005) + Grok($0.005) ≈ $0.010。
 注：中间方案 Gemini 3.5 Flash（$0.003）因输出质量不如 V4 Flash 被否决（过于关注格式正确性）。
+
+**表中“当前”列已过时（2026-09-24 标注）**：预处理与 gap detection 自 issue #11/#60 起为 `google/gemma-4-31b-it`，推理合成自 issue #60 起为 `openai/gpt-5.6-luna`/high（fallback `x-ai/grok-4.5`），见 §8.1。换模型后的单次追问成本尚未用 OR 账单核实，上表数字不再代表现状。
 
 ---
 
@@ -636,28 +806,52 @@ tail -f /tmp/ibkr_keepalive.log                 # keepalive（每 5 分钟 auth 
 ├── scripts/
 │   ├── run_finance.py              主入口，报告生成流程
 │   ├── fetch_prices.py             yfinance 价格拉取
-│   ├── intel_collect.py            免费信源收集、实体匹配与原子情报快照
-│   ├── intel_pass0.py              情报快照构建与历史回放
-│   ├── intel_deepen.py             代码 Pass 1 搜索/Extract
-│   ├── intel_render.py             Pass 2 输入与代码降级渲染
-│   ├── recent_coverage.py          近五交易日同标的报道
-│   ├── fetch_news.py               RSS 来源清单及旧接口
-│   │   ├── memory_context_finance.py   KB 上下文注入
+│   ├── fetch_news.py               RSS + Guardian 聚合
+│   ├── intel_pass0.py              Pass 0 情报快照入口 build_intel_snapshot()；--replay 回放（issue #87 PR #88/#89）
+│   ├── intel_collect.py            按标的收集 Finnhub/Google News/RSS/Guardian、别名匹配、ETFS 常量、archive_intel_snapshot()
+│   ├── intel_deepen.py             代码 Pass 1：直链/302 解析、按需搜索、Extract 补齐（PR #96）
+│   ├── intel_render.py             情报快照 → Pass 2 输入段落（条数上限）与代码摘要降级
+│   ├── pass2_context.py            背景信号 context_state 与变化判断（FRED 档位/15% 仓位/52 周高低）
+│   ├── recent_coverage.py          近 5 个 NYSE 交易日已报道内容抽取
+│   ├── publication_window.py       报告与回放共用的交易日发表窗口计算
+│   ├── eval/                       issue #87 回溯评估集与收集召回验收入口
+│   ├── intel_sources.py            Sonar 宏观 / Polymarket / Adanos / Apify Reddit / FRED + 字段消毒（issue #17/#26/#38）；fetch_brave_news()、fetch_finnhub_news() 仍在但主报告不再调用
+│   ├── scoring_utils.py            关键词锚定与信源置信度打标（_source_confidence_tags 被 intel_deepen 复用）
+│   ├── report_writers.py           报告/状态消息格式化辅助函数（_fmt_llm_meta 等，从 run_finance.py 拆分）
+│   ├── calibration.py              AM 预判校准闭环（evaluate_am_calibration 等，issue #10，从 run_finance.py 拆分）
+│   ├── llm_client.py               call_llm() 统一 LLM 调用层（重试 + OR flex fallback + parse_llm_json，从 run_finance.py 拆分）
+│   ├── llm_config.py               每-stage LLM 选型 + 运行时覆盖加载器（issue #11，可由 llm_config.json 运行时覆盖）
+│   ├── budget_trackers.py          各个预算 tracker 对外共享接口（内部委托 quota_store.py，issue #41）
+│   ├── quota_store.py              Tavily/SerpApi/Adanos/Apify/Brave 五个 tracker 共享的 load/save/remaining 原子操作（issue #41，叶子模块）
+│   ├── memory_context_finance.py   KB 上下文注入
 │   ├── telegram_commands.py        TG bot + 追问流水线
+│   ├── telegram_utils.py           call_telegram() 共享容错层（run_finance.py 与 telegram_commands.py 共用，issue #20-23）
+│   ├── finance_email.py            Resend 邮件客户端
 │   ├── sas_review.py               季度 SAS 深度复盘（issue #32，2026-07-09），已接入 PM launchd 串联运行（第九节9.1），详见第十二节
 │   ├── sec_edgar_utils.py          封装 edgartools：Form 4 内部人买入过滤 + 10-K risk factors 取值
-│   └── migrate_reports.py          旧格式迁移（一次性）
+│   ├── backfill_drawers.py         MemPalace 历史 drawer 一次性回填（已完成，保留供参考）
+│   ├── migrate_reports.py          旧格式迁移（一次性）
+│   └── test_*.py                   无 pytest 依赖的回归测试（2026-09-24 共 13 个；含 test_issue87_pass0/pass2/switch、test_llm_config、test_intel_sources_sanitize、test_telegram_followup_reason 等；#72/#80/#82 与语义过滤测试随 PR #89 删除）
 ├── .venv/
+├── llm_config.example.json         LLM 选型 schema 与默认值说明模板（git 追踪，issue #11）
+├── llm_config.json                 实际生效的 LLM 选型覆盖（git 追踪，目前内容与 DEFAULTS 完全一致——没有覆盖，可直接编辑，不需 PR）
 ├── sas_tracked_tickers.json        SAS 永久追踪标的列表（原子写入，人工才能移除）
 ├── sas_review.lock                 sas_review.py 并发锁（运行时产生，非代码仓库内容）
 ├── finance_tavily_budget.json      Tavily 每日计数
 ├── finance_serpapi_budget.json     SerpApi 月度计数（首次使用时自动创建）
+├── finance_brave_budget.json       Brave News 月度计数（issue #14）
+├── finance_adanos_budget.json      Adanos X 舆情月度计数（issue #17）
+├── finance_apify_budget.json       Apify Reddit 舆情月度计数（issue #17）
 ├── tg_offset.json                  TG getUpdates offset
-├── archives/                       情报快照存档（Obsidian 之外，不被 mine）
+├── entity_alias_cache.json         Finnhub profile2 补全的实体别名缓存（gitignore）
+├── archives/                       情报快照与历史 Extract 存档（Obsidian 之外，不被 mine）
 │   └── YYYYMM/
-│       └── YYYY-MM-DD-{slot}-intel-snapshot.json
+│       ├── YYYY-MM-DD-{slot}-intel-snapshot.json   PR #89 起每次运行原子写入
+│       └── YYYY-MM-DD-{slot}-extract.md            PR #89 起停止新写，历史保留
 └── backups/                        本地备份镜像（gitignore，不进代码仓库）
     └── 预判校准记录_backup.md      与 Obsidian 预判校准记录.md 同步写入，防 Obsidian 侧丢失
+
+注：`run_finance.py` 自 2026-07 起逐步拆分出上述叶子模块（budget_trackers/quota_store/intel_sources/scoring_utils/report_writers/calibration/llm_client/telegram_utils），自身仅保留主流程编排与调用胶结，具体拆分过程见 Daily Intelligence 开发部署日志各对应 issue。
 
 Obsidian Vault/
 ├── Hermes/Daily Intelligence/
@@ -784,7 +978,7 @@ Obsidian Vault/
 - **Sonar 宏观快照防过时/防幻觉（issue #24）**：详见第五节 Sonar 部分。
 
 **待规划**
-- **候选统一打标层（issue #14，并入方向 4；旧插入点已作废）**：原计划放在 `score_and_filter()` 与 `_haiku_relevance_filter()` 之间；这两个阶段已由 issue #87 的情报快照和代码深挖替换，不能按旧方案接入。若后续获准实施，应在 `intel_deepen.py` 的候选链接选择、实际 Extract 之前评估相关度（direct_company_news/sector_related_news/macro_market_news）及信源形态（wire_article/video_hub/aggregator_listing）。可通过 URL 路径 `/video/`、`/watch/` 等识别视频/聚合页，同事件优先文章版；用户此前决定先观察再评估优先级。
+- **候选统一打标层（issue #14，并入方向 4）**：`score_and_filter()` 之后、`_semantic_relevance_filter()` 之前加统一打标步骤，产出两个 tier：相关度（direct_company_news/sector_related_news/macro_market_news，来自 #14）+ 信源形态（wire_article/video_hub/aggregator_listing，来自 #19 方向 4）。信源形态判断前移到候选阶段（URL 路径正则前筛 `/video/`/`/watch/` 等），而非现有 `_detect_low_structure()` 那样等 extract 抹完全文才事后判断——能在花 Tavily extract credit 之前就把视频/聚合页候选降权。同域名同事件时优先保留文章版，视频版降权/丢弃。用户决定先观察一段时间再评估优先级。
 - MemPalace 细切片：月度报告目前整文件级 drawer，跨日报 embedding 较粗；可在 run_finance.py 写报告后直接 mempalace_add_drawer 做 per-day 切片，不增加 Obsidian 文件
 - TG 追问后置 Extract：Sonar 返回引用 URL 后对前 1-2 个 URL 调 `tavily_extract()`，补全文作为 Claude 辅证证据，仅当异动标的且 budget ≥ 2cr 时触发
 
@@ -838,6 +1032,7 @@ Daily Intelligence 原本只有一条频次流水线：AM/PM 日报，面向“�
 - **`NOTIFY_ONLY = True`**（当前默认）：自动扫描（无 `--ticker` 的定时运行）命中触发条件时只发邮件提醒（附手工执行命令），不自动跑分析不自动花钱。原因：财报触发逻辑尚未经生产验证，且每次真实运行花钱（~$0.05）并写入永久、难以撤销的历史记录。`--ticker`（手动）不受此开关影响，总是真实运行。观察几个真实财报季后可改 `False` 转全自动。
 - **`_has_today_entry()` 防重守卫**：自动触发前先检查 `Finance/SAS_Review/{TICKER}.md` 今天日期分节是否已存在，避免调度重复触发/进程重启后重复提醒或重复收费。
 - **`_acquire_lock()` 并发锁**（`sas_review.lock`，`fcntl.flock`，复用 `run_finance.py` 同模式）：同一时刻只允许一个实例运行，避免手动补跑与定时任务重叠。
+- **每日扫描总是发 TG 摘要**（`_send_daily_scan_summary()`，issue #35，2026-07-09）：自动扫描（无 `--ticker`）无论是否有 ticker 命中，都会发一条 Telegram 文本摘要，列出当天每个追踪 ticker 的命中/未命中状态及原因（上次财报日期+触发窗口还没到/已过，或查不到财报记录，或今日已跑过去重跳过）——解决之前"静默跳过和脚本崩溃从外部看一模一样"的可观测性缺口。`--ticker` 手动模式不发这条摘要。
 
 ### 12.7 调度接入
 
@@ -1037,30 +1232,113 @@ LLM 调用层的容错设计一直是"网络错误/5xx 重试，4xx 不重试"�
 
 ---
 
+## 变更记录追加：2026-07-19 — LLM JSON 解析统一迁移至 `llm_json_utils.parse_llm_json()`（issue #49）
+
+`sas_review.py` 此前已用跨项目 canonical JSON 提取/修复工具（`~/Homepage/llm_json_utils.py`，issue #15/PR #22 重写），但 `llm_client.py::call_llm()`（主调用 + OR flex fallback 两处）和 `telegram_commands.py::_unified_preprocess()` 仍是重写前的手写正则（fence 剥离 + 掐头去尾找花括号），后者结尾散文带花括号时会截断错位——这正是 `llm_json_utils.py` 重写要修的那类 bug，在这两处原样复现。改为统一 `sys.path.insert(0, "~/Homepage")` + `from llm_json_utils import parse_llm_json`，与 `sas_review.py` 同一引入模式。
+
+**PR review 追加修复一个真实 P1**：`parse_llm_json()` 文档声明返回类型是 `Any` 而非 `dict`——当外层 JSON 对象本身损坏但内部某个数组字段单独能完整解析时，"挑最长可解析候选"的启发式会直接返回那个数组而非修复外层对象。两处消费方都默认拿到 dict：`call_llm()` 做 `result["_llm_meta"] = {...}` 会 `TypeError`，被外层 `except Exception: return {}` 悄悄吞掉；`_unified_preprocess()` 的调用方紧接着 `cmd["_raw_text"] = text` 同样 `TypeError`，但这里没有 try/except 包裹，会直接崩掉整个 Telegram 长轮询循环。修复：两处均加 `isinstance(result, dict)` 判空，转换成既有的重试/兜底路径处理。`telegram_commands.py` 改动按坑32重启了 TG bot。commit `10e1963`，issue #49（已关闭）。
+
+---
+
+## 变更记录追加：2026-07-20 — 6 个 budget/quota tracker 参数化（issue #41）
+
+Tavily/SerpApi/Adanos/Apify/Brave 五个 tracker 的 load/save/remaining 逻辑高度重复，未参数化。新增叶子模块 `scripts/quota_store.py`（`load_quota`/`save_quota`/`remaining`），只承载这五个 tracker 真正重复的样板逻辑（读 JSON/校验周期键/原子写）；`budget_trackers.py` 五个函数改为委托调用，**公开名字/签名完全不变**，`run_finance.py`/`intel_sources.py`/`sas_review.py` 全部调用点零改动。
+
+Parallel.ai（`telegram_commands.py`）**刻意不纳入**同一契约——它的 `load` 是 setdefault 部分 schema 补全（其余五个是整体重置），`remaining` 在无上限时返回 `float("inf")`（其余五个是 `max(0, limit-used)` 的 int），且有一套跟其余五个都不同的美元加权双字段+独立通知冷却字段模型；只让 `save_parallel_budget()` 复用共享的原子写入，其余原样保留。设计上明确不参数化"何时计入用量"（Adanos 收到任何 HTTP 响应就计数 vs Apify 成功/超时计数+连接失败不计数 vs Brave 仅成功计数）和"谁来 save"——这些是已经分化的业务行为，硬塞进通用函数当 flag 只会制造新 bug。
+
+调查中额外确认两个真实 bug，同一 PR 一并修复：`sas_review.py::_fetch_tavily_context()` 对同一个 `budget` dict 做了冗余的二次 `rf.save_budget()`（`rf.tavily_search()` 内部已存过一次），已删除；`telegram_commands.py` 硬编码 `TAVILY_DAILY_LIMIT=10`，与 `budget_trackers.py` 实际生效的 `20` 不一致，TG「状态」指令用量分母显示错了一段时间，已修正为从 `budget_trackers.py` 导入真实常量。commit `b77b3f6a`，issue #41（已关闭）。
+
+---
+
+## 变更记录追加：2026-07-21 — 社交舆情第三方字段消毒（issue #38）
+
+`_polymarket_brief()`/`_adanos_x_sentiment()`/`_reddit_sentiment_brief()`（`scripts/intel_sources.py`）此前把第三方返回字段未经消毒直接拼进 markdown 注入 Pass 1/2 prompt——第三方响应里的换行符可伪造出假的 `##` 小节边界，误导 LLM 对 prompt 结构的解读。新增 `_sanitize_field()`（折叠空白+剔除控制字符+长度截断）和 `_sanitize_ticker()`（`^[A-Z]{1,5}$` 白名单 + 可选 `allowed` 参数做请求集合成员校验），三处注入点全部套用；只有 Apify Reddit 的 `ticker` 是第三方在响应里回传（不可信），Adanos/Polymarket 的 ticker 是调用方自己传入（可信），因此只有前者需要白名单校验。
+
+PR review 抓到一个真实 bug（`_sanitize_ticker` 先 `str(value)` 再判断类型——`str(None).upper() == "NONE"` 恰好匹配自己写的白名单正则，导致缺失/`null` ticker 的行不再被跳过，反而渲染进 prompt——这正是修复本身引入的回归，见 `docs/PITFALLS.md#84`）。经两轮 review 全部修复并补充 `scripts/test_intel_sources_sanitize.py`（8/8 通过）。commit `f519cd5`，issue #38（已关闭）。详见 [第 5.1 节](#五一数据采集) 社交舆情段落。
+
+---
+
+## 变更记录追加：2026-07-23 — 语义过滤模型从 deepseek-v4-flash 切换至 google/gemma-4-31b-it（issue #53/PR #54）
+
+**触发原因**：2026-07-22 生产环境真实崩溃，`_haiku_relevance_filter()`（Layer 2b 语义排序）报 `'NoneType' object has no attribute 'strip'`。排查确认：`deepseek/deepseek-v4-flash` 即使不发送 `thinking`/`reasoning` key，在当前 OpenRouter 路由下仍会隐式产生 reasoning token，把该函数 `max_tokens=80` 的预算烧在看不见的思考过程上，导致 API 返回 `content: null`；同批确认 `DS_OR_PROVIDERS` 的 provider pin（`DigitalOcean`/`Venice`）并未被 OpenRouter 可靠遵守（Pass 1 两次调用实际都落到了 `Alibaba`）。
+
+**验证**：姊妹项目 `PC611-homepage` 的 LLM-eval 框架测出 `google/gemma-4-31b-it` 是唯一 100% 通过的模型；用 `_haiku_relevance_filter()` 真实 prompt 模板 + 真实形态样本数据做了两次真实付费调用（`max_tokens` 80/150），`completion_tokens_details.reasoning_tokens` 均回传 0，`finish_reason=stop`——验证通过后才切换。
+
+**实现**：`SEMANTIC_FILTER_MODEL` 切换；函数改名为 `_semantic_relevance_filter()`（原名从未用过 Haiku）；返回值从 `list[dict]` 改为 `(filtered, meta)`，真实 provider/fallback 信息串联进 `build_status_message()` TG 状态行（此前硬编码 `"OR/DigitalOcean"`）；移除不可靠的 `DS_OR_PROVIDERS` provider pin 及其在 `run_finance.py` 里因此变为无用的模块级常量。
+
+**PR review 追加修复 4 处**（协作者账号 `blacktomb42`）：`max_tokens` 80→200（原值对 prose/代码块包裹的输出余量不足）；成功响应补 usage/finish_reason 日志（含 `reasoning_tokens`），对 `finish_reason=length` 且内容为空的情况显式告警；`sem_filter_meta` 区分"从未调用 LLM"（`{"skipped": "no_results"|"no_api_key"}`）vs"主备均失败"（`{}`），修复 TG 状态消息把跳过路径误报为双重失败的准确性问题；新增 `scripts/test_run_finance_semantic_filter.py`（5/5，mock `httpx.post` 复现真实故障形态）。commit `a9cbdca`，issue #53（已关闭）。详见第 8.1 节 LLM 选型表第 3 行。
+
+---
+
+## 变更记录追加：2026-07-25 — LLM 选型集中到 llm_config.py + llm_config.json（issue #11/PR #56）
+
+**背景**：issue #11 原始范围是"评估用 Grok 4.3 替换 DeepSeek V4 Flash 做 TG 追问 Step4 主力"。用户提出三点讨论方向：① 更新过时状态文案；② LLM 选型 JSON 化，运行时可改不需要走 PR review；③ Step4 主力考虑开 thinking，fallback 升级为更强模型。三点讨论定稿后实施，范围在实现过程中扩大。
+
+**1. 状态文案修正**：`_build_status()` 硬编码 `个人化推理：{model}（Azure）`，自 2026-05-21 迁移离开 Azure/Claude Sonnet 后就是过时文案；追问回答 footer 也硬编码"V4 Flash"标签。均改为从 `llm_config` 动态取值，不会再次腐化。
+
+**2. `scripts/llm_config.py`**：全项目 8 个 LLM 调用点（`report_pass1`/`report_pass2`/`semantic_filter`/`macro_brief`/`tg_preprocess`/`tg_gap_detect`/`tg_research`/`tg_followup`）集中为 named stage，`DEFAULTS` 是唯一最终兜底。可由项目根目录 `llm_config.json` 逐字段覆盖，加载器 fail-safe：文件缺失/JSON 损坏/未知 stage 或字段/字段类型或取值非法均逐字段回退默认值并记 WARNING，不让流水线崩溃；每处生效覆盖记 INFO 日志。新增跨字段安全网 `_enforce_thinking_budget()`——`max_tokens` 必须比 `thinking.budget_tokens` 多留至少 500 headroom，不满足则两个字段一起回退（field-level 校验各自独立通过时无法发现这类组合风险，这是 PR review 提出的加固项）；`_v_providers` 透传未知 OpenRouter provider key（如 `data_collection`）而非静默丢弃；`_build()`/`stage()` 用 `copy.deepcopy` 避免多个 stage 共享的 provider 默认对象被跨 stage 污染（长驻的 TG bot 进程尤其需要这层防护）。
+
+**`llm_config.json` 一度被误设为 gitignore，当场被用户指出没有站得住的理由**：最初照搬 `tg_offset.json`/budget 计数器那类"运行时状态"文件的 gitignore 套路，没有意识到这个文件性质完全不同——它是人手改的、有意图的配置决策，跟 `watchlist.md` 是同一类东西而非机器写的临时状态，且不含任何敏感信息，没理由不入库。gitignore 掉的代价：没有审计记录（`git log` 看不到改过什么、何时改的）、文件丢失会静默退回 DEFAULTS 没人知道、而且这个决定本身让"配置文件"从未被真正创建出来（cp 模板才能用，功能等同于没做）。已改正：取消 gitignore，把该文件（当前内容与 DEFAULTS 完全一致，零覆盖）入库；代码注释/README/本文档所有"gitignored"表述一并修正（commit `fc7b91f`，直接提交 main，纯配置/文档修正无功能改动）。
+
+**3. TG Step4（`tg_followup`）**：开启 `thinking`（budget=3000，max_tokens 8000→12000，timeout 120s→180s——thinking token 先于可见输出生成，短超时会把大部分调用逼进 fallback）；fallback 由 `x-ai/grok-4.3` 升级为 `x-ai/grok-4.5`，用 OpenRouter 统一 `reasoning={"effort":"medium"}` 参数（"medium"是 effort 档位不是独立模型 slug，已用真实调用验证 slug 存在、参数生效、provider=xAI）。
+
+**实现过程中额外发现并修复两处真实生产 bug（不在原计划范围）**：`tg_gap_detect`（Step3 P1 补搜判断，60-token 预算）和 `tg_preprocess`（Step1 意图分类+字段抽取）此前都用 `deepseek-v4-flash`。用这两个 stage 各自的真实 prompt 直接实测：`tg_gap_detect` 在未开 thinking 的情况下把整个 60-token 预算烧在隐藏推理上（`finish_reason=length`，`reasoning_tokens=60`，`content=None`），函数自身的 `try/except` 静默吞掉随之而来的 `AttributeError`、返回 `None`，跟"正确判断出无需补搜"完全无法区分——这个功能自 2026-05-23 上线起大概率就没有真正生效过，只是看起来优雅地 fail-open。`tg_preprocess` 更严重：`temperature=0` 下对同一条简单指令（"删关键词 US-Iran blockade"）连续 3 次真实调用给出 3 种不同的错误结果（幻觉出枚举外的 action 值"remove_keyword"、预算耗尽 content 全空、JSON 从中间截断落到"unknown"），三次都没能给出正确的 `remove_geo`；这个 stage 是 bot 的指令路由入口而非可选增强，出错意味着用户的加/删指令表面上"没反应"或被错误分类。两处均切换为 `google/gemma-4-31b-it`（参考跨项目题库 Obsidian `Hermes/Homepage/LLM-No-Reasoning-eval设计与实现.md`，该题库 21 case × n=10 全量测试 gemma-4-31b-it 210/210 100% 通过，是目前唯一验证到零失误的候选），实测零 reasoning token、5 种指令类型全部正确复现（含直接跑通真实代码路径验证）。已知代价：`tg_preprocess` 在跨标的关联问题上 gemma 的 `relevant_tickers` 更保守，但 deepseek 自己在同一问题上也不稳定，不算可靠优势。
+
+**PR #56 review（协作者账号 `blacktomb42`）修复 2 个真实 bug**：① `answer = content or reasoning_content` 在 thinking 耗尽预算的真实场景（`content=null`+`finish_reason=length`+`reasoning_content` 含部分思维链）下，会把思维链原文当作答案返回给用户——这段思维链文本让 `answer` 变成 truthy，budget-exhausted 分支完全不会触发，等于本 PR 专门为修 issue #53 加的防护在唯一真正需要它生效的场景下失效了。修复：改为按 `finish_reason` 消歧，只有 `content` 是有效答案来源，`finish_reason=="length"` 时绝不提升 `reasoning_content`。② 主力 HTTP 200 但内容为空/预算耗尽时此前直接报错，从不尝试已配置的 fallback（只在传输层失败耗尽 3 次重试后才会 fallback）——改为空内容也走一次 fallback，跟传输失败同等对待，不再让用户对着一个能用的 fallback 被要求去改配置文件。
+
+**Review 之后又出现一条 P1 claim，实测证伪**："model-only 覆盖（只改 `model`/`thinking`，不动 `providers`）会残留跟新模型不兼容的 provider pin，导致换模型实际失效"。真实调用复现：`model=x-ai/grok-4.5` + 遗留的 `provider={order:[DigitalOcean,Venice], allow_fallbacks:true}`（这正是 `tg_followup` 默认继承到的值）——结果 HTTP 200、`provider:xAI`、正常返回，因为 `allow_fallbacks:true` 语义本身就会在 order 列表都不支持目标模型时自动路由到支持的 provider，不会报错或用错模型。对照测了 `allow_fallbacks:false`，确认这种情况下才会真的 404——但那不是默认值，也不是 review 给出的复现配置实际继承到的值。**教训与本项目一贯做法一致**：评价/验证他人（或其他 LLM）review 的 claim 要拿真实调用核实，不能只看是否读起来有道理，跟 `feedback_verify_llm_review_claims` 是同一条原则。
+
+**端到端验证**（2026-07-25，周六用 `FINANCE_FORCE_RUN=1 FINANCE_FORCE_SLOT=pm` 手动跑一次真实 PM 报告，非交易日不影响真实定时任务）：日志正确显示 `LLM tokens [report_pass1/deepseek/deepseek-v4-flash]`、`[report_pass2/deepseek/deepseek-v4-pro]` 的 stage 标签、语义过滤 `reasoning=0`（provider=Crusoe）——`llm_config` 的默认值和标签在真实流水线里生效，邮件/TG/Obsidian 全部正常发出。手动跑该脚本时用 Claude Code Bash 工具默认 2 分钟超时会被杀（历史实测完整跑一次约 2m20s，属正常耗时非异常），需要显式加长超时；被杀进程的 `finally` 清理来不及跑，`run_finance.lock` 残留旧 PID，但 `fcntl.flock` 跟进程走、进程一死锁自动释放，不阻塞重跑（见 `docs/PITFALLS.md#86`）。
+
+`telegram_commands.py` 改动已按坑32重启 `com.daily-intel.finance.telegram` 并确认加载新代码。PR #56 squash-merge（`f351dd5`），远程分支已删除，issue #11 随 `Closes #11` 自动关闭。详见第 8.1 节 LLM 选型表第 5/6b/7 行、第十节目录结构。
+
 ## 变更记录追加：2026-08-04 — `report_pass1`/`am_calibration` 切换 gemma-4-31b-it（issue #59，PR #61）
+
+> 2026-09-24 从仓库 `docs/design.md` 回补：该条当时只写进了仓库快照，Obsidian 版漏记。`report_pass1` 已随 PR #89 删除，本条保留作选型记录。
 
 **背景**：`report_pass1`（`deepseek/deepseek-v4-flash`，未显式传 `thinking` key）2026-08-03 出现两次真实生产故障——AM 主报告调用 2/3 次被隐式推理吃满 `max_tokens=4000` 预算（`finish_reason=length`）；`calibration.py::evaluate_am_calibration()` 当时复用同一 `report_pass1` stage 做 PM 校验，3/3 次全部失败，靠 `fallback_model` 兜底才拿到结果。根因与 issue #53 当年修过的"隐式推理吃光判别式小任务预算"是同一模式，只是 `report_pass1` 从未被纳入那次修复范围。
 
-**改动**（第8.1节表格、第5.5节已同步更新）：
+**改动**：
 1. `llm_config.py` DEFAULTS：`report_pass1.model` → `google/gemma-4-31b-it`，`providers` → `None`（不再走 DeepSeek 专属的 DigitalOcean/Venice pin）
 2. 新增独立 stage `am_calibration`（同样默认 `google/gemma-4-31b-it`），`calibration.py::_evaluate_am_predictions()` 改用该 stage 而非复用 `report_pass1`——理由与 `tg_gap_detect`/`tg_followup` 拆分为独立 stage 一致，避免未来调 report_pass1 预算/模型时静默影响这个无关的 PM 判断
 3. `llm_config.json`/`llm_config.example.json` 同步更新；新增回归测试 `test_calibration_uses_its_own_stage_not_report_pass1`
 
 **验证**：用 2026-08-03 当天真实生产故障数据（真实价格表、RSS、Sonar宏观快照、AM可验证信号清单）重建两种 prompt 形状直接调用 OpenRouter 对比——`deepseek-v4-flash` 同条件下 4/4 复现真实故障（确认测试 prompt 忠实复现生产条件）；`google/gemma-4-31b-it` 6/6 全部 `reasoning_tokens=0`、`finish_reason=stop`，completion 仅占预算16-20%，路由到3个不同 OR provider 均稳定；内容质量核查（非仅结构校验）确认输出正确。另用真实生产 `call_llm(stage="report_pass1")`/`calibration._evaluate_am_predictions()` 端到端冒烟测试确认代码路径正确接入。`test_llm_config.py` 21/21 通过。
 
-**同批核查（issue #60，未在本 PR 实施）**：按用户要求核查项目内剩余 `deepseek-v4-flash` 调用点，仅剩 `tg_followup`（Telegram Step 4，刻意保留以维持开放式持仓推理质量，issue #11 已验证取消 thinking 会明显降质）。压力测试发现该 stage 同样会无视 `thinking.budget_tokens=3000` 软上限（1/3 次烧穿 `max_tokens=12000`），但已有 fallback 兜底且真实生产 0 次失败，判定为低优先级、非阻断，未并入本 PR。候选 `openai/gpt-5.6-luna`（非pro）+`reasoning.effort=high` 已用同一真实数据验证 7/7 可行（`max_tokens=16000` 档更稳），但实施需要代码改动（OpenAI 系模型走 OpenRouter 统一 `reasoning` 参数而非 DeepSeek 的 `thinking` 字段）而非纯配置切换，建议单独排期。issue #59/PR #61 review（协作者 `blacktomb42`）额外指出 CLAUDE.md 状态记录和本文档未同步，均已修正。
-
-**issue #60 实施（2026-08-04）**：上面记录的候选方案已实现，另加两项在同一轮讨论中一并验证并入的关联改动。
-
-1. **`tg_followup` 切换到 `openai/gpt-5.6-luna`（非pro）+ `reasoning.effort=high`**：`max_tokens` 12000→16000（一并调整，理由与当初 8000→12000 一致——留足余量而非卡着上限）；`providers` 从 DeepSeek 的 `{order:[DigitalOcean,Venice]}` 改为锁定 `{order:[OpenAI],allow_fallbacks:false}`（避免路由到可能不遵守 `reasoning` 参数的 provider，与姊妹项目 `clip_processor.py` Stage 2 的已验证配置一致）；`telegram_commands.py::_followup_reason()` 主模型请求路径新增 `reasoning` 字段透传（此前只有 fallback 分支支持这个字段）。
-2. **`report_pass2` 的 `report_md` 脱离 JSON 包裹**：`llm_client.call_llm()` 新增 `parse_json` 参数（默认 `True`，向后兼容其余 7 个 stage），`parse_json=False` 时跳过 `parse_llm_json`，直接返回 `{"text": <裸文本>, "_llm_meta": {...}}`，仅做防御性代码围栏剥离（模型即使被要求不要包围栏，仍可能习惯性加上）。空文本视为失败走既有重试/fallback 路径，不会把空 report_md 当成功返回。`report_pass2` 模型本身**未换**（仍是 `deepseek/deepseek-v4-pro`）——上一轮真实数据对比虽然发现它在"认知提升 vs 生态位验证"判断上出现过一次自相矛盾（详见 GitHub issue #60 评论），但样本量 n=1，按当时记录的建议暂不换模型，只做架构层的 JSON 解耦。
-3. **`sas_candidates` 拆成独立 stage `sas_candidate_extract`**：不再是 Pass 2 JSON 的一个字段，而是 Pass 2 report_md 调用之后的第二次独立调用，复用同一份已组装好的价格/新闻/持仓上下文（`run_finance.py::SAS_CANDIDATE_PROMPT_TEMPLATE`），模型选 `google/gemma-4-31b-it`（9/9 真实对抗测试验证，见 issue #60 评论）。带来一个此前没有的副作用（正面）：`sas_candidates` 提取失败不再能连累 `report_md`——原先两者共享一个 JSON 信封，一次解析失败两个都丢。
-
-验证：`test_llm_config.py`（24/24）、`test_telegram_followup_reason.py`（16/16，含 `reasoning` 字段透传、`provider` 锁定断言）新增/更新用例覆盖 `parse_json=False` 的正常返回、空文本重试/fallback、`reasoning` 字段校验；另用真实生产 `llm_client.call_llm(stage="report_pass2", parse_json=False)`、`call_llm(stage="sas_candidate_extract")`、`telegram_commands._followup_reason()` 三处端到端冒烟测试确认代码路径正确接入（非仅 mock 测试）。
-
-**`report_pass2` 模型换成 `openai/gpt-5.6-luna`（同日追加，用户确认后实施）**：上一段记录的"模型本身未换、按 n=1 建议暂不换"是 PR 首次提交时的状态；用户复核上一轮真实数据对比（ORCL/CACI 事件的分类自相矛盾、SPCX 被误标为ETF两处真实问题，详见 issue #60 评论）后决定直接换模型，不再等待更多样本。改动：`report_pass2` 的 `model` 改为 `openai/gpt-5.6-luna`（非pro），`thinking` 置空、新增 `reasoning={"effort":"high"}`，`providers` 从 DeepSeek 的 `{order:[DigitalOcean,Venice]}` 改为锁定 `{order:[OpenAI],allow_fallbacks:false}`，`max_tokens` 8000→16000——与 `tg_followup` 完全同一套处理方式。`llm_client.py::call_llm()` 原先只透传 `thinking` 字段、从不发送 `reasoning`（即使 stage 配置了它）——这是本次修复顺带发现并补上的真实缺口，若不修，`report_pass2`/`tg_followup` 配置的 `reasoning` 参数会被静默丢弃，模型退化为无显式推理强度设置调用。同批，六个 `google/gemma-4-31b-it` stage（`report_pass1`/`am_calibration`/`sas_candidate_extract`/`semantic_filter`/`tg_preprocess`/`tg_gap_detect`）的 `providers` 从 `null`（不锁定）统一改为 `{order:["OpenInference"],allow_fallbacks:true}`——此前这些 stage 的真实调用观察到落在 Friendli/Crusoe/Novita/OpenInference 等多个不同 provider 上，改为显式偏好 OpenInference、允许失败时降级到其他 provider（而非强制锁死不可 fallback）。真实生产 `call_llm()` 冒烟测试确认三处均正确接入：`report_pass2` 路由到 `OpenAI`，`sas_candidate_extract` 路由到 `OpenInference`，`report_pass1` 一次实测降级路由到 `Novita`（验证了 `allow_fallbacks:true` 确实按预期生效，不是摆设）。
+**同批核查（issue #60，未在本 PR 实施）**：仅剩 `tg_followup` 用 `deepseek-v4-flash`（刻意保留以维持开放式持仓推理质量）。压力测试发现该 stage 同样会无视 `thinking.budget_tokens=3000` 软上限（1/3 次烧穿 `max_tokens=12000`），已有 fallback 兜底且真实生产 0 次失败，判定为低优先级。候选 `openai/gpt-5.6-luna`（非pro）+`reasoning.effort=high` 已用同一真实数据验证 7/7 可行，实施需要代码改动（OpenAI 系模型走 OpenRouter 统一 `reasoning` 参数而非 DeepSeek 的 `thinking` 字段），当时建议单独排期；随后的实施见下一条 2026-08-05 记录。issue #59/PR #61 review（协作者 `blacktomb42`）额外指出 CLAUDE.md 状态记录和本文档未同步，均已修正。
 
 ---
+
+## 变更记录追加：2026-08-05 — tg_followup/report_pass2 切 gpt-5.6-luna，report_md 脱离 JSON，sas_candidates 独立 stage（issue #60/PR #62）
+
+**触发原因**：`tg_followup`（issue #11 时切到 `deepseek-v4-flash+thinking`）压力测试发现 `thinking.budget_tokens` 是软性提示、不是强制上限——1/3 次真实调用无视 `budget_tokens=3000` 一路烧穿 `max_tokens=12000`。同期用户观察到 DeepSeek V4 Flash 系列表现波动，借机一并评估 `report_pass2`（`deepseek-v4-pro+thinking`）换模型。真实数据对比（2026-08-03 PM 数据重建）发现 `deepseek-v4-pro` 一处真实正确性 bug：把 ORCL/CACI 事件在 `sas_candidates` 字段归类为"生态位验证"，却在"持仓异动核对"正文里把同一事实当"认知提升-战略节点解锁"处理，给出违反 prompt 规则的加仓建议；同批还错把 SPCX 标注成 ETF。候选 `openai/gpt-5.6-luna`（非pro）+`reasoning.effort=high` 在同一测试中未出现这两个问题。
+
+**实现**（`scripts/llm_config.py`/`llm_client.py`/`run_finance.py`/`telegram_commands.py`）：
+1. `tg_followup`、`report_pass2` 均切换到 `openai/gpt-5.6-luna` + `reasoning:{"effort":"high"}`，`thinking` 字段清空；`providers` 改为硬锁定 `{"order":["OpenAI"],"allow_fallbacks":false}`（不允许降级到其他 provider，与姊妹项目 `paperview/clip_processor.py` Stage 2 的已验证配置一致）；`max_tokens` 均提到 16000。
+2. `report_pass2` 的 `report_md` 不再包在 JSON 里——`llm_client.py::call_llm()` 新增 `parse_json=False` 模式，直接返回裸 markdown 文本。原因：`report_md` 是全项目单次调用最大的 payload，也是唯二撞过 `finish_reason=length` 的 stage 之一（另一个是已修复的 `report_pass1`），JSON 包裹意味着截断发生在字符串中途会把已经写好的大半份报告一起作废；裸文本被截断只丢末尾。
+3. `sas_candidates`（issue #32，命中 Manual 7.4 内部信号清单/认知提升标准时的证据队列）从 Pass 2 JSON 的一个字段拆成独立的 `sas_candidate_extract` stage（`google/gemma-4-31b-it`），复用 Pass 2 已经组装好的价格/新闻/持仓上下文单独调用一次，互相隔离——`sas_candidates` 提取失败不再能连累 `report_md`。
+4. 六个 `google/gemma-4-31b-it` stage（`report_pass1`/`am_calibration`/`sas_candidate_extract`/`semantic_filter`/`tg_preprocess`/`tg_gap_detect`）的 `providers` 从不锁定统一改为锁定 OpenInference（`allow_fallbacks:true`）——此前观察到真实调用散落在 Friendli/Crusoe/Novita/OpenInference 多个 provider。
+
+**Review 抓到一个真实 P0**（`blacktomb42`，PR #62，两轮）：`call_llm()` 的免 JSON 路径直接复用了旧的 `content or reasoning_content or reasoning` 取值顺序——`finish_reason=="length"` 且 `content` 为空时会把部分思维链错误当成 `report_md` 正文返回、不触发重试/fallback，是 PR #56 修过的"CoT 被错误提升为答案"这个 bug 在新调用路径里的重现。用镜像 `_parse_step4_response` 判断逻辑的 `_resolve_content()` 修复，primary 和 flex-fallback 两条路径都改了。另修了 4 项非阻断建议（SAS 抽取包 try/except 隔离、hard pin 跳过 flex fallback 的行为记入注释、legacy JSON 包裹防御性 unwrap、删除死代码 `_DS_PROVIDERS`）+ 二轮 review 的 2 项残留（SAS prompt 措辞防止裸 `[]` 输出、Step4 日志措辞更新）。61/61 测试通过。
+
+**合并后验证**：squash merge `384be56`，issue #60 自动关闭。`com.daily-intel.finance.telegram` 已重启确认生效。当晚用户要求对同一交易日完整重跑一次 PM 报告（合并前 17:11 ET 已用旧代码跑过一次），产出真实生产双跑对比——`gpt-5.6-luna` 在信源怀疑度处理、"生态位验证不能直接当认知提升"规则遵守度上实测优于 `deepseek-v4-pro`；`sas_candidate_extract` 独立调用正确遵守了 fact 字段"含来源"的格式要求，旧的 Pass2 内嵌调用没有。完整对比记录见 Obsidian `Hermes/Homepage/LLM-Reasoning-eval设计与实现.md`（"生产环境双跑对比"节）和 `LLM-No-Reasoning-eval设计与实现.md`（§21.3/§21.5）。
+
+
+## 变更记录追加：2026-08-11 — fetch_52week_stats 重试 + yfinance ERROR 降噪（issue #63/PR #64）
+
+**触发**：2026-08-10 AM 主价格 18/18 成功后，Pass2 Layer B 的 `fetch_52week_stats()` 对 INTC 拉 `period=1y` 瞬时失败；yfinance 连打 3 行 `possibly delisted` ERROR，Homepage healthcheck `finance 新错误`（阈值 1）WARN；报告仍正常发出。
+
+**决策**：不做 Finnhub 1y candle fallback（免费档无权限）；只做 (A) bulk miss → `Ticker.history` + 1 次延迟重试；(B) 拉取期间 yfinance logger → CRITICAL，失败改应用 WARNING。
+
+**实现**：`scripts/fetch_prices.py`；测试 `scripts/test_fetch_52week_stats.py` 12/12。squash merge `b6acbda`，issue #63 关闭。无需重启 TG bot。
+
+## 变更记录追加：2026-08-13 — Telegram 进程级 httpx.Client（issue #65/PR #66）
+
+**触发**：KeepAlive `telegram_commands.py` 跑 8 天后 `phys_footprint` 386MB（峰值 675）；同代码 6h 到 459MB。冷启动 import 只有 38MB。
+
+**决策**：不是「httpx 没关 Client」（顶层 `post()` 已经 `with Client()`），是短命 Client+TLS 在永不退出进程里被 macOS libmalloc 碎片化。主修复 = 进程级单例 Client；连续输运失败/满 6h 重建；24h `sys.exit(0)` 交 KeepAlive。顺带 #58：`call_telegram` 补 `ConnectTimeout`。不收口 OpenRouter/Exa/Finnhub。
+
+**验收**：squash `dda8d66`，已 kickstart。同一 PID 13h10m → 58MB（旧斜率约 70MB/h）。剩余 ~2MB/h，有日切不会堆到两周后数百兆。
 
 ## 变更记录追加：2026-08-13 — 主路径 yfinance 8d/2d 降噪 + 日线按列合并重试（issue #67/PR #68）
 
@@ -1070,47 +1348,91 @@ LLM 调用层的容错设计一直是"网络错误/5xx 重试，4xx 不重试"�
 
 **实现**：`scripts/fetch_prices.py`；测试 `scripts/test_fetch_prices_yfinance_noise.py` 10/10。两轮 review 后 squash `df36a78`，issue #67 关闭。无需重启 TG bot。
 
+
+## 变更记录追加：2026-09-03/09-04 — PM 报告日线批量滞后时静默用昨收顶替今收（issue #69/PR #70，已合并 `d457455`）
+
+**触发**：用户对照 yfinance iOS App 真实数据，发现 09-03 夜盘报告 PLTR 价格描述与实际完全对不上（报告"收盘 $169.46"，真实收盘 $182.53+7.71%）。排查确认报告里的"收盘价"其实是昨收——批量扫描 6 月至今全部夜盘价格快照，确认 09-02（14/18 标的）、09-03（13/18 标的）"日内↑↓（vs前收）"集体显示 `+0.00%`，是历史级异常，此前正常噪音只有 0-5/18。
+
+**根因**：`fetch_prices.py` PM 分支在批量日线（`period=8d, interval=1d`）当天数据缺失时静默回退成批量表最后一行（=昨天），且这个 fallback 路径完全没有日志。`git log` 确认 `fetch_prices.py` 自 08-13（#67/#68）起未改动，`yfinance` 版本锁定 1.3.0 未变，launchd 调度时间未漂移——排除代码/依赖/调度侧变量，指向 Yahoo 后端日线数据落库延迟本身变得更严重/更常态化（外部数据源时序行为，不受我方控制）。
+
+**权衡**（用户提出加 fallback 接口 / 推迟取数时间 / 两者都做三个候选，均评估后否决，见 issue #69 comment）：不加新数据源——当前故障不是缺数据，是有正确数据（intraday `prepost=True` 当时已经拿到今天数据，`vs今开`/`盘后`两列因此是对的）却被代码丢弃未用；不推迟报告时间——Yahoo 侧滞后没有 SLA，推迟只是"赌赢概率"变化不是消除，且牺牲"夜盘速报"本该有的时效性。
+
+**设计与实现**（见 issue #69 comment 详细契约）：PM"今日收盘/今日开盘"改由同一次运行已拉取的 intraday（`period=2d, interval=1m, prepost=True`）提供——`_get_pm_prices()` 新增返回今日开盘（新增 `_opens_1m()`/`_field_1m()` helper），原先只被丢弃的今日常规时段收盘价改为启用；批量日线只保留给 5 日涨幅等需要多日窗口的计算。intraday 也没有今天数据时，该 ticker 直接从 `rows` 中剔除 + WARNING（`f"{ticker} PM: no intraday regular-session close available, price unavailable"`），`run_finance.py` 现有的失败标的检测无需改动就自动接管。`week_change_pct` 修正为从 `_closes_prev` 的末尾往前数 5 个交易日作为锚点。
+
+**协作者 `blacktomb42` 首轮 review 给了 REQUEST_CHANGES，抓到 2 个真实 bug，均已修复**：① `_get_pm_prices` 的"常规时段"筛选只卡了 `time<=16:00` 上界、没卡 `>=09:30` 下界——`prepost=True` 拉到的 04:00 盘前 bar 也满足这个条件，`opens_today.iloc[0]` 在真实运行中会把盘前价错误当成"今日开盘"，`vs今开` 列会算错——已改为显式 `09:30<=time<=16:00` 双边界，并在测试 fixture 里加入盘前 bar 复现。② PM 分支全部 ticker 因 intraday 也缺今天被逐 ticker `continue` 后 `rows` 为空时，函数尾部原有的 `if not rows: 走 Finnhub fallback` 仍会整表回填 regular-session 价格，绕过了刚做的硬失败设计、跳过 `run_finance.py` 的禁引声明——已改为 `slot=="pm"` 且整表落空时直接返回 `[]`，不再走 Finnhub。
+
+**测试**：`scripts/test_fetch_prices_pm_intraday_source.py` 现 3/3（新增盘前 bar 回归用例 + "Finnhub key 存在也不应被调用"断言），`test_fetch_prices_yfinance_noise.py`（10/10）无回归。本次改动仅限 `fetch_prices.py`，不涉及 `telegram_commands.py`，无需重启 TG bot。
+
+**状态**：第二轮 re-review APPROVE（附一条非阻塞 nit：`_get_pm_prices` docstring 仍写 `<=16:00` 未提 `>=09:30`，已在合并前顺手改一行同步），squash 合并至 main（`d457455`），远程分支已删除，issue #69 自动关闭。此前文档一度在 PR 未合并时预写了"已合并"，已改正——状态段只能记已发生的事。
+
 ## 变更记录追加：2026-09-21 — Digitimes RSS + 异动追因 query + 7 天围栏（issue #72/PR #73，已合并 `4a54d39`）
 
 **触发**：2026-09-21 AM INTC 盘前 +5.47% 正确标记异动，未检索到 Digitimes 英特尔-友达 Micro LED 包装新闻；Tavily 被 `INTC CL=F stock news earnings` 导向过时 Q2 财报；INTC 被异动/Pass1/rotation 各查一次。
 
 **实现**：Digitimes 加入 `RSS_FEEDS`；`_anomaly_search_jobs` 前 3 大 `|change_pct|` 各一条追因 query；7 天围栏只作用于 `_anomaly_query` job，年龄相对 `now_et`；rotation 与当天异动 ticker 去重；Pass1 `{anomaly_tickers_note}`。
 
-**Review**：初版围栏打在 pooled `score_and_filter`（砍 rotation 30 天窗）且用墙钟（FORCE_DATE 补跑误删）。已修。测试 `test_issue72_anomaly_search.py` 9/9。
+**Review**：初版围栏打在 pooled `score_and_filter`（砍 rotation 30 天窗）且用墙钟（FORCE_DATE 补跑误删）。已修。测试 `test_issue72_anomaly_search.py` 9/9。不改 `telegram_commands.py`。
 
 **未改**：rotation 命中仍进同一 `tavily_section`（issue #74）。
 
-## 变更记录追加：2026-09-22 — PM 异动覆盖 + Finnhub 公平截取（issue #76/PR #79）
+## 变更记录追加：2026-09-22 — PM 异动覆盖 + Finnhub 公平截取（issue #76/PR #79，已合并 `924f923`）
 
 **触发**：2026-09-21 PM 有 6 个异动时，Finnhub AH 内容触发旧短路，前3大异动没有 Tavily 追因；同时 #72 的去重集合错误使用全量异动，导致第4名以后虽没有 anomaly job，仍被 Pass1 与 rotation 当成“已覆盖”。Finnhub 另有全 ticker 混池只取最新15条的公平性问题。
 
-**实现**：AM/PM 均生成前3大异动 job，移除 `finnhub_covers` 死参数；job 携带 `_anomaly_ticker`，Pass1/rotation 只从实际 job 推导覆盖集合。Finnhub 保留跨 ticker 去重，改为每 ticker 各取最近5条后合并。Tavily 日预算 20→25。
+**实现**：AM/PM 均生成前3大异动 job，移除 `finnhub_covers` 死参数；job 携带 `_anomaly_ticker`，Pass1/rotation 只从实际 job 推导覆盖集合。Finnhub 保留跨 ticker去重，改为每 ticker 各取最近5条后合并。Tavily 日预算 20→25。
 
-**验证**：先写失败回归测试，覆盖 6 个 PM 异动、第四名 NVDA 不进覆盖 note 且 rotation 不跳过、Finnhub 5×5 与跨 ticker 去重、预算常量；实现后定向 13/13、全仓库 99/99、`compileall` 与 `git diff --check` 通过。issue #74 的 rotation 结果同池问题不在本次范围。
+**验证与状态**：先写失败回归测试，覆盖 6 个 PM 异动、第四名 NVDA 不进覆盖 note 且 rotation 不跳过、Finnhub 5×5 与跨 ticker 去重、预算常量；实现后定向 13/13、全仓库 99/99、`compileall` 与 `git diff --check` 通过。`blacktomb42` 对 exact head `5600abd` 的 pending review 为 0 bugs / 1 文档同步 suggestion / 0 nits，文档同步后 PR #79 squash 合并为 `924f923`，issue #76 自动关闭。未部署、未触发生产报告；issue #74 的 rotation 结果同池问题不在本次范围。
 
 ## 变更记录追加：2026-09-23 — 多日累计涨跌追因（issue #80/PR #81，已合并 `9a05d3f`）
 
-**触发**：INTC 到 09-21 累计上涨约 30% 后，09-22 当天不再是单日异动，流水线不再追催化剂。
+**触发**：INTC 从 2026-09-19 附近到 09-21 累计上涨约 30%（友达 Micro LED 先进封装）。流水线只看“今天是不是异动”。09-22 盘前 -1.28%、收盘 +1.71%，都低于 3% 单日阈值，之后没有任何机制回头追这条催化剂。
 
-**实现**：3 日绝对涨跌 ≥15% 或 5 日 ≥20% 生成 basic 追因 query，与异动 job 去重，每次最多 2 条。排除商品/FX/指数 ETF 和 AAOI。不持久化“是否已解释”。
+**实现**：`_compute_multiday_moves()` / `_unexplained_move_search_jobs()`。阈值 3 日绝对涨跌 ≥15% 或 5 日 ≥20%，3 日优先。与当日异动 job 去重，每次最多 2 条，插在异动之后、Pass 1 之前。排除商品/FX/指数 ETF 和 AAOI。不持久化“是否已解释”。Pass 1 增加 `{unexplained_move_note}`。
 
-**Review**：skip 改到多日检测之后；job 自带发布日期窗口（行情起点再往前 2 个自然日）；日线不足的窗口不触发，价格表短历史回退保留。测试 `test_issue80_unexplained_move.py` 10/10。issue #74 未改。
+**Review（`blacktomb42`，合入前已修）**：① 无单日异动且无地缘命中时，skip 发生在多日检测之前，独立触发无效。检测改到 skip 之前，有多日 job 则继续跑。② job 只设 `days`，搜索循环仍用上次报告日到今天的 `start_published_date`，夜盘会把 09-21 的催化剂切掉；`min(query_days, window+2)` 也提供不了缓冲。job 现在自带 `start_date`/`end_date`：行情第一个交易日再往前 2 个自然日，到报告日。AM 分子是前收，锚点比 PM 多回一个交易日。09-22 INTC：开盘前从 09-14 起，夜盘从 09-13 起。③ 日线不足 3 或 5 个交易日时，旧逻辑用最早收盘价仍标成完整窗口。触发档改为空、不触发；价格表 5 日涨跌的短历史回退保留。
+
+**验证**：`scripts/test_issue80_unexplained_move.py` 10/10；issue #72 9/9、#76 4/4、PM 价格 3/3、yfinance 噪音 10/10。未跑付费报告。不改 `telegram_commands.py`。issue #74 未改。
 
 ## 变更记录追加：2026-09-23 — Extract 名额预留（issue #82/PR #83，已合并 `cf9cc33`）
 
-必须解释的 ticker 预留 Extract URL，不参加开放池打分。开放池 25 → 约 15。Extract 分批，最多约 20 URL / 4cr，日上限仍 25。围栏、keyword bonus、Extract query 只读 `_must_answer_tickers()`。测试 `test_issue82_extract_reservation.py` 15/15。不改 Telegram。issue #74 未改。
+**触发**：2026-09-22 PM 重跑验证 issue #80 时，INTC 的未解释大涨 query 正确生成（`INTC stock surged 27.5% over 5 trading days...`，3 条结果），但进入 `score_and_filter` 后被同批地缘新闻的 keyword bonus 压下去。Extract 的 10 个 URL 里没有 INTC，Pass 2 仍写“没有对应的新公司级事实”。
 
-### 变更记录追加：2026-09-23（Pass 2 截断被当成功发出）
+**实现**：异动（最多 3）和未解释大涨（最多 2）各留一条 Extract URL，只在自己的结果里按域名、时效、是否视频页选，不参加开放池打分。开放池预筛 25、语义过滤约 15。`tavily_extract()` 仍是每次最多 10 个 URL；预留先发，开放池再按 10 个一批。满载约 20 个 URL、4cr。日上限仍为 25。Tavily 文档上限是单次 20 个 URL，代码里的 10 是本项目的 2cr 上限。
 
-2026-09-23 PM 报告写完“要点”后在“INTC（持仓）收于$122.57，”处断句，随后直接拼接预判校验。`report_pass2` 自 issue #90 起为 `gpt-6-luna` + `reasoning.effort=xhigh`，但 `max_tokens` 仍为 16000，推理与正文共享预算。`llm_client.py::_resolve_content()` 只拒绝 `finish_reason=length` 且正文为空的情形；非空的残缺正文作为成功返回，没有重试、fallback 或 TG 告警，运行状态也显示 Pass 2 成功。
+**一份名单**：`_must_answer_tickers()` 是唯一组装点。下游不再各自拼「这次必须解释哪些 ticker」。7 天围栏、开放池 keyword bonus、Extract 重排 query 都读这份。Extract 的预留 query 是整份名单；开放池 query 是同一份名单加地缘词。新增一类必须解释的 ticker 时，job 写 `_must_answer_ticker` 即可，不用改三处判定。
 
-修复：`parse_json=False` 路径（目前仅 `report_pass2`）新增 `_free_text()`，`finish_reason=length` 时即使正文非空也抛出可重试错误，依次走同模型重试、`fallback_model`，全部失败时由 `run_finance.py` 发送代码生成的情报快照摘要并发 TG 告警。`report_pass2.max_tokens` 16000→32000（`llm_config.py` DEFAULTS、`llm_config.json`、`llm_config.example.json` 同步）。`call_llm()` 非流式请求的超时由固定 180s 改为 `max(180, max_tokens // 50)`，32000 对应 640s，避免加大额度后读超时。PR #62 时“接受残缺正文”的测试改为“拒绝残缺正文并走 fallback”。
+**Review**：对 `d7436ea` 的意见指出预留 URL 进了 Extract，但共享 query 仍只有异动 ticker 和地缘词，安静的多日大涨不会进 Tavily 的 chunk 重排。`6af2dfc` 拆开两次意图。`bbb9a90` 把三处消费收成一份名单。
 
-### 变更记录追加：2026-09-24（Extract 补齐与直链解析日志）
+**验证**：`scripts/test_issue82_extract_reservation.py` 15/15，加上 #72 9/9、#76 4/4、语义过滤 5/5、#80 10/10。未跑付费报告。不改 `telegram_commands.py`。issue #74 未改。
 
-`intel_deepen.py`：Tavily Extract 按 `ceil(URL/5)` 计费，2026-09-23 PM 只送 7 个 URL 却付了 2cr。第一轮收集后按涨跌幅强弱顺序补齐到下一个 5 的倍数（最多 10）：先取该标的下一条不同落地域名的直链，再取搜索的第 3 条结果（`run_finance.py` 搜索 `max_results` 2→3，basic 搜索仍 1cr）。补齐 URL 排在末尾，预算不足时先被截掉。`_direct_leads()` 每次调用记录 `Deepen direct leads {ticker}: N leads, Finnhub redirects resolved a/b, X.Xs`，302 解析结果在同次运行内缓存，补齐轮不重复 HEAD。
+## 变更记录追加：2026-09-23/24 — Pass 2 截断修复、社交舆情只查个股、Extract 补齐、供给事件例外（PR #94–#97）
 
-### 变更记录追加：2026-09-24（Pass 2 供给事件例外）
+四个 PR 由云端 session 在 2026-09-23 晚至 09-24 合并（云端访问不到 vault，本节由宿主机 session 于 09-24 同步）。同步时一并把正文按 issue #87 PR #89（已合并 `65816d9`）之后的实际代码改写：第二节流程图、§5.1、新 §5.1b（情报快照与代码深挖）、§5.2、§5.4、§7.1b、第八节选型表、第十节目录结构；#89 之前的 Search+Extract 三层设计保留为 §5.1c 历史记录。#87–#93 本身在本文件中此前没有独立变更记录，其设计以正文与仓库 `docs/design.md` 为准。
 
-Pass 2 提示词原要求只写相对“此前已报道”和近五个交易日报告的新增事实，无进展即省略。已排期的供给事件（限售股解禁、增发或 ATM 发行、配售、指数纳入或剔除调整）的价格影响集中在生效日前后，按旧规则可能在生效当天被当作“无进展”省掉。现增加例外：这类事件在生效日之前和之后的报告中都要保留，写明生效日期、规模及其与当日价格或成交的关系。触发案例：2026-09-23 PM 的 SPCX 约 3.28 亿股解禁、AAOI 至多 6 亿美元 ATM 发行。
+### Pass 2 截断被当成功发出（PR #94，`778b5fc`）
 
+2026-09-23 PM 定时报告写完“要点”后，在“INTC（持仓）收于$122.57，”处断掉，后面直接接上预判校验；邮件和 TG 照常发出，TG 运行状态也显示 Pass 2 成功，没有任何告警。日志：`LLM tokens [report_pass2/openai/gpt-6-luna]: prompt=16792 completion=16000 reasoning=15781 finish_reason=length`，正文只剩约 219 token。
+
+根因两层：① issue #90/PR #91 把模型切到 `gpt-6-luna`、推理强度 xhigh，但 `max_tokens` 仍是 16000，推理与正文共用预算，被推理用光；② `llm_client._resolve_content()` 只在正文为空时把 length 截断当失败，非空的截断正文照常作为成功返回。这是 PR #62 有意留下的行为，当时有测试 `test_call_llm_parse_json_false_accepts_partial_content_on_length` 锁住它，本次改成相反的预期（拒绝残缺正文并走 fallback）。
+
+修复：`parse_json=False` 路径新增 `_free_text()`，`finish_reason=length` 时即使有正文也判为失败，依次走同模型重试 → `fallback_model` → `run_finance` 输出代码生成的情报快照摘要并发 TG 告警「Pass 2 失败」。`report_pass2.max_tokens` 16000→32000（`llm_config.py` DEFAULTS、`llm_config.json`、`llm_config.example.json` 三处同步）。`call_llm()` 非流式 HTTP 超时由固定 180s 改为 `_http_timeout()` = `max(180, max_tokens // 50)`，32000 对应 640s。
+
+补跑验证（2026-09-23 18:38 PT）：`completion=12336 reasoning=10358 finish_reason=stop`，正文约 1978 token，Pass 2 用时约 143s。对照 `gpt-5.6-luna`/high 的正文：09-22 PM 约 3423 token、09-23 AM 约 2125 token——xhigh 推理量约翻倍，正文并未变长。32000 的余量目前只有这一个样本支撑，需继续观察推理峰值（约 25000 为重新评估阈值）。
+
+### 社交舆情只查个股（PR #95，`cb67806`）
+
+09-23 PM 把 `CL=F` 发给 Adanos 返回 422；Adanos 只要收到 HTTP 响应就计入月度额度，白白消耗。新增 `run_finance._social_tickers()`：只保留 watchlist 个股中不在 `intel_collect.ETFS`（QQQM/VOO/EWJ/SGOL）里的标的，异动个股在前，最多 4 个。Adanos 与 Apify Reddit 共用这份列表。
+
+### Extract 补齐与直链解析日志（PR #96，`c7f0fa6`）
+
+Extract 按 `ceil(URL 数/5)` 计费，09-23 PM 只送 7 个 URL 却付了 2cr。第一轮收集后按涨跌幅从强到弱补到下一个 5 的倍数（最多 10）：先取该标的下一条不同落地域名的直链（只限原本就走直链、或因 Extract 名额满被跳过的标的），再取搜索结果第 3 条。`run_finance` 搜索 `max_results` 2→3（basic 仍 1cr）。补进来的 URL 排在末尾，预算不够时最先被截掉；快照新增 `extract_topup_count`。`_direct_leads()` 每次调用按标的记 INFO：`Deepen direct leads {ticker}: N leads (limit L), Finnhub redirects resolved a/b, X.Xs`；302 解析结果同次运行内缓存，补齐轮不重复发 HEAD。背景：09-23 PM 在 18:34:51（FRED）到 18:36:07（第一条 Tavily）之间 76 秒无日志，时间耗在串行 Finnhub 302 HEAD 解析上。并发解析和单标的解析上限这次不做，先看日志数据。
+
+### Pass 2 供给事件例外（PR #97，`2d596b8`）
+
+Pass 2 提示词在“无进展就省略”规则后加例外：已排期的供给事件（限售股解禁、增发或 ATM 发行、配售、指数纳入或剔除调整）在生效日之前和之后的报告里都要保留，不算“无进展”；写明生效日期、规模，以及与当天价格或成交量的关系。触发案例：09-23 PM 的 SPCX 约 3.28 亿股解禁、AAOI 至多 6 亿美元 ATM 发行。已知局限：规则只保证模型不删，不保证信息找得到；生效日当天没有相关新闻时 Pass 2 看不到该事件。候选方案“供给事件日历”（代码按日期注入）未实现。
+
+### 同一次排查的其他结论（未改代码）
+
+- Sonar 宏观快照没有浪费：用于 Pass 2 正文、PM 校准和 Context Log 三处。但 #89 之后 SAS 候选抽取的输入只剩情报快照（#89 之前还能看到 RSS、Finnhub、Sonar、社交舆情和 Tavily），是否把 Sonar 加回来未定。
+- `sas_candidate_extract` 的 `completion=13` 即 `{"sas_candidates": []}`，是正常空结果。AAOI 是观察标的，按规则不进 SAS；解禁、增发这类短期供给事件属于正文职责，不是 SAS 的职责。
+- 信息量偏少除截断外，#89 本身有结构性原因：输入收窄（无开放池，地缘话题无全文）且提示词要求“无进展就省略”。需观察几天正常报告后单独评估，#94–#97 均未处理。
