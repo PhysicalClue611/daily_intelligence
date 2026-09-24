@@ -53,7 +53,7 @@ owner 已要求把原规划 PR3 并入 #89。主流程在价格与多日涨跌�
 
 ## 当前系统状态（2026-09-24，Extract 补齐 / 社交舆情只查个股）
 
-PR #95：Adanos/Reddit 只查非 ETF 个股（`_social_tickers()`），避免 `CL=F` 这类 422 消耗 Adanos 月额度。随后一 PR：`intel_deepen.py` 把 Extract URL 补齐到下一个 5 的倍数（最多 10，同一 credit 档），搜索 `max_results` 2→3；`_direct_leads()` 按标的记录 Finnhub 302 解析次数与耗时（09-23 PM 这里静默耗时 76s）。并发解析和单标的解析上限暂不实现。
+PR #95：Adanos/Reddit 只查非 ETF 个股（`_social_tickers()`），避免 `CL=F` 这类 422 消耗 Adanos 月额度。随后一 PR：`intel_deepen.py` 把 Extract URL 补齐到下一个 5 的倍数（最多 10，同一 credit 档），搜索 `max_results` 2→3；`_direct_leads()` 按标的记录 Finnhub 302 解析次数与耗时（09-23 PM 这里静默耗时 76s）。并发解析和单标的解析上限暂不实现。Pass 2 提示词新增例外：已排期的供给事件（解禁、增发/ATM、配售、指数调整）在生效日前后都要保留，不算“无进展”。
 
 ## 当前系统状态（2026-09-23 晚，Pass 2 截断修复）
 
