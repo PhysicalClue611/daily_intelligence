@@ -51,6 +51,10 @@ owner 已要求把原规划 PR3 并入 #89。主流程在价格与多日涨跌�
 
 ---
 
+## 当前系统状态（2026-09-24，issue #105，已合并 `5b8efc8`）
+
+Pass 0 增加两路免费来源。SEC 8-K：每只个股按该标的窗口查提交的 8-K，`source=SEC 8-K`，`publisher_domain=sec.gov`，`url_kind=sec_filing`，标题含 Item 编号和 accession，渲染成「公司公告（8-K Item x.xx）」；不进 Extract。CIK 来自 SEC `company_tickers.json`，缓存在 gitignore 的 `cik_cache.json`。联系人身份用 `sec_edgar_utils.sec_user_agent()`（读 `FINANCE_FROM_ADDRESS`，未设置时沿用 SAS 客户端已有的回退）。请求间隔 0.12 秒。找不到 CIK 或请求失败只记该标的覆盖错误。Yahoo 按个股 RSS：`url_kind=direct`，域名取文章真实主机，与现有标题去重并保留多个 `publisher_domains`；回放跳过，覆盖里写 `yahoo_rss: skipped in replay`。日志行 `Pass 0 sec_8k` / `Pass 0 yahoo_rss`。免费回放 22/24，两处未命中与合并前相同（09-14 PM AMKR、09-21 AM INTC）。未跑付费报告。未改 `telegram_commands.py`，无需重启机器人。blacktomb42 批准后 squash 为 `5b8efc8`（PR #108）。
+
 ## 当前系统状态（2026-09-24，issue #99 / #101，已合并 `a9b6991`）
 
 15% 跨越只对个股，排除集合与 `_CORE_HOLDING_EXCLUDE` 相同（常量在 `pass2_context.py`，`run_finance` 再导出）。上次没有该标的权重时不注入；52 周新高/低同样要求上次已有该标的。Pass 2 提示词要求只陈述事实和传导，不逐条否定材料里没人提出的推论；持仓段只写当天有新事件、异动或已排期供给事件的标的。PM 盘后说明只在方向相反或达到异动阈值时写。`parse_json=False` 遇到 `finish_reason=length` 不重复同一请求：`reasoning.effort` 降一档重试一次（xhigh→high），再截断进入 fallback。情报快照 `pass2` 在成功时记录 `_llm_meta`，走代码摘要时记录失败原因。同一 PR 还修 TG 改 watchlist：节边界用前瞻，不再吃掉下一节标题；收件人一行一条；`_write_watchlist()` 改为临时文件加 `os.replace`，空正文不覆盖非空文件。已 squash 合并为 `a9b6991`。未跑付费报告。`com.daily-intel.finance.telegram` 已于 2026-09-24 06:21 ET 重启（PID 55749，日志 `Finance Telegram bot started`）。
@@ -529,7 +533,7 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
 ```
 0.  FINANCE_FORCE_DATE / FINANCE_FORCE_SLOT / FINANCE_FORCE_RUN 覆盖，NYSE 交易日与月度报告同档防重检查
 1.  读取 watchlist、预算和价格；AM 使用盘前价，PM 使用今日收盘和盘后价，并计算单日及 3/5 交易日涨跌
-2.  免费 Pass 0：intel_pass0.build_intel_snapshot(archive=False) 按标的收集 Finnhub、Google News、RSS、Guardian；多日异动扩大各来源发表窗口；收集整体失败时保留价格与窗口，生成带错误记录的应急情报快照
+2.  免费 Pass 0：intel_pass0.build_intel_snapshot(archive=False) 按标的收集 Finnhub、Google News、RSS、Guardian、SEC 8-K、Yahoo 按个股 RSS；多日异动扩大各来源发表窗口；回放跳过 Yahoo（与 RSS 相同）并按提交日期重建 8-K；收集整体失败时保留价格与窗口，生成带错误记录的应急情报快照
 3.  无标的异动、标的新闻或命中地缘话题则退出；否则读取 KB，收集 Sonar 宏观、社交舆情和 FRED 流动性背景
 4.  代码 Pass 1：intel_deepen.py 按触发的绝对涨跌选最多 5 个标的，优先每标的 2 个不同落地域名的直接文章/Finnhub 302 链接；无链接才按同一发表窗口搜索（`max_results=3`，前 2 条进首轮 Extract，第 3 条留作补齐）。首轮后按涨跌强弱把 Extract URL 补到下一个 5 的倍数（最多 10）：先补同标的下一条不同域名直链，再补搜索第 3 条；补齐 URL 排末尾，预算不足先截（PR #96）。最多 3 次 basic 搜索 + 1 次 Extract（≤10 URL，2cr），单次运行合计 ≤5cr，SerpApi 可作回退
 5.  将深挖正文、来源覆盖、此前已报道标记写回情报快照并存档；按异动/安静持仓/地缘话题的数量上限渲染 Pass 2 输入，加入最近 5 个既往交易日报告与发生变化的背景信号
@@ -819,6 +823,7 @@ _Tavily: N/10_
 22. **SAS 候选命中频率**（#89 之后）：`SAS候选证据日志.md` 的新增频率；#89 后 SAS 抽取输入只剩情报快照（不含 Sonar），据此决定是否把 Sonar 加回 SAS 输入
 23. **issue #99 合并后由验证方看**（实现方不跑报告）：连续 3 个交易日防御性否定句比例是否低于 10%；没有事件的标的是否还单独成段；快照 `pass2` 里的 token 与 `finish_reason`；QQQM 是否还出现在仓位段
 24. **issue #101**（已于 06:21 ET 重启 bot）：下次用 TG 加删个股、关键词、收件人后，确认下一节标题仍在，收件人按行分开。
+25. **issue #105**（PR #108，`5b8efc8`）：下次 AM/PM 看日志 `Pass 0 sec_8k` / `Pass 0 yahoo_rss` 的耗时；8-K 是否出现在报告里并带 Item 编号；Yahoo 失败是否只留在覆盖错误里。回放召回已是 22/24。供给事件日历和 8-K 附件正文仍未做。
 
 ---
 

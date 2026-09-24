@@ -2,7 +2,7 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-09-24（issue #99 与 #101：TG 编辑 watchlist 不再吃掉下一节标题，收件人一行一条，写回改为原子替换。issue #99：15% 跨越只比较个股且必须已有上一次权重，52 周新高/低同样要求上次已有该标的；Pass 2 不否定材料里没人提出的推论，持仓段只写有新事件、异动或已排期供给事件的标的；`finish_reason=length` 时 reasoning.effort 降一档一次，再截断则 fallback；情报快照写入 `pass2`。此前同日：同步 2026-09-23/24 云端 session 合并的 PR #94–#97：Pass 2 截断正文判为失败 + `max_tokens` 32000 + HTTP 超时 640s（#94）；社交舆情只查非 ETF 个股（#95）；Extract 补齐到同一 credit 档、搜索 `max_results=3`、直链解析日志（#96）；Pass 2 供给事件例外（#97）。同时把第二节流程图、§5.1/§5.1b/§5.2/§5.4、第八节选型表、第十节目录结构改写为 issue #87 PR #89（已合并）之后的情报快照架构；#89 之前的 Search+Extract 三层设计降为 §5.1c 历史记录。另回补仓库版独有的 2026-08-04（#59/PR #61）变更记录，更正 Parallel SDK 版本，标注 §8.3 追问成本表过时。仓库 `docs/design.md` 同日按本版整体同步。详见文末变更记录）
+> **最后更新**：2026-09-24（issue #105 / PR #108 `5b8efc8`：Pass 0 增加 SEC 8-K 与 Yahoo 按个股 RSS。8-K 写入 Item 编号和 accession，`url_kind=sec_filing`，不进 Extract；Yahoo `url_kind=direct`。CIK 缓存在 gitignore 的 `cik_cache.json`。回放跳过 Yahoo。此前同日 issue #99 与 #101：TG 编辑 watchlist 不再吃掉下一节标题，收件人一行一条，写回改为原子替换。issue #99：15% 跨越只比较个股且必须已有上一次权重，52 周新高/低同样要求上次已有该标的；Pass 2 不否定材料里没人提出的推论，持仓段只写有新事件、异动或已排期供给事件的标的；`finish_reason=length` 时 reasoning.effort 降一档一次，再截断则 fallback；情报快照写入 `pass2`。此前同日：同步 2026-09-23/24 云端 session 合并的 PR #94–#97：Pass 2 截断正文判为失败 + `max_tokens` 32000 + HTTP 超时 640s（#94）；社交舆情只查非 ETF 个股（#95）；Extract 补齐到同一 credit 档、搜索 `max_results=3`、直链解析日志（#96）；Pass 2 供给事件例外（#97）。同时把第二节流程图、§5.1/§5.1b/§5.2/§5.4、第八节选型表、第十节目录结构改写为 issue #87 PR #89（已合并）之后的情报快照架构；#89 之前的 Search+Extract 三层设计降为 §5.1c 历史记录。另回补仓库版独有的 2026-08-04（#59/PR #61）变更记录，更正 Parallel SDK 版本，标注 §8.3 追问成本表过时。仓库 `docs/design.md` 同日按本版整体同步。详见文末变更记录）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -46,7 +46,7 @@ fetch_prices —— 价格 + 当日异动 + 3/5 日累计涨跌（issue #80 阈�
       │
       ▼
 Pass 0（intel_pass0.build_intel_snapshot，免费，零 LLM / 零 Tavily）
-      按标的收集 Finnhub company-news、公司名 Google News RSS、7 RSS + Guardian
+      按标的收集 Finnhub company-news、公司名 Google News RSS、7 RSS + Guardian、SEC 8-K、Yahoo 按个股 RSS
       → 别名边界匹配、标的内去重、seen_before 标记；收集整体失败则生成带错误覆盖的应急快照
       │
       ▼
@@ -284,7 +284,7 @@ system prompt 注入 portfolio 快照实现个人化。~$0.005/次，fail-open�
 
 ### 5.1b 情报快照与代码深挖（issue #87：PR #88/#89 已合并；PR #96 补齐）
 
-**Pass 0 收集（`intel_pass0.py` / `intel_collect.py`，免费、零 LLM、零 Tavily）**：对 watchlist 个股（排除 QQQM/VOO/EWJ/SGOL）按标的收集 Finnhub company-news（AM 36h、PM 24h，多日阈值标的扩到涨跌起点）、公司名 Google News RSS（每次 HTTP 尝试含重试至少间隔 1s，与 Finnhub 使用独立线程池；链接只作线索，不解码原文）、现有 7 个 RSS 源和 Guardian。标题按别名边界匹配归入实体（中文别名用 ASCII 边界，拉丁别名用词边界）并做标的内去重。别名写在 watchlist `## 实体别名`（如 `INTC: Intel, 英特尔`），缺失时用 Finnhub profile2 补全并缓存到 gitignore 的 `entity_alias_cache.json`。与上一次运行快照归一化标题相同的条目标 `seen_before`。多日异动时 RSS/Guardian 共享抓取窗口扩到最早标的起点，再按各标的窗口分拣；报告与回放共用 `publication_window.py`。每个实体保存移动、覆盖（各来源原始条数与错误）、条目和 `fulltext`。收集整体异常时生成带错误覆盖记录的应急快照，不阻断报告。
+**Pass 0 收集（`intel_pass0.py` / `intel_collect.py`，免费、零 LLM、零 Tavily）**：对 watchlist 个股（排除 QQQM/VOO/EWJ/SGOL）按标的收集 Finnhub company-news（AM 36h、PM 24h，多日阈值标的扩到涨跌起点）、公司名 Google News RSS（每次 HTTP 尝试含重试至少间隔 1s，与 Finnhub 使用独立线程池；链接只作线索，不解码原文）、现有 7 个 RSS 源、Guardian、SEC 8-K 和 Yahoo 按个股 RSS（issue #105 / PR #108）。8-K 用 SEC `company_tickers.json` 把 ticker 解成 10 位 CIK（缓存在 gitignore 的 `cik_cache.json`；找不到或请求失败只记该标的覆盖错误），条目 `source=SEC 8-K`、`url_kind=sec_filing`，标题含 Item 编号和 accession，渲染为「公司公告（8-K Item x.xx）」，不进 Extract。联系人身份走 `sec_edgar_utils.sec_user_agent()`，SEC 请求间隔 0.12 秒。Yahoo RSS 的 `url_kind=direct`，域名取文章真实主机，与已有标题去重后保留多个 `publisher_domains`；回放跳过 Yahoo（覆盖注明 `yahoo_rss: skipped in replay`），8-K 按 `dateb=报告时刻+1 天` 再由窗口过滤。日志 `Pass 0 sec_8k` / `Pass 0 yahoo_rss`。标题按别名边界匹配归入实体（中文别名用 ASCII 边界，拉丁别名用词边界）并做标的内去重。别名写在 watchlist `## 实体别名`（如 `INTC: Intel, 英特尔`），缺失时用 Finnhub profile2 补全并缓存到 gitignore 的 `entity_alias_cache.json`。与上一次运行快照归一化标题相同的条目标 `seen_before`（8-K 同样参加；accession 写在标题里，避免同 Item 的两份公告并成一条）。多日异动时 RSS/Guardian 共享抓取窗口扩到最早标的起点，再按各标的窗口分拣；报告与回放共用 `publication_window.py`。每个实体保存移动、覆盖（各来源原始条数与错误）、条目和 `fulltext`。收集整体异常时生成带错误覆盖记录的应急快照，不阻断报告。
 
 **代码 Pass 1（`intel_deepen.deepen_intel_snapshot()`，无 LLM）**：
 - **候选**：当日异动或 #80 多日阈值（3 日 ≥15% / 5 日 ≥20%）标的，按触发项的绝对涨跌取最多 5 个。
@@ -808,7 +808,7 @@ tail -f /tmp/ibkr_keepalive.log                 # keepalive（每 5 分钟 auth 
 │   ├── fetch_prices.py             yfinance 价格拉取
 │   ├── fetch_news.py               RSS + Guardian 聚合
 │   ├── intel_pass0.py              Pass 0 情报快照入口 build_intel_snapshot()；--replay 回放（issue #87 PR #88/#89）
-│   ├── intel_collect.py            按标的收集 Finnhub/Google News/RSS/Guardian、别名匹配、ETFS 常量、archive_intel_snapshot()
+│   ├── intel_collect.py            按标的收集 Finnhub/Google News/RSS/Guardian/SEC 8-K/Yahoo RSS、别名匹配、ETFS 常量、archive_intel_snapshot()
 │   ├── intel_deepen.py             代码 Pass 1：直链/302 解析、按需搜索、Extract 补齐（PR #96）
 │   ├── intel_render.py             情报快照 → Pass 2 输入段落（条数上限）与代码摘要降级
 │   ├── pass2_context.py            背景信号 context_state 与变化判断（FRED 档位/个股 15% 跨越/52 周高低；CORE_HOLDING_EXCLUDE）
@@ -828,7 +828,7 @@ tail -f /tmp/ibkr_keepalive.log                 # keepalive（每 5 分钟 auth 
 │   ├── telegram_utils.py           call_telegram() 共享容错层（run_finance.py 与 telegram_commands.py 共用，issue #20-23）
 │   ├── finance_email.py            Resend 邮件客户端
 │   ├── sas_review.py               季度 SAS 深度复盘（issue #32，2026-07-09），已接入 PM launchd 串联运行（第九节9.1），详见第十二节
-│   ├── sec_edgar_utils.py          封装 edgartools：Form 4 内部人买入过滤 + 10-K risk factors 取值
+│   ├── sec_edgar_utils.py          封装 edgartools：Form 4 内部人买入过滤 + 10-K risk factors 取值；`sec_user_agent()` 供 Pass 0 的 SEC 请求使用
 │   ├── backfill_drawers.py         MemPalace 历史 drawer 一次性回填（已完成，保留供参考）
 │   ├── migrate_reports.py          旧格式迁移（一次性）
 │   └── test_*.py                   无 pytest 依赖的回归测试（2026-09-24 共 15 个；含 test_issue99_pass2_review、test_issue101_watchlist_edit、test_issue87_pass0/pass2/switch、test_llm_config 等；#72/#80/#82 与语义过滤测试随 PR #89 删除）
@@ -844,6 +844,7 @@ tail -f /tmp/ibkr_keepalive.log                 # keepalive（每 5 分钟 auth 
 ├── finance_apify_budget.json       Apify Reddit 舆情月度计数（issue #17）
 ├── tg_offset.json                  TG getUpdates offset
 ├── entity_alias_cache.json         Finnhub profile2 补全的实体别名缓存（gitignore）
+├── cik_cache.json                  ticker → 10 位 CIK（gitignore，issue #105）
 ├── archives/                       情报快照与历史 Extract 存档（Obsidian 之外，不被 mine）
 │   └── YYYYMM/
 │       ├── YYYY-MM-DD-{slot}-intel-snapshot.json   PR #89 起每次运行原子写入
@@ -1455,3 +1456,15 @@ Pass 2 提示词在“无进展就省略”规则后加例外：已排期的供�
 设计里的开放点：降到 high 之后若仍截断，按设计默认直接 fallback，没有再降到 medium。测试 `scripts/test_issue99_pass2_review.py`。未跑付费报告。Obsidian 文档留给合并后的验证方。
 
 同一 PR 包含 issue #101。TG 的 `_section_add`、`_section_remove`、`_geo_add`、`_geo_remove` 原先用 `(\n## |\Z)` 当边界，写回时把下一节的 `\n## ` 吃掉。收件人还被 `", "` 拼成一行，`load_watchlist()` 会把整行当成一个地址。`_write_watchlist()` 直接 `write_text`。现在四处共用前瞻边界 `(?=\n## |\Z)`；收件人一行一条；个股、商品、汇率仍是逗号一行；地缘关键词仍是 `话题: 词1, 词2`。写回先序列化，空正文不覆盖非空文件，临时文件 `os.replace` 后再读回核对。`load_watchlist()` 的解析没改。测试 `scripts/test_issue101_watchlist_edit.py`，只用临时文件和字符串。`com.daily-intel.finance.telegram` 已于 2026-09-24 06:21 ET 重启。
+
+## 变更记录追加：2026-09-24 — issue #105（PR #108，已合并 `5b8efc8`）
+
+Pass 0 原先全是媒体转述。增发、重大合同、高管变动如果当天没有新闻，报告看不到。本次加两路免费来源，不调用 LLM，不消耗 Tavily。
+
+- `fetch_sec_8k()`：SEC atom `browse-edgar?type=8-K`。CIK 来自 `company_tickers.json`，写入 gitignore 的 `cik_cache.json`。`dateb` 取报告时刻的次日，再按该标的窗口过滤。条目带 Item 编号和 accession，`url_kind=sec_filing`，不进 Extract。`sec_user_agent()` 读 `FINANCE_FROM_ADDRESS`；请求间隔 0.12 秒。失败只记覆盖错误。
+- `fetch_yahoo_rss()`：`feeds.finance.yahoo.com/rss/2.0/headline?s=`。`url_kind=direct`，域名取文章主机，与已有标题去重。回放跳过。
+- 渲染、Context Log 和 TG 状态行计入 `sec_8k` / `yahoo_rss`。8-K 在材料里写成「公司公告（8-K Item x.xx）」。
+- 开放点按 issue 已写方案：官方 JSON 加缓存、Item 不译成中文、8-K 参加 `seen_before`、Yahoo 不做 1 秒节流、深挖顺序不改。
+- 测试 `scripts/test_issue105_sec_yahoo.py`。免费回放 22/24，未命中仍是 09-14 PM AMKR 和 09-21 AM INTC。未跑付费报告。未改 Telegram 机器人。
+
+8-K 附件正文和按生效日注入的供给事件日历仍未做。
