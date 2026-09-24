@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -290,52 +291,101 @@ def _read_watchlist() -> str:
     return WATCHLIST_PATH.read_text(encoding="utf-8")
 
 
+def _atomic_replace(path: Path, text: str) -> None:
+    """Write text to a temp file in the same directory, then os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def _write_watchlist(text: str):
-    WATCHLIST_PATH.write_text(text, encoding="utf-8")
+    path = Path(WATCHLIST_PATH)
+    original = path.read_text(encoding="utf-8") if path.exists() else ""
+    if not text.strip() and original.strip():
+        logger.error("Refusing to replace non-empty watchlist.md with empty text")
+        return
+    _atomic_replace(path, text)
+    written = path.read_text(encoding="utf-8")
+    if written != text:
+        logger.error("watchlist.md readback mismatch; restoring previous contents")
+        _atomic_replace(path, original)
+
+
+def _section_match(text: str, section: str) -> re.Match | None:
+    """Locate one ## section. The next header stays outside the match."""
+    return re.compile(
+        rf"(## {re.escape(section)}\n)(.*?)(?=\n## |\Z)", re.DOTALL
+    ).search(text)
+
+
+def _splice_section(text: str, match: re.Match, new_body: str) -> str:
+    if new_body and not new_body.endswith("\n"):
+        new_body += "\n"
+    return text[:match.start()] + match.group(1) + new_body + text[match.end():]
+
+
+def _comma_items(body: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[,\n]+", body) if item.strip()]
+
+
+def _line_items(body: str) -> list[str]:
+    return [line.strip() for line in body.splitlines() if line.strip()]
 
 
 def _section_add(text: str, section: str, item: str) -> tuple[str, bool]:
     """Add item to a ## section. Returns (new_text, was_added)."""
-    pattern = re.compile(rf"(## {re.escape(section)}\n)(.*?)(\n## |\Z)", re.DOTALL)
-    m = pattern.search(text)
-    if not m:
+    match = _section_match(text, section)
+    if not match:
         return text, False
-    body = m.group(2).strip()
-    items = [i.strip() for i in re.split(r"[,\n]+", body) if i.strip()]
-    if item in items:
-        return text, False
-    items.append(item)
-    new_body = ", ".join(items)
-    new_section = m.group(1) + new_body + "\n"
-    new_text = text[:m.start()] + new_section + text[m.end():]
-    return new_text, True
+    if section == "收件人":
+        items = _line_items(match.group(2))
+        if item in items:
+            return text, False
+        items.append(item)
+        new_body = "\n".join(items) + "\n"
+    else:
+        items = _comma_items(match.group(2))
+        if item in items:
+            return text, False
+        items.append(item)
+        new_body = ", ".join(items) + "\n"
+    return _splice_section(text, match, new_body), True
 
 
 def _section_remove(text: str, section: str, item: str) -> tuple[str, bool]:
     """Remove item from a ## section. Returns (new_text, was_removed)."""
-    pattern = re.compile(rf"(## {re.escape(section)}\n)(.*?)(\n## |\Z)", re.DOTALL)
-    m = pattern.search(text)
-    if not m:
+    match = _section_match(text, section)
+    if not match:
         return text, False
-    body = m.group(2).strip()
-    items = [i.strip() for i in re.split(r"[,\n]+", body) if i.strip()]
-    if item not in items:
-        return text, False
-    items.remove(item)
-    new_body = ", ".join(items)
-    new_section = m.group(1) + new_body + "\n"
-    new_text = text[:m.start()] + new_section + text[m.end():]
-    return new_text, True
+    if section == "收件人":
+        items = _line_items(match.group(2))
+        if item not in items:
+            return text, False
+        items.remove(item)
+        new_body = ("\n".join(items) + "\n") if items else ""
+    else:
+        items = _comma_items(match.group(2))
+        if item not in items:
+            return text, False
+        items.remove(item)
+        new_body = (", ".join(items) + "\n") if items else ""
+    return _splice_section(text, match, new_body), True
 
 
 def _geo_add(text: str, topic: str, keyword: str) -> tuple[str, bool]:
     """Add keyword to an existing geo topic, or create a new topic line."""
-    section_pat = re.compile(r"(## 地缘政治关键词\n)(.*?)(\n## |\Z)", re.DOTALL)
-    m = section_pat.search(text)
-    if not m:
+    match = _section_match(text, "地缘政治关键词")
+    if not match:
         return text, False
-    body = m.group(2)
-    # Try to find existing topic line
+    body = match.group(2)
     topic_pat = re.compile(rf"({re.escape(topic)}: )(.*)")
     tm = topic_pat.search(body)
     if tm:
@@ -346,21 +396,16 @@ def _geo_add(text: str, topic: str, keyword: str) -> tuple[str, bool]:
         new_body = body[:tm.start()] + tm.group(1) + ", ".join(kws) + body[tm.end():]
     else:
         new_body = body.rstrip() + f"\n{topic}: {keyword}\n"
-    new_section = m.group(1) + new_body
-    if not new_section.endswith("\n"):
-        new_section += "\n"
-    return text[:m.start()] + new_section + text[m.end():], True
+    return _splice_section(text, match, new_body), True
 
 
 def _geo_remove(text: str, keyword: str) -> tuple[str, bool]:
     """Remove a keyword from any geo topic line."""
-    section_pat = re.compile(r"(## 地缘政治关键词\n)(.*?)(\n## |\Z)", re.DOTALL)
-    m = section_pat.search(text)
-    if not m:
+    match = _section_match(text, "地缘政治关键词")
+    if not match:
         return text, False
-    body = m.group(2)
     new_body, found = "", False
-    for line in body.splitlines(keepends=True):
+    for line in match.group(2).splitlines(keepends=True):
         if ":" in line:
             head, kws_str = line.split(":", 1)
             kws = [k.strip() for k in kws_str.split(",") if k.strip()]
@@ -369,8 +414,7 @@ def _geo_remove(text: str, keyword: str) -> tuple[str, bool]:
                 found = True
                 line = f"{head}: {', '.join(kws)}\n" if kws else ""
         new_body += line
-    new_section = m.group(1) + new_body
-    return text[:m.start()] + new_section + text[m.end():], found
+    return _splice_section(text, match, new_body), found
 
 
 # ── Status report ─────────────────────────────────────────────────────────────

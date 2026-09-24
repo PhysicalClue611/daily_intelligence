@@ -88,7 +88,10 @@ from report_writers import (
     REPORTS_DIR,
 )
 from recent_coverage import build_recent_coverage_section
-from pass2_context import current_state, changed_background, read_previous_intel_snapshot_state
+from pass2_context import (
+    CORE_HOLDING_EXCLUDE as _CORE_HOLDING_EXCLUDE,
+    current_state, changed_background, read_previous_intel_snapshot_state,
+)
 from intel_pass0 import build_intel_snapshot
 from intel_collect import ETFS, archive_intel_snapshot
 from intel_deepen import deepen_intel_snapshot
@@ -441,12 +444,6 @@ def _get_portfolio_snapshot() -> str:
         return ""
 
 
-# Beta layer (QQQM/VOO) + defensive layer (EWJ/SGOL/BOXX) + cash — excluded from the
-# "core individual holding" set per Investment Operating Manual Section 1's three-tier
-# structure (issue #33). What's left is the ~25% active-Alpha layer these signals target.
-_CORE_HOLDING_EXCLUDE = {"QQQM", "VOO", "EWJ", "SGOL", "BOXX", "CASH"}
-
-
 def _get_core_holding_tickers() -> list[str]:
     """Active individual-stock tickers from the IB holdings snapshot (issue #33)."""
     try:
@@ -606,14 +603,14 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 ## 实际持仓与框架
 {personal_context}
 
-根据所给事实直接分析事件、传导路径和持仓含义，不复述情报收集过程。对需要解释的价格异动，直接证据可写“已知原因”并附来源；仅有线索时写“线索待核实”，单一来源的强断言在相关句内标一次“未证实”；没有可靠线索时写“未找到原因”，只在这种情形下简短写明该标的来源覆盖。检索失败且无条目时写“未能完成检索”，不能声称已查遍。价格变化本身不是原因；不凭空归因于情绪、资金流或风格轮动，也不因没找到线索就断言没有公司级催化。只写新闻相对“此前已报道”及近五个交易日报告新增的事实；无进展时省略，或一句“延续 MM-DD 已报道的<事件>，今日无新进展”。例外：已排期的供给事件（限售股解禁、增发或 ATM 发行、配售、指数纳入或剔除调整）在生效日之前和之后的报告里都要保留，即使此前已报道也不算“无进展”；写明生效日期、规模，以及它与当日价格或成交的关系。不复述信源独立域名数量。
+根据所给事实直接分析事件、传导路径和持仓含义，不复述情报收集过程。对需要解释的价格异动，直接证据可写“已知原因”并附来源；仅有线索时写“线索待核实”，单一来源的强断言在相关句内标一次“未证实”；没有可靠线索时写“未找到原因”，只在这种情形下简短写明该标的来源覆盖。检索失败且无条目时写“未能完成检索”，不能声称已查遍。价格变化本身不是原因；不凭空归因于情绪、资金流或风格轮动，也不因没找到线索就断言没有公司级催化。陈述事实及其传导即可；材料里没人提出的推论（如“已兑现”“已获客户”）不要去逐条否定；只有当某篇报道或市场叙事确实作出了这个推论，才用一句话指出证据不足，同一标的只说一次。只写新闻相对“此前已报道”及近五个交易日报告新增的事实；无进展时省略，或一句“延续 MM-DD 已报道的<事件>，今日无新进展”。例外：已排期的供给事件（限售股解禁、增发或 ATM 发行、配售、指数纳入或剔除调整）在生效日之前和之后的报告里都要保留，即使此前已报道也不算“无进展”；写明生效日期、规模，以及它与当日价格或成交的关系。不复述信源独立域名数量。
 
 仓位建议仅在下列事实命中时提出，并指出具体新证据：认知提升（战略节点首次商业化、竞争格局结构变化、此前被怀疑的管理层承诺获证实）；Alpha 大幅兑现（预期差评分下降超过3分、未来 Alpha 潜力低于5分且无新催化）；更高赔率机会（候选潜力高2分以上且战略空间同量级）；价格被动上涨致单一仓位跨过15%。若注入了 FRED 档位变化或52周新高/新低，也允许写仓位小节，但只陈述本次背景变化，不把它当成单独的交易指令。上述事实或背景变化均未出现时省略仓位小节，不逐股声明“无加减仓依据”，不复述标准原文。
 
 输出骨架（空节省略）：
 # [Daily_Intel] {date} 开盘前简报
 ## 要点（可选，最多3条）
-## 持仓与观察标的
+## 持仓与观察标的（只写当天有新事件、有异动或有已排期供给事件的标的；其余标的不单独成段，不复述价格表数字）
 ## 宏观与地缘（只写对持仓有传导的新事实）
 ## 仓位（仅出现上述例外时）
 {verifiable_signals_rule}
@@ -667,6 +664,26 @@ fact 为一句话事实摘要（含关键数字/来源，不超过80字）。宁
 
 
 
+
+
+def _pm_afterhours_note(run_slot: str, now_et: datetime) -> str:
+    """PM price-table note. Quiet after-hours moves are not narrated per name."""
+    if run_slot != "pm":
+        return ""
+    clock = now_et.strftime("%H:%M %Z")
+    return (
+        f"价格表【盘后涨跌】列反映收盘后截至 {clock} 的状态。"
+        "只在盘后走势与日内方向相反、或盘后变动达到异动阈值时说明；其余不必逐一复述。"
+        "盘后无成交只在对异动标的有意义时注明。"
+    )
+
+
+def _attach_pass2(intel_snapshot: dict, result: dict, reason: str | None = None) -> None:
+    """Store Pass 2 metadata on the snapshot before the atomic archive write."""
+    if reason:
+        intel_snapshot["pass2"] = {"fallback_summary": True, "reason": reason}
+        return
+    intel_snapshot["pass2"] = dict((result or {}).get("_llm_meta") or {})
 
 
 def _social_tickers(anomaly_tickers: list[str], stocks: list[str], limit: int = 4) -> list[str]:
@@ -881,12 +898,7 @@ def _main_body():
         "盘前数据（昨日全日↑↓=昨收vs前收，与Yahoo Finance口径一致；盘前↑↓=盘前价vs昨收）" if run_slot == "am"
         else "收盘+盘后数据（日内↑↓=今收vs前收，与Yahoo Finance口径一致；vs今开=纯盘中涨跌；盘后↑↓=盘后价vs今收）"
     )
-    pm_afterhours_note = (
-        f"注意（夜盘报告）：价格表【盘后涨跌】列反映收盘后截至 {now_et.strftime('%H:%M %Z')} 的最新运行状态。"
-        f"请在【持仓与观察标的】中依据所给事实分别说明日内表现与盘后延续/反转情况，"
-        f"无盘后数据时注明\"盘后无成交\"。"
-        if run_slot == "pm" else ""
-    )
+    pm_afterhours_note = _pm_afterhours_note(run_slot, now_et)
     price_rows = fetch_prices(
         stocks=wl["stocks"],
         commodities=wl["commodities"],
@@ -1027,14 +1039,17 @@ def _main_body():
         personal_context=personal_context,
         verifiable_signals_rule=VERIFIABLE_SIGNALS_INSTRUCTION_P2 if run_slot == "am" else "",
     )
+    pass2_failure_reason = None
     try:
         result2 = call_llm(prompt2, stage="report_pass2", system_prompt=SYSTEM_PROMPT_P2,
                            parse_json=False)
     except Exception as exc:
         logger.warning("Pass 2 failed, using intelligence snapshot summary: %s", exc)
         result2 = {}
+        pass2_failure_reason = f"{type(exc).__name__}: {exc}"
     if not isinstance(result2, dict):
         result2 = {}
+        pass2_failure_reason = pass2_failure_reason or "Pass 2 returned no report text"
     llm_meta_p2 = result2.get("_llm_meta", {})
     raw_report = result2.get("text")
     report_md = raw_report.strip() if isinstance(raw_report, str) else ""
@@ -1042,6 +1057,10 @@ def _main_body():
     if not report_md:
         report_md = render_fallback_report(intel_snapshot, slot_label)
         send_telegram_alert(f"[!] Daily_Intel {today_et} {slot_label} Pass 2 失败；已发送代码生成的情报摘要。")
+        _attach_pass2(intel_snapshot, result2,
+                      reason=pass2_failure_reason or "Pass 2 returned no report text")
+    else:
+        _attach_pass2(intel_snapshot, result2)
 
     # Independent SAS extraction retains its JSON output schema, now sourced
     # from the same intelligence snapshot rather than the removed discovery pool.
@@ -1067,10 +1086,10 @@ def _main_body():
     write_report(today_et, slot_label, report_md, budget)
     if pass2_succeeded:
         intel_snapshot["context_state"] = context_state
-        try:
-            archive_intel_snapshot(intel_snapshot)
-        except OSError as exc:
-            logger.warning("Intelligence snapshot context state save failed: %s", exc)
+    try:
+        archive_intel_snapshot(intel_snapshot)
+    except OSError as exc:
+        logger.warning("Intelligence snapshot context state save failed: %s", exc)
     _mempalace_add_daily_drawer(today_et, run_slot, report_md)
     write_context_log(today_et, slot_label, now_et, price_table, [],
                       (intel_snapshot.get("macro_digest") or {}).get("geo_topics_hit", []),

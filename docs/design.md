@@ -2,7 +2,7 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-09-24（同步 2026-09-23/24 云端 session 合并的 PR #94–#97：Pass 2 截断正文判为失败 + `max_tokens` 32000 + HTTP 超时 640s（#94）；社交舆情只查非 ETF 个股（#95）；Extract 补齐到同一 credit 档、搜索 `max_results=3`、直链解析日志（#96）；Pass 2 供给事件例外（#97）。同时把第二节流程图、§5.1/§5.1b/§5.2/§5.4、第八节选型表、第十节目录结构改写为 issue #87 PR #89（已合并）之后的情报快照架构；#89 之前的 Search+Extract 三层设计降为 §5.1c 历史记录。另回补仓库版独有的 2026-08-04（#59/PR #61）变更记录，更正 Parallel SDK 版本，标注 §8.3 追问成本表过时。仓库 `docs/design.md` 同日按本版整体同步。详见文末变更记录）
+> **最后更新**：2026-09-24（issue #99 与 #101：TG 编辑 watchlist 不再吃掉下一节标题，收件人一行一条，写回改为原子替换。issue #99：15% 跨越只比较个股且必须已有上一次权重，52 周新高/低同样要求上次已有该标的；Pass 2 不否定材料里没人提出的推论，持仓段只写有新事件、异动或已排期供给事件的标的；`finish_reason=length` 时 reasoning.effort 降一档一次，再截断则 fallback；情报快照写入 `pass2`。此前同日：同步 2026-09-23/24 云端 session 合并的 PR #94–#97：Pass 2 截断正文判为失败 + `max_tokens` 32000 + HTTP 超时 640s（#94）；社交舆情只查非 ETF 个股（#95）；Extract 补齐到同一 credit 档、搜索 `max_results=3`、直链解析日志（#96）；Pass 2 供给事件例外（#97）。同时把第二节流程图、§5.1/§5.1b/§5.2/§5.4、第八节选型表、第十节目录结构改写为 issue #87 PR #89（已合并）之后的情报快照架构；#89 之前的 Search+Extract 三层设计降为 §5.1c 历史记录。另回补仓库版独有的 2026-08-04（#59/PR #61）变更记录，更正 Parallel SDK 版本，标注 §8.3 追问成本表过时。仓库 `docs/design.md` 同日按本版整体同步。详见文末变更记录）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -70,7 +70,7 @@ LLM Pass 2 —— openai/gpt-6-luna via OR/OpenAI，reasoning.effort=xhigh，max
               输入：价格表 + intel_render 渲染的情报快照 + Sonar + 报告涉及标的的社交舆情
                     + 状态变化的背景信号 + 近 5 个交易日已报道内容 + 持仓框架
               Layer A: SYSTEM_PROMPT_P2（Layer_A_Prompt.md）；输出裸 markdown
-              空文本 / 异常 / finish_reason=length 截断 → 同模型重试 → fallback → 代码摘要 + TG 告警
+              空文本 / 异常 → 同请求重试 → fallback；finish_reason=length → effort 降一档一次，再截断则 fallback → 代码摘要 + TG 告警
       │
       ▼
 SAS 候选独立抽取（gemma-4-31b-it，只读情报快照）+ PM 预判校准
@@ -434,18 +434,18 @@ Tavily 日预算为 25cr。issue #82 把单次运行的 Extract 从最多 2cr �
 
 **代码层 skip**：`should_report(intel_snapshot)` 在没有标的异动（含 #80 多日阈值）、没有标的新闻、也没有命中地缘话题的宏观条目时退出（日志 `No entity move, company item, or macro item; skipping`），零付费调用。旧 LLM Pass 1（草稿 + `tavily_queries`）、异动/多日/轮询三类搜索 job 均已随 PR #89 删除，其演化过程见 §5.1c 与文末 #72/#76/#80/#82 变更记录。
 
-**Pass 2（有报告材料时必跑，不再依赖是否有付费搜索结果）**：`report_pass2` stage，`openai/gpt-6-luna` + `reasoning.effort=xhigh`（issue #90/PR #91），`max_tokens` 32000（PR #94）。输入：价格表、情报快照段落（§5.1b 的渲染上限）、Sonar 宏观、报告涉及标的的社交舆情（每标的一行）、状态变化的背景信号（FRED 档位、15% 仓位跨越、52 周新高/低，只在与上次成功报告快照 `context_state` 不同时注入）、KB 上下文、AM 校准笔记、近 5 个 NYSE 交易日已报道内容（`recent_coverage.py`：按异动/多日阈值标的抽取实体段落，跨月读取，同档只取首份，排除当前档，每标的最多 600 字）、个人上下文（Layer B）。Layer A 私有文件里旧的“结论必须可操作”句在运行时精确替换，其余个人原则保留。
+**Pass 2（有报告材料时必跑，不再依赖是否有付费搜索结果）**：`report_pass2` stage，`openai/gpt-6-luna` + `reasoning.effort=xhigh`（issue #90/PR #91），`max_tokens` 32000（PR #94）。输入：价格表、情报快照段落（§5.1b 的渲染上限）、Sonar 宏观、报告涉及标的的社交舆情（每标的一行）、状态变化的背景信号（FRED 档位；个股 15% 跨越，指数/防御/现金不参与，且上次没有该标的权重时不注入；52 周新高/低，上次没有该标的时不注入）、KB 上下文、AM 校准笔记、近 5 个 NYSE 交易日已报道内容（`recent_coverage.py`：按异动/多日阈值标的抽取实体段落，跨月读取，同档只取首份，排除当前档，每标的最多 600 字）、个人上下文（Layer B）。Layer A 私有文件里旧的“结论必须可操作”句在运行时精确替换，其余个人原则保留。
 
 **提示词规则（`USER_PROMPT_TEMPLATE_P2`）**：
-- 归因三状态：已知原因（附来源）/ 线索待核实（单一来源的强断言在句内标一次“未证实”）/ 未找到原因（只在这种情形下简短写来源覆盖）；检索失败且无条目写“未能完成检索”。价格变化本身不是原因，不凭空归因于情绪、资金流或风格轮动，也不因没找到线索就断言没有公司级催化。
-- 只写相对“此前已报道”及近五个交易日报告的新增事实；无进展时省略，或一句“延续 MM-DD 已报道的<事件>，今日无新进展”。
+- 归因三状态：已知原因（附来源）/ 线索待核实（单一来源的强断言在句内标一次“未证实”）/ 未找到原因（只在这种情形下简短写来源覆盖）；检索失败且无条目写“未能完成检索”。价格变化本身不是原因，不凭空归因于情绪、资金流或风格轮动，也不因没找到线索就断言没有公司级催化。陈述事实及其传导即可；材料里没人提出的推论不要逐条否定，只有报道或市场叙事确实作出该推论时才用一句话指出证据不足，同一标的只说一次（issue #99）。
+- 只写相对“此前已报道”及近五个交易日报告的新增事实；无进展时省略，或一句“延续 MM-DD 已报道的<事件>，今日无新进展”。持仓与观察标的只写当天有新事件、有异动或有已排期供给事件的标的；其余不单独成段，不复述价格表数字。PM 只在盘后走势与日内方向相反、或盘后变动达到异动阈值时说明盘后；盘后无成交只在对异动标的有意义时注明。
 - **供给事件例外（PR #97，2026-09-24）**：已排期的供给事件（限售股解禁、增发或 ATM 发行、配售、指数纳入或剔除调整）在生效日之前和之后的报告里都要保留，即使此前已报道也不算“无进展”；写明生效日期、规模，以及它与当日价格或成交的关系。这类事件的价格影响集中在生效日前后，按旧规则可能在生效当天被当作“无进展”省掉。触发案例：2026-09-23 PM 的 SPCX 约 3.28 亿股解禁、AAOI 至多 6 亿美元 ATM 发行。已知局限：规则只保证模型不删，不保证信息找得到——生效日当天如果没有相关新闻，Pass 2 根本看不到这个事件。候选方案是由代码按日期注入的“供给事件日历”，未实现。
 - 仓位小节只在认知提升、Alpha 大幅兑现、更高赔率机会、单一仓位被动跨过 15%，或注入了 FRED 档位变化 / 52 周新高新低时出现；否则省略，不逐股声明“无加减仓依据”。
 - 正文按主题写自然段，不写检索步骤、证据缺口清单或自我免责（PR #92）；直接输出 Markdown，不要 JSON 或代码围栏。
 
-**失败与降级**：Pass 2 返回空文本、异常，或 `finish_reason=length` 的截断正文（PR #94 起即使正文非空也判为失败），`call_llm()` 依次走同模型重试、`fallback_model`（`google/gemini-3.5-flash` OR flex）；全部失败时 `run_finance.py` 用代码渲染的情报快照摘要照常写出与发送，并发 TG 告警「Pass 2 失败」。SAS 候选抽取（独立 JSON 调用，只读情报快照）和 PM 校准照常运行。
+**失败与降级**：Pass 2 返回空文本、异常，或 `finish_reason=length` 的截断正文（PR #94 起即使正文非空也判为失败）。空文本和网络/5xx/429 仍走同请求重试。`parse_json=False` 的 length（issue #99）不重复同一请求：若当前 `reasoning.effort` 不是最低档（xhigh→high→medium），降一档重试一次，再截断则进入 `fallback_model`（`google/gemini-3.5-flash` OR flex）；没有 effort 或已是最低档则直接 fallback。降档只影响这一次调用，不写回配置。全部失败时 `run_finance.py` 用代码渲染的情报快照摘要照常写出与发送，并发 TG 告警「Pass 2 失败」。成功时情报快照 `pass2` 写入 `_llm_meta`（含 token、finish_reason、`effort_used`、`truncation_downgrade`）；降级摘要时写入 `fallback_summary` 和 `reason`。SAS 候选抽取（独立 JSON 调用，只读情报快照）和 PM 校准照常运行。
 
-**错误韧性**：`call_llm()` 对网络/5xx/429 自动重试（指数退避），耗尽后进入 OR flex fallback；`parse_json=False` 路径的空文本或截断文本由 `_free_text()` 按解析失败处理、进入同一条重试路径。非流式 HTTP 读超时由 `_http_timeout()` 计算：`max(180, max_tokens // 50)`，32000 对应 640s（此前固定 180s，预算翻倍后会读超时）。`telegram_commands.py` 的 `_deepseek_post()`（沿用旧名，实际按 stage 配置走 OpenRouter）与 `_openrouter_post()` 使用相同的网络/5xx 重试策略。
+**错误韧性**：`call_llm()` 对网络/5xx/429 自动重试（指数退避），耗尽后进入 OR flex fallback；`parse_json=False` 的空文本仍走这条同请求重试，截断文本走上一节的降档路径。非流式 HTTP 读超时由 `_http_timeout()` 计算：`max(180, max_tokens // 50)`，32000 对应 640s（此前固定 180s，预算翻倍后会读超时）。`telegram_commands.py` 的 `_deepseek_post()`（沿用旧名，实际按 stage 配置走 OpenRouter）与 `_openrouter_post()` 使用相同的网络/5xx 重试策略。
 
 ### 5.3 防重与手动重跑
 
@@ -469,7 +469,7 @@ if f"## {today_et} {slot_label}" in monthly_file_content:
 |---|---|---|
 | Obsidian 月度报告 `Daily_Intel_report_YYYYMM.md` | append section（step 11） | 是 |
 | Obsidian 月度 Context Log `Daily_Intel_context_YYYYMM.md` | append section（step 11b）：价格快照 + 每标的情报快照摘要/覆盖 + Sonar 宏观原文 + 代码搜索任务列表 | 是 |
-| 情报快照 `~/Daily_Intelligence/archives/YYYYMM/YYYY-MM-DD-{slot}-intel-snapshot.json`（PR #89 起） | 免费来源条目、覆盖、Extract 正文片段与置信度标签、深挖状态/计数（含 `extract_topup_count`）、供下次比较的 `context_state`；原子写入 | 否（Obsidian 之外） |
+| 情报快照 `~/Daily_Intelligence/archives/YYYYMM/YYYY-MM-DD-{slot}-intel-snapshot.json`（PR #89 起） | 免费来源条目、覆盖、Extract 正文片段与置信度标签、深挖状态/计数（含 `extract_topup_count`）、供下次比较的 `context_state`、Pass 2 的 `pass2`（成功为 `_llm_meta`，代码降级摘要为 `fallback_summary` 与 `reason`）；原子写入 | 否（Obsidian 之外） |
 | Extract Archive `archives/YYYYMM/YYYY-MM-DD-{slot}-extract.md` | PR #89 起停止新写，历史文件保留 | 否 |
 | MemPalace per-day drawer | report_md 推送 bridge，wing=paperview, room=finance | — |
 | 邮件 | Gmail API（send+readonly scope） | — |
@@ -631,7 +631,7 @@ Step 4  DeepSeek V4 Flash via OR/DigitalOcean→Venice（主，~$0.002）
 - **持仓占组合%**（`_get_portfolio_weights()`，市值÷组合总USD市值），对应 Manual 第6节的仓位结构性超载减仓情形（>15%），“持仓异动核对”那条分析要求直接读取这个计算值判断，不再让 LLM 自己从持仓快照文本估算百分比
 - 适用范围仅限核心主动个股（排除 QQQM/VOO/EWJ/SGOL/BOXX/CASH），与 Manual 第1节三层结构对齐
 
-**PR #89 起的注入方式**：Pass 2 不再每次注入全量数值。`pass2_context.current_state()` 把 FRED 档位、是否跨过 15%、52 周新高/新低记为 `context_state` 存入情报快照，`changed_background()` 与上次成功报告的快照比较，只把发生变化的项注入 Pass 2 的 Layer B（减少“15%/结构性超载”一类套话）。SAS 候选抽取仍拿全量持仓计算信号。
+**PR #89 起的注入方式**：Pass 2 不再每次注入全量数值。`pass2_context.current_state()` 把 FRED 档位、权重和 52 周高低记为 `context_state` 存入情报快照，`changed_background()` 与上次成功报告的快照比较，只把发生变化的项注入 Pass 2 的 Layer B。issue #99：15% 跨越只比较 `CORE_HOLDING_EXCLUDE` 之外的个股（QQQM、VOO、EWJ、SGOL、BOXX、CASH 排除，常量在 `pass2_context.py`，`run_finance` 再导出），并且上次状态里没有该标的权重时不注入；52 周新高/低同样要求上次已有该标的。SAS 候选抽取仍拿全量持仓计算信号。
 
 ### 7.2 持仓快照（user message，每次追问刷新）
 
@@ -667,7 +667,7 @@ IB美股持仓（成本价为均价，浮盈%为报告日数据供参考，实�
 | #   | 调用位置 | 用途 | 主力模型 | Fallback | max_tokens | 成本估算 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1b  | `calibration.py::_evaluate_am_predictions()`（stage `am_calibration`） | PM slot：核验AM可验证信号 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference，issue #59——从report_pass1拆分为独立stage） | `google/gemini-3.1-flash-lite` OR flex | 4000 | ~$0.0005 |
-| 2   | `run_finance.py` Pass 2（stage `report_pass2`） | 整合情报快照、Sonar 与个人上下文生成最终报告，report_md 直接输出裸 markdown | `openai/gpt-6-luna` via OR/OpenAI（provider 锁定不允许 fallback 到其他 provider；`reasoning={"effort":"xhigh"}`，issue #90/PR #91；此前 issue #60 从 `deepseek-v4-pro`+thinking 换到 `gpt-5.6-luna`/high，原因见文末变更记录）。**截断正文判为失败**（PR #94）：`finish_reason=length` 时即使正文非空，也依次走同模型重试 → fallback → 代码摘要 + TG 告警 | `google/gemini-3.5-flash` OR flex | 32000（PR #94 由 16000 提高；HTTP 读超时 `max(180, max_tokens//50)`=640s） | ~$0.02（未核实精确单价） |
+| 2   | `run_finance.py` Pass 2（stage `report_pass2`） | 整合情报快照、Sonar 与个人上下文生成最终报告，report_md 直接输出裸 markdown | `openai/gpt-6-luna` via OR/OpenAI（provider 锁定不允许 fallback 到其他 provider；`reasoning={"effort":"xhigh"}`，issue #90/PR #91；此前 issue #60 从 `deepseek-v4-pro`+thinking 换到 `gpt-5.6-luna`/high，原因见文末变更记录）。**截断正文判为失败**（PR #94，issue #99 改重试方式）：`finish_reason=length` 时即使正文非空也失败。空正文仍同请求重试；length 则 `reasoning.effort` 降一档一次（xhigh→high），再截断进入 fallback → 代码摘要 + TG 告警 | `google/gemini-3.5-flash` OR flex | 32000（PR #94 由 16000 提高；HTTP 读超时 `max(180, max_tokens//50)`=640s） | ~$0.02（未核实精确单价） |
 | 2b  | `run_finance.py` Pass 2后（stage `sas_candidate_extract`，issue #60） | 独立提取SAS候选证据（原是Pass 2 JSON的一个字段） | `google/gemma-4-31b-it`（OR，provider锁定OpenInference，9/9真实对抗测试验证） | `google/gemini-3.1-flash-lite` OR flex | 800 | ~$0.0003 |
 | 4   | `intel_sources.py::_sonar_macro_brief()`（stage `macro_brief`） | Sonar 宏观快照（AM/PM 各一次） | `perplexity/sonar`（OR，`search_recency_filter="day"`，2026-07-02 加，见 issue #24） | 重试1次(5s) → `””` 空节 | 1500（2026-07-23 起，issue #55；此前 800 会在 finish_reason=length 时静默截断且无日志可查） | ~$0.005（含固定搜索费） |
 | 5   | `telegram_commands.py` Step 1（stage `tg_preprocess`） | 统一预处理：意图分类 + 2条 query 生成 | `google/gemma-4-31b-it`（OR，provider锁定OpenInference，issue #11/#60——实测 temperature=0 下 deepseek-v4-flash 对同一条简单指令连续3次调用给出3种不同错误结果，见第8.1节注记） | `google/gemini-3.1-flash-lite` OR flex | 600 | ~$0.0001 |
@@ -811,7 +811,7 @@ tail -f /tmp/ibkr_keepalive.log                 # keepalive（每 5 分钟 auth 
 │   ├── intel_collect.py            按标的收集 Finnhub/Google News/RSS/Guardian、别名匹配、ETFS 常量、archive_intel_snapshot()
 │   ├── intel_deepen.py             代码 Pass 1：直链/302 解析、按需搜索、Extract 补齐（PR #96）
 │   ├── intel_render.py             情报快照 → Pass 2 输入段落（条数上限）与代码摘要降级
-│   ├── pass2_context.py            背景信号 context_state 与变化判断（FRED 档位/15% 仓位/52 周高低）
+│   ├── pass2_context.py            背景信号 context_state 与变化判断（FRED 档位/个股 15% 跨越/52 周高低；CORE_HOLDING_EXCLUDE）
 │   ├── recent_coverage.py          近 5 个 NYSE 交易日已报道内容抽取
 │   ├── publication_window.py       报告与回放共用的交易日发表窗口计算
 │   ├── eval/                       issue #87 回溯评估集与收集召回验收入口
@@ -831,7 +831,7 @@ tail -f /tmp/ibkr_keepalive.log                 # keepalive（每 5 分钟 auth 
 │   ├── sec_edgar_utils.py          封装 edgartools：Form 4 内部人买入过滤 + 10-K risk factors 取值
 │   ├── backfill_drawers.py         MemPalace 历史 drawer 一次性回填（已完成，保留供参考）
 │   ├── migrate_reports.py          旧格式迁移（一次性）
-│   └── test_*.py                   无 pytest 依赖的回归测试（2026-09-24 共 13 个；含 test_issue87_pass0/pass2/switch、test_llm_config、test_intel_sources_sanitize、test_telegram_followup_reason 等；#72/#80/#82 与语义过滤测试随 PR #89 删除）
+│   └── test_*.py                   无 pytest 依赖的回归测试（2026-09-24 共 15 个；含 test_issue99_pass2_review、test_issue101_watchlist_edit、test_issue87_pass0/pass2/switch、test_llm_config 等；#72/#80/#82 与语义过滤测试随 PR #89 删除）
 ├── .venv/
 ├── llm_config.example.json         LLM 选型 schema 与默认值说明模板（git 追踪，issue #11）
 ├── llm_config.json                 实际生效的 LLM 选型覆盖（git 追踪，目前内容与 DEFAULTS 完全一致——没有覆盖，可直接编辑，不需 PR）
@@ -1436,3 +1436,22 @@ Pass 2 提示词在“无进展就省略”规则后加例外：已排期的供�
 - Sonar 宏观快照没有浪费：用于 Pass 2 正文、PM 校准和 Context Log 三处。但 #89 之后 SAS 候选抽取的输入只剩情报快照（#89 之前还能看到 RSS、Finnhub、Sonar、社交舆情和 Tavily），是否把 Sonar 加回来未定。
 - `sas_candidate_extract` 的 `completion=13` 即 `{"sas_candidates": []}`，是正常空结果。AAOI 是观察标的，按规则不进 SAS；解禁、增发这类短期供给事件属于正文职责，不是 SAS 的职责。
 - 信息量偏少除截断外，#89 本身有结构性原因：输入收窄（无开放池，地缘话题无全文）且提示词要求“无进展就省略”。需观察几天正常报告后单独评估，#94–#97 均未处理。
+
+## 变更记录追加：2026-09-24 — issue #99 首日复盘（尚未合并）
+
+2026-09-23 AM 把 QQQM 19% 写成应修剪到 12–13%。15% 线针对个股 Alpha 层；`changed_background()` 对全部权重判断，且第一次运行没有上一次状态时把 `old is None` 当成跨越。52 周新高/低同样会在没有上次记录时注入。
+
+同日报告里“不能视为 / 不代表 / 不足以”这类防御句约占 29%。PM 还按 `pm_afterhours_note` 逐个持仓复述日内和盘后。
+
+#94 把截断正文判为失败后，仍用同一个 xhigh、32000 请求再试，最坏每次等到 640 秒超时。情报快照也没有 Pass 2 的 token 记录。
+
+本次改动（一个 PR，四处独立）：
+
+- `CORE_HOLDING_EXCLUDE` 放到 `pass2_context.py`（`run_finance` 再导出，避免循环 import）。15% 只比较这份集合之外的标的，且上次没有权重时不注入。52 周新高/低要求上次已有该标的。
+- Pass 2 提示词：不逐条否定材料里没人提出的推论；持仓段只写有新事件、异动或已排期供给事件的标的。PM 盘后说明只在方向相反或达到异动阈值时写，盘后无成交只在对异动标的有意义时注明。#97 的供给事件例外保留。
+- `parse_json=False` 遇到 `finish_reason=length` 时不重复同一请求。`reasoning.effort` 按 xhigh→high→medium 降一档重试一次；再截断，或已经是最低档/没有 effort，就进入 fallback。不写回 `llm_config`。空正文、网络错误、5xx、429 的重试不变。
+- 情报快照 `pass2`：成功写入 `_llm_meta`（含 token、finish_reason、`effort_used`、`truncation_downgrade`）；代码降级摘要写入 `fallback_summary` 和 `reason`。
+
+设计里的开放点：降到 high 之后若仍截断，按设计默认直接 fallback，没有再降到 medium。测试 `scripts/test_issue99_pass2_review.py`。未跑付费报告。Obsidian 文档留给合并后的验证方。
+
+同一 PR 包含 issue #101。TG 的 `_section_add`、`_section_remove`、`_geo_add`、`_geo_remove` 原先用 `(\n## |\Z)` 当边界，写回时把下一节的 `\n## ` 吃掉。收件人还被 `", "` 拼成一行，`load_watchlist()` 会把整行当成一个地址。`_write_watchlist()` 直接 `write_text`。现在四处共用前瞻边界 `(?=\n## |\Z)`；收件人一行一条；个股、商品、汇率仍是逗号一行；地缘关键词仍是 `话题: 词1, 词2`。写回先序列化，空正文不覆盖非空文件，临时文件 `os.replace` 后再读回核对。`load_watchlist()` 的解析没改。测试 `scripts/test_issue101_watchlist_edit.py`，只用临时文件和字符串。合并后需要重启 `com.daily-intel.finance.telegram`。
