@@ -161,6 +161,56 @@ class SwitchTest(unittest.TestCase):
         self.assertNotIn("https://a.example/2", extracted)
         self.assertEqual(len(result["entities"][0]["fulltext"]), 2)
 
+    def test_extract_tops_up_to_next_multiple_of_five(self):
+        # 2026-09-23 PM sent 7 URLs for 2cr; 10 URLs cost the same.
+        def items_for(ticker, n):
+            return [item(f"{ticker} news {i}", f"{ticker.lower()}{i}.example",
+                         f"https://{ticker.lower()}{i}.example/a", when=f"2026-09-21T1{i}:00:00+00:00")
+                    for i in range(n)]
+        entities = [entity("INTC", d1=10, items=items_for("INTC", 4)),
+                    entity("AAOI", d1=-9, items=items_for("AAOI", 1)),
+                    entity("SPCX", d1=-8),
+                    entity("PLTR", d1=7, items=items_for("PLTR", 3))]
+        intel_snapshot = {"date": "2026-09-21", "slot": "pm", "entities": entities,
+                          "macro_digest": {"items": [], "geo_topics_hit": []}}
+        extracted = []
+        def search(query, start, end):
+            return [{"title": query, "url": f"https://s{i}.example/x", "content": "lead"} for i in range(3)]
+        def extract(urls, query):
+            extracted.extend(urls)
+            return [{"url": url, "chunks": [{"content": "Body."}]} for url in urls]
+        with self.assertLogs("intel_deepen", "INFO") as logs:
+            result = deepen_intel_snapshot(intel_snapshot, search=search, extract=extract,
+                                           remaining=lambda: 25)
+        # First pass: INTC 2 + AAOI 1 + SPCX 2 (search) + PLTR 2 = 7; top-up fills to 10
+        # with the next-newest INTC link, SPCX's spare search result, then PLTR's next link;
+        # AAOI has only one link, so it contributes nothing.
+        self.assertEqual(len(extracted), 10)
+        self.assertEqual(extracted[7:], ["https://intc1.example/a", "https://s2.example/x",
+                                         "https://pltr0.example/a"])
+        self.assertEqual(result["extract_topup_count"], 3)
+        self.assertEqual(len(set(extracted)), 10)
+        self.assertTrue(any("Deepen direct leads INTC" in line and "s" in line for line in logs.output))
+        self.assertTrue(any("top-up: +3 URLs to 10" in line for line in logs.output))
+
+    def test_extract_top_up_skips_exact_multiple_and_reuses_redirect_cache(self):
+        redirects = [item(f"INTC news {i}", "finnhub.io", f"https://finnhub.io/r{i}",
+                          kind="finnhub_redirect", when=f"2026-09-21T1{i}:00:00+00:00") for i in range(3)]
+        entities = [entity("INTC", d1=10, items=redirects)]
+        intel_snapshot = {"date": "2026-09-21", "slot": "pm", "entities": entities,
+                          "macro_digest": {"items": [], "geo_topics_hit": []}}
+        heads = []
+        def fake_head(url, follow_redirects=False, timeout=8):
+            heads.append(url)
+            return SimpleNamespace(status_code=302, headers={"location": f"https://site{url[-1]}.example/a"})
+        extracted = []
+        with patch("intel_deepen.httpx.head", side_effect=fake_head):
+            deepen_intel_snapshot(intel_snapshot, search=lambda *_: [],
+                                  extract=lambda urls, q: extracted.extend(urls) or [],
+                                  remaining=lambda: 25)
+        self.assertEqual(len(extracted), 3)  # 2 first pass + 1 top-up toward 5
+        self.assertEqual(sorted(heads), ["https://finnhub.io/r0", "https://finnhub.io/r1", "https://finnhub.io/r2"])
+
     def test_budget_exhaustion_stops_spend_and_keeps_items(self):
         intel_snapshot = {"date": "2026-09-21", "slot": "am", "entities": [entity("INTC", d1=6)],
                   "macro_digest": {"items": [], "geo_topics_hit": []}}
