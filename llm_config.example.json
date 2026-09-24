@@ -36,13 +36,13 @@
       "fallback_model": "google/gemini-3.1-flash-lite"
     },
     "report_pass2": {
-      "_note": "Issue #90: report Pass 2 uses GPT-6 Luna with xhigh reasoning; the OpenAI provider pin and Gemini fallback remain. See issue #60 for the original GPT-5.6 Luna selection evidence.",
+      "_note": "Issue #90: report Pass 2 uses GPT-6 Luna with xhigh reasoning; the OpenAI provider pin and Gemini fallback remain. max_tokens 32000: 16000 truncated the 2026-09-23 PM report. See issue #60 for the original GPT-5.6 Luna selection evidence.",
       "gateway": "openrouter",
       "model": "openai/gpt-6-luna",
       "providers": {"order": ["OpenAI"], "allow_fallbacks": false},
       "thinking": null,
       "reasoning": {"effort": "xhigh"},
-      "max_tokens": 16000,
+      "max_tokens": 32000,
       "temperature": 0.2,
       "fallback_model": "google/gemini-3.5-flash"
     },

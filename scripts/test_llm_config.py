@@ -334,7 +334,7 @@ def test_llm_client_reads_stage_config():
     assert captured["model"] == "x-ai/grok-4.5"
     assert "thinking" not in captured           # report_pass2 no longer uses DeepSeek's thinking
     assert captured["reasoning"] == {"effort": "xhigh"}
-    assert captured["max_tokens"] == 16000
+    assert captured["max_tokens"] == 32000
 
 
 def test_call_llm_parse_json_false_returns_raw_text():
@@ -463,12 +463,50 @@ def test_call_llm_parse_json_false_never_promotes_partial_cot_on_length():
     assert calls.count("openai/gpt-6-luna") == 2  # primary + 1 retry, neither promoted CoT
 
 
-def test_call_llm_parse_json_false_accepts_partial_content_on_length():
-    # Contrast with the case above: finish_reason=="length" does NOT mean
-    # "reject the response" — only an *empty* content under length should be
-    # treated as failure. Genuinely truncated but non-empty visible content
-    # (the model wrote real markdown and then ran out of budget mid-report)
-    # must still be accepted as a (partial) report rather than discarded.
+def test_call_llm_parse_json_false_rejects_truncated_content_on_length():
+    # 2026-09-23 PM: report_pass2 returned finish_reason=="length" with the
+    # report cut mid-sentence after its first section, and it shipped as a
+    # success. Non-empty truncated text is now a failure: retry, then
+    # fallback_model; the fallback's complete text is what comes back.
+    import llm_client
+    importlib.reload(llm_client)
+    _load(None)
+    calls = []
+
+    class _Resp:
+        def __init__(self, content, finish):
+            self._content, self._finish = content, finish
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"provider": "T", "usage": {},
+                    "choices": [{"finish_reason": self._finish,
+                                 "message": {"content": self._content}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append((json["model"], timeout))
+        if json["model"] == llm_config.stage("report_pass2")["fallback_model"]:
+            return _Resp("# Report\n\nFull fallback body.", "stop")
+        return _Resp("# Report\n\nINTC（持仓）收于$122.57，", "length")
+
+    orig = llm_client.httpx.post
+    llm_client.httpx.post = fake_post
+    try:
+        out = llm_client.call_llm("p", system_prompt="s", stage="report_pass2",
+                                   parse_json=False, max_retries=1)
+    finally:
+        llm_client.httpx.post = orig
+    assert out["text"] == "# Report\n\nFull fallback body."
+    assert out["_llm_meta"]["fallback"] is True
+    assert [m for m, _ in calls].count("openai/gpt-6-luna") == 2
+    assert all(t == 640 for _, t in calls)  # 32000 // 50, not the old fixed 180s
+
+
+def test_call_llm_parse_json_false_truncated_fallback_also_fails():
+    # If the fallback is truncated too, call_llm returns {} so run_finance
+    # ships the deterministic snapshot summary and sends the TG alert.
     import llm_client
     importlib.reload(llm_client)
     _load(None)
@@ -480,20 +518,23 @@ def test_call_llm_parse_json_false_accepts_partial_content_on_length():
         def json(self):
             return {"provider": "T", "usage": {},
                     "choices": [{"finish_reason": "length",
-                                 "message": {"content": "# Report\n\n价格异动部分正常写完，"
-                                                         "后面被截断了"}}]}
-
-    def fake_post(url, headers=None, json=None, timeout=None):
-        return _Resp()
+                                 "message": {"content": "# Report\n\n被截断了，"}}]}
 
     orig = llm_client.httpx.post
-    llm_client.httpx.post = fake_post
+    llm_client.httpx.post = lambda url, headers=None, json=None, timeout=None: _Resp()
     try:
-        out = llm_client.call_llm("p", system_prompt="s", stage="report_pass2", parse_json=False)
+        out = llm_client.call_llm("p", system_prompt="s", stage="report_pass2",
+                                   parse_json=False, max_retries=0)
     finally:
         llm_client.httpx.post = orig
-    assert "价格异动部分正常写完" in out["text"]
-    assert out["_llm_meta"]["fallback"] is False  # accepted on the primary attempt, no fallback needed
+    assert out == {}
+
+
+def test_http_timeout_scales_with_max_tokens():
+    import llm_client
+    assert llm_client._http_timeout(4000) == 180
+    assert llm_client._http_timeout(16000) == 320
+    assert llm_client._http_timeout(32000) == 640
 
 
 def test_call_llm_sends_reasoning_param_for_report_pass2_parse_json_false():
