@@ -35,6 +35,12 @@ _identity_set = False
 _DISCRETIONARY_BUY_CODE = "P"
 
 
+def sec_user_agent() -> str:
+    """Contact identity SEC asks for on every request. Env wins; the module fallback is the SAS client."""
+    contact = os.getenv("FINANCE_FROM_ADDRESS", "").strip() or _EDGAR_CONTACT
+    return f"Daily Intelligence research {contact}"
+
+
 def _ensure_identity() -> None:
     global _identity_set
     if _identity_set:

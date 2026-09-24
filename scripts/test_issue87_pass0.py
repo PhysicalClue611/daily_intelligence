@@ -65,6 +65,8 @@ class PassZeroTest(unittest.TestCase):
         timer.start()
         try:
             with patch.object(collect, "fetch_finnhub", side_effect=finnhub), \
+                 patch.object(collect, "resolve_ciks", return_value={}), \
+                 patch.object(collect, "fetch_yahoo_rss", return_value=[]), \
                  patch.object(collect.httpx, "get", side_effect=http_get), \
                  patch.object(collect, "fetch_rss_pool", return_value=([], [])), \
                  patch.object(collect, "fetch_guardian_pool", return_value=([], [])):
@@ -91,6 +93,8 @@ class PassZeroTest(unittest.TestCase):
         moves = {"INTC": {"window_start": old.date().isoformat()}}
         with patch.object(collect, "fetch_finnhub", return_value=[]), \
              patch.object(collect, "fetch_google_news", return_value=[]), \
+             patch.object(collect, "resolve_ciks", return_value={}), \
+             patch.object(collect, "fetch_yahoo_rss", return_value=[]), \
              patch.object(collect, "fetch_rss_pool", side_effect=rss), \
              patch.object(collect, "fetch_guardian_pool", side_effect=guardian_pool):
             entities, _ = collect.collect(["INTC", "PLTR"], aliases, set(), {}, moves, {}, now, "pm")
@@ -105,6 +109,8 @@ class PassZeroTest(unittest.TestCase):
         story = collect.item("Intel and AUO deal", "", "Guardian", "theguardian.com", "u", "direct", now)
         with patch.object(collect, "fetch_finnhub", return_value=[]), \
              patch.object(collect, "fetch_google_news", return_value=[]), \
+             patch.object(collect, "resolve_ciks", return_value={}), \
+             patch.object(collect, "fetch_yahoo_rss", return_value=[]), \
              patch.object(collect, "fetch_rss_pool", side_effect=AssertionError("replay fetched RSS")), \
              patch.object(collect, "fetch_guardian_pool", return_value=([story], [])) as guardian:
             entities, _ = collect.collect(["INTC"], {"INTC": ["Intel"]}, set(), {}, {}, {}, now, "pm", replay=True)

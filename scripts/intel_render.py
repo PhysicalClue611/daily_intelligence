@@ -1,7 +1,12 @@
 """Bounded intelligence snapshot inputs and deterministic fallback for issue #87 Pass 2."""
 from __future__ import annotations
 
+import re
+
 from intel_collect import _word_match
+
+_ACCESSION = re.compile(r"\d{10}-\d{2}-\d{6}")
+_ITEM_NUMBER = re.compile(r"\d+\.\d+")
 
 
 def emergency_intel_snapshot(today: str, slot: str, as_of, price_rows: list,
@@ -26,7 +31,8 @@ def emergency_intel_snapshot(today: str, slot: str, as_of, price_rows: list,
                          "move": {"d1": row.change_pct if row else None, "d3": d3, "d5": d5, "flags": flags,
                                   **({"window_start": window_starts[ticker]}
                                      if window_starts and ticker in window_starts else {})},
-                         "coverage": {"finnhub": 0, "google_news": 0, "rss": 0, "guardian": 0, "errors": [error]},
+                         "coverage": {"finnhub": 0, "google_news": 0, "rss": 0, "guardian": 0,
+                                      "sec_8k": 0, "yahoo_rss": 0, "errors": [error]},
                          "items": [], "fulltext": []})
     return {"schema_version": 1, "date": today, "slot": slot, "as_of": as_of.isoformat(),
             "entities": entities, "macro_digest": {"items": [], "geo_topics_hit": []}}
@@ -41,11 +47,23 @@ def should_report(intel_snapshot: dict) -> bool:
             or bool((intel_snapshot.get("macro_digest") or {}).get("geo_topics_hit")))
 
 
+def filing_headline(row: dict) -> str | None:
+    """Company filing label for Pass 2. Item numbers stay numeric."""
+    if row.get("source") != "SEC 8-K" and row.get("url_kind") != "sec_filing":
+        return None
+    title = row.get("title") or ""
+    nums = list(dict.fromkeys(_ITEM_NUMBER.findall(title)))
+    label = "公司公告（8-K Item " + "、".join(nums) + "）" if nums else "公司公告（8-K）"
+    accession = _ACCESSION.search(title)
+    return f"{label} {accession.group(0)}" if accession else label
+
+
 def coverage_line(entity: dict) -> str:
     coverage = entity.get("coverage") or {}
     errors = coverage.get("errors") or []
     return (f"Finnhub {coverage.get('finnhub', 0)}、Google News {coverage.get('google_news', 0)}、"
-            f"RSS {coverage.get('rss', 0)}、Guardian {coverage.get('guardian', 0)}"
+            f"RSS {coverage.get('rss', 0)}、Guardian {coverage.get('guardian', 0)}、"
+            f"SEC 8-K {coverage.get('sec_8k', 0)}、Yahoo RSS {coverage.get('yahoo_rss', 0)}"
             + (f"；错误：{'; '.join(errors)}" if errors else ""))
 
 
@@ -71,13 +89,14 @@ def render_intel_snapshot_context(intel_snapshot: dict, geo_keywords: dict[str, 
         lines.append(f"检索范围（仅供核查）：{coverage_line(e)}")
         limit = 25 if active else 8
         for row in rows[:limit]:
+            shown = filing_headline(row) or row.get("title", "")
             if active:
                 summary = str(row.get("summary") or "")[:200]
                 lines.append(f"- {row.get('published_at', '')[:16]} [{row.get('publisher_domain', '')}] "
-                             f"{row.get('title', '')}" + (f"；{summary}" if summary else "")
+                             f"{shown}" + (f"；{summary}" if summary else "")
                              + ("（此前已报道）" if row.get("seen_before") else ""))
             else:
-                lines.append(f"- [{row.get('publisher_domain', '')}] {row.get('title', '')}")
+                lines.append(f"- [{row.get('publisher_domain', '')}] {shown}")
         for chunk in e.get("fulltext", []):
             lines.append(f"  正文[{chunk.get('url', '')}] {chunk.get('confidence_tags', '')}: {chunk.get('text', '')}")
     if quiet_observers:
@@ -109,7 +128,8 @@ def render_fallback_report(intel_snapshot: dict, slot_label: str) -> str:
             continue
         move = e.get("move") or {}
         errors = (e.get("coverage") or {}).get("errors") or []
-        reason = (f"线索待核实：{e['items'][0].get('title', '')}（{e['items'][0].get('publisher_domain', '')}）"
+        lead = (filing_headline(e["items"][0]) or e["items"][0].get("title", "")) if e.get("items") else ""
+        reason = (f"线索待核实：{lead}（{e['items'][0].get('publisher_domain', '')}）"
                   if e.get("items") else ("未能完成检索" if errors else "未找到原因"))
         lines.append(f"- {e['ticker']}：当日 {float(move.get('d1') or 0):+.1f}%；" + reason
                      + f"；覆盖：{coverage_line(e)}。")
