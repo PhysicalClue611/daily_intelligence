@@ -1,6 +1,7 @@
 """Bounded, entity-specific context from recent monthly reports for Pass 2."""
 
 import re
+import json
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -27,6 +28,27 @@ def _trading_dates(today: date) -> set[str]:
                 dates.append(cursor.isoformat())
             cursor -= timedelta(days=1)
         return set(dates)
+
+
+def recent_fresh_counts(root: Path, today: str, slot: str, limit: int = 10) -> dict[str, list[int]]:
+    """Recent same-slot fresh item counts; corrupt or missing archives are ignored."""
+    paths = sorted(root.glob(f"*/????-??-??-{slot}-intel-snapshot.json"), reverse=True)
+    history: dict[str, list[int]] = {}
+    for path in paths:
+        if path.name[:10] >= today:
+            continue
+        try:
+            entities = json.loads(path.read_text()).get("entities", [])
+        except (OSError, ValueError):
+            continue
+        for entity in entities:
+            ticker = entity.get("ticker")
+            if ticker and len(history.get(ticker, [])) < limit:
+                history.setdefault(ticker, []).append(sum(not row.get("seen_before")
+                                                            for row in entity.get("items", [])))
+        if history and all(len(counts) >= limit for counts in history.values()):
+            break
+    return history
 
 
 def _entity_names(ticker: str, aliases: dict[str, list[str]]) -> list[str]:

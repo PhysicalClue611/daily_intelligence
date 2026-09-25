@@ -68,6 +68,10 @@ def build_intel_snapshot(wl: dict, as_of: datetime, slot: str, *, price_rows: li
             row["seen_before"] = collect.normalize_title(row["title"]) in previous[entity["ticker"]]
         if entity["ticker"] in alias_errors:
             entity["coverage"]["errors"].append(alias_errors[entity["ticker"]])
+    prior_macro = {collect.normalize_title(title) for title in
+                   collect.previous_macro_titles(archive_root, as_of)}
+    for row in macro.get("items", []):
+        row["seen_before"] = collect.normalize_title(row.get("title", "")) in prior_macro
     intel_snapshot = {"schema_version": 1, "date": as_of.astimezone(ET).date().isoformat(), "slot": slot,
               "as_of": as_of.isoformat(), "replay": replay, "entities": entities, "macro_digest": macro}
     path = (collect.archive_intel_snapshot(intel_snapshot, archive_root) if archive else

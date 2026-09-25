@@ -31,17 +31,9 @@ ROOT = Path(__file__).resolve().parent.parent
 ETFS = {"QQQM", "VOO", "EWJ", "SGOL"}
 SUFFIXES = re.compile(r"\s+(?:Corp(?:oration)?|Inc(?:orporated)?|Holdings?|Ltd|Limited|PLC|Co)\.?$", re.I)
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DailyIntel/1.0)"}
-YAHOO_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
-}
 ENTITY_SOURCES = ("finnhub", "google_news", "rss", "guardian", "sec_8k", "yahoo_rss")
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_ATOM_URL = "https://www.sec.gov/cgi-bin/browse-edgar"
-YAHOO_RSS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline"
 CIK_CACHE = ROOT / "cik_cache.json"
 _GOOGLE_NEWS_LOCK = threading.Lock()
 _last_google_news_request = 0.0
@@ -307,17 +299,31 @@ def fetch_sec_8k(ticker: str, since: datetime, as_of: datetime, cik: str) -> lis
     return out
 
 
-def fetch_yahoo_rss(ticker: str, since: datetime, as_of: datetime) -> list[dict]:
-    response = _request(YAHOO_RSS_URL, params={"s": ticker, "region": "US", "lang": "en-US"},
-                        headers=YAHOO_HEADERS, timeout=12)
+def fetch_yahoo_rss(ticker: str, since: datetime, as_of: datetime,
+                    aliases: list[str] | None = None) -> list[dict]:
+    import yfinance as yf
+    from fetch_prices import _quiet_yfinance_logs
+
+    with _quiet_yfinance_logs():
+        news = yf.Ticker(ticker).get_news(count=20)
     out = []
-    for entry in feedparser.parse(response.content).entries:
-        published = _published(entry)
-        if not published or not _in_window(published, since, as_of) or not entry.get("title"):
+    for entry in news or []:
+        content = entry.get("content") or {}
+        title = content.get("title") or ""
+        summary = content.get("summary") or ""
+        try:
+            published = datetime.fromisoformat(str(content.get("pubDate", "")).replace("Z", "+00:00"))
+        except ValueError:
             continue
-        link = entry.get("link", "")
-        out.append(item(entry["title"], entry.get("summary", ""), "Yahoo RSS",
-                        _domain(link), link, "direct", published))
+        if not _in_window(published, since, as_of) or not title:
+            continue
+        if not any(_word_match(title + " " + summary, name) for name in (aliases or [ticker])):
+            continue
+        link = (content.get("canonicalUrl") or {}).get("url") or ""
+        if not link.startswith("https://"):
+            continue
+        provider = (content.get("provider") or {}).get("displayName") or "Yahoo RSS"
+        out.append(item(title, summary, provider, _domain(link), link, "direct", published))
     return out
 
 
@@ -451,6 +457,18 @@ def previous_event_titles(root: Path, before: datetime, ticker: str) -> list[str
     return []
 
 
+def previous_macro_titles(root: Path, before: datetime) -> list[str]:
+    for path in archived_intel_snapshot_paths(root):
+        try:
+            data = json.loads(path.read_text())
+            if datetime.fromisoformat(data["as_of"]) >= before:
+                continue
+        except (OSError, ValueError, KeyError):
+            continue
+        return [row.get("title", "") for row in (data.get("macro_digest") or {}).get("items", [])]
+    return []
+
+
 def collect(tickers: list[str], aliases: dict[str, list[str]], held: set[str], weights: dict[str, float],
             moves: dict[str, dict], geo_keywords: dict[str, list[str]], as_of: datetime, slot: str,
             *, replay: bool = False, finnhub_key: str = "", guardian_key: str = "") -> tuple[list[dict], dict]:
@@ -501,7 +519,8 @@ def collect(tickers: list[str], aliases: dict[str, list[str]], held: set[str], w
                         timed, "sec_8k", fetch_sec_8k, ticker, since_by_ticker[ticker], as_of, cik)
             if not replay:
                 futures[(ticker, "yahoo_rss")] = yahoo_pool.submit(
-                    timed, "yahoo_rss", fetch_yahoo_rss, ticker, since_by_ticker[ticker], as_of)
+                    timed, "yahoo_rss", fetch_yahoo_rss, ticker, since_by_ticker[ticker], as_of,
+                    aliases[ticker])
         for (ticker, kind), future in futures.items():
             try:
                 source[ticker][kind] = future.result()

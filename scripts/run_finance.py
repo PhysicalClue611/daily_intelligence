@@ -69,6 +69,7 @@ from finance_email import send_report
 # calls them directly, not for hypothetical future rf.* access).
 from budget_trackers import (
     load_budget, save_budget, budget_remaining,
+    save_run_budget,
     load_serpapi_budget, save_serpapi_budget, serpapi_remaining,
     load_adanos_budget, save_adanos_budget,
     load_apify_budget, save_apify_budget,
@@ -87,14 +88,14 @@ from report_writers import (
     _fmt_llm_meta, finance_footer,
     REPORTS_DIR,
 )
-from recent_coverage import build_recent_coverage_section
+from recent_coverage import build_recent_coverage_section, recent_fresh_counts
 from pass2_context import (
     CORE_HOLDING_EXCLUDE as _CORE_HOLDING_EXCLUDE,
     current_state, changed_background, read_previous_intel_snapshot_state,
 )
 from intel_pass0 import build_intel_snapshot
 from intel_collect import ETFS, archive_intel_snapshot
-from intel_deepen import deepen_intel_snapshot
+from intel_deepen import deepen_intel_snapshot, RUN_CREDIT_CAP, MANUAL_CREDIT_CAP
 from intel_render import (
     emergency_intel_snapshot, should_report, render_intel_snapshot_context,
     render_fallback_report, filter_social_lines,
@@ -333,7 +334,7 @@ def tavily_search(query: str, budget: dict, days: int = 1,
         resp = _request_with_retry(httpx.post, "https://api.tavily.com/search", json=payload, timeout=30)
         results = resp.json().get("results", [])
         budget["used"] += credits
-        save_budget(budget)
+        save_run_budget(budget)
         logger.info(f"Tavily [{budget['used']}/{TAVILY_DAILY_LIMIT}] ({search_depth}, {credits}cr): "
                     f"'{query}' → {len(results)} results")
         return results
@@ -351,7 +352,7 @@ def tavily_extract(urls: list[str], query: str, budget: dict,
     if not TAVILY_API_KEY or not urls:
         return []
     # Round up to nearest 5 for credit efficiency
-    batch = urls[:10]  # cap at 10 (= 2cr max)
+    batch = urls[:20]
     n = len(batch)
     extract_cost = math.ceil(n / 5)   # 1-5 → 1cr, 6-10 → 2cr
     if budget_remaining(budget) < extract_cost:
@@ -371,7 +372,7 @@ def tavily_extract(urls: list[str], query: str, budget: dict,
         )
         results = resp.json().get("results", [])
         budget["used"] += extract_cost
-        save_budget(budget)
+        save_run_budget(budget)
         logger.info(f"Tavily Extract [{budget['used']}/{TAVILY_DAILY_LIMIT}]: "
                     f"{n} URLs → {len(results)} extracted ({extract_cost}cr)")
         return results
@@ -707,8 +708,13 @@ def build_status_message(today_et: str, slot_label: str, budget: dict,
                          reddit_section: str, apify_budget: dict,
                          llm_meta_p2: dict) -> str:
     """TG-only status aligned with intelligence snapshot coverage and code-only deepening."""
-    lines = [f"**Daily_Intel 运行状态** · {today_et} {slot_label}", "",
-             f"Tavily今日剩余: {budget_remaining(budget)}/{TAVILY_DAILY_LIMIT}（本次用 {budget['used'] - tavily_used_before}）"]
+    if budget.get("_manual"):
+        budget_line = (f"手动运行 Tavily本次限额: {budget.get('_run_cap')}/{budget.get('_run_cap')}cr"
+                       f"（本次用 {budget['used']}cr；独立记账）")
+    else:
+        budget_line = (f"Tavily今日剩余: {max(0, TAVILY_DAILY_LIMIT - budget['used'])}/{TAVILY_DAILY_LIMIT}"
+                       f"（本次限额 {budget.get('_run_cap')}cr，本次用 {budget['used'] - tavily_used_before}cr）")
+    lines = [f"**Daily_Intel 运行状态** · {today_et} {slot_label}", "", budget_line]
     serpapi_used_run = serpapi_budget["used"] - serpapi_used_before
     if serpapi_used_run:
         lines.append(f"SerpApi本月已用: {serpapi_budget['used']}/{SERPAPI_MONTHLY_LIMIT}（本次用 {serpapi_used_run}）")
@@ -719,7 +725,7 @@ def build_status_message(today_et: str, slot_label: str, budget: dict,
     lines += ["", "情报来源:",
               f"- Pass 0: {len(entities)} 标的；Finnhub {totals['finnhub']}、Google News {totals['google_news']}、RSS {totals['rss']}、Guardian {totals['guardian']}、SEC 8-K {totals['sec_8k']}、Yahoo RSS {totals['yahoo_rss']}",
               f"- 来源错误: {'；'.join(errors[:5]) if errors else '无'}",
-              f"- Pass 1（代码）: 搜索 {intel_snapshot.get('search_count', 0)}，Extract {intel_snapshot.get('extract_success_count', 0)}/{intel_snapshot.get('extract_url_count', 0)} URL"]
+              f"- Pass 1（代码）: 搜索 {intel_snapshot.get('search_count', 0)}，Extract {intel_snapshot.get('extract_success_count', 0)}/{intel_snapshot.get('extract_url_count', 0)} URL；安静标的 {len(intel_snapshot.get('quiet_selected', []))} 只/{intel_snapshot.get('quiet_url_count', 0)} URL；宏观 {intel_snapshot.get('macro_url_count', 0)} URL；本次限额 {intel_snapshot.get('run_credit_cap', 0)}cr"]
     for ticker, status in (intel_snapshot.get("deepen_status") or {}).items():
         lines.append(f"  {ticker}: {status}")
     lines.append(f"- Sonar宏观快照: {'成功' if sonar_macro_section else '失败/跳过'}")
@@ -846,6 +852,18 @@ def main():
         LOCK_FILE.unlink(missing_ok=True)
 
 
+def is_manual_run() -> bool:
+    return bool(os.getenv("FINANCE_FORCE_RUN") or os.getenv("FINANCE_FORCE_DATE"))
+
+
+def run_credit_cap(slot: str, manual: bool, daily_used: int) -> int:
+    if manual:
+        return MANUAL_CREDIT_CAP[slot]
+    available = max(0, TAVILY_DAILY_LIMIT - daily_used)
+    fixed = RUN_CREDIT_CAP[slot]
+    return min(fixed, available) if fixed is not None else available
+
+
 def _main_body():
     # 0. Handle forced overrides (for manual re-runs)
     force_date = os.getenv("FINANCE_FORCE_DATE", "")
@@ -886,8 +904,19 @@ def _main_body():
         sys.exit(1)
 
     # 3. Load Tavily budget
-    budget = load_budget()
-    logger.info(f"Tavily budget: {budget['used']}/{TAVILY_DAILY_LIMIT} used today")
+    manual_run = is_manual_run()
+    if manual_run:
+        cap = run_credit_cap(run_slot, True, 0)
+        budget = {"used": 0, "_manual": True, "_limit": cap,
+                  "_run_cap": cap, "_persisted_used": 0}
+        logger.info("Tavily manual run cap: %dcr, independent ledger", cap)
+    else:
+        budget = load_budget()
+        cap = run_credit_cap(run_slot, False, budget["used"])
+        budget["_limit"] = budget["used"] + cap
+        budget["_run_cap"] = cap
+        logger.info("Tavily budget: %d/%d used today; run cap %dcr",
+                    budget["used"], TAVILY_DAILY_LIMIT, cap)
     serpapi_budget = load_serpapi_budget()
     logger.info(f"SerpApi budget: {serpapi_budget['used']}/{SERPAPI_MONTHLY_LIMIT} used this month")
     tavily_used_before = budget["used"]
@@ -993,10 +1022,16 @@ def _main_body():
             ),
             extract=lambda urls, query: tavily_extract(urls, query, budget),
             remaining=lambda: budget_remaining(budget),
+            slot=run_slot, geo_keywords=wl["geo_keywords"],
+            history_counts=recent_fresh_counts(_PROJ_DIR / "archives", today_et, run_slot),
+            run_credit_cap=cap,
         )
     except Exception as exc:
         logger.warning("Pass 1 deepening failed, keeping free-source intelligence snapshot: %s", exc)
         intel_snapshot["deepen_status"] = {"error": type(exc).__name__}
+    intel_snapshot["run_credit_cap"] = cap
+    intel_snapshot["run_credit_used"] = budget["used"] - tavily_used_before
+    intel_snapshot["manual_run"] = manual_run
     previous_context_state = read_previous_intel_snapshot_state(_PROJ_DIR / "archives", now_et)
     try:
         archive_intel_snapshot(intel_snapshot)
@@ -1122,7 +1157,10 @@ def _main_body():
     )
     send_telegram_report(status_md, "")
 
-    logger.info(f"=== Done. Tavily used today: {budget['used']}/{TAVILY_DAILY_LIMIT} ===")
+    if manual_run:
+        logger.info("=== Done. Tavily manual run used: %d/%d ===", budget["used"], cap)
+    else:
+        logger.info("=== Done. Tavily used today: %d/%d ===", budget["used"], TAVILY_DAILY_LIMIT)
 
 
 if __name__ == "__main__":

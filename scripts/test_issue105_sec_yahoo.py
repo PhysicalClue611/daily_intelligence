@@ -100,14 +100,21 @@ class Issue105Test(unittest.TestCase):
                 collect.fetch_sec_8k("INTC", SINCE, AS_OF, "0000050863")
 
     def test_yahoo_rss_keeps_window_and_real_article_domain(self):
-        def fake(url, **kwargs):
-            self.assertEqual(url, "https://feeds.finance.yahoo.com/rss/2.0/headline")
-            self.assertEqual(kwargs["params"]["s"], "INTC")
-            self.assertIn("Mozilla/5.0", kwargs["headers"]["User-Agent"])
-            return _response(YAHOO)
-
-        with patch.object(collect, "_request", side_effect=fake):
-            rows = collect.fetch_yahoo_rss("INTC", SINCE, AS_OF)
+        def news(title, published, url):
+            return {"content": {"title": title, "summary": "Packaging deal", "pubDate": published,
+                                "canonicalUrl": {"url": url}, "provider": {"displayName": "Yahoo RSS"}}}
+        class Ticker:
+            def __init__(self, ticker):
+                self.ticker = ticker
+            def get_news(self, count):
+                self_test.assertEqual((self.ticker, count), ("INTC", 20))
+                return [news("Intel signs AUO partnership", "2026-09-21T16:00:00Z",
+                             "https://www.benzinga.com/news/intel-auo"),
+                        news("Old Intel story outside the window", "2026-09-01T12:00:00Z",
+                             "https://finance.yahoo.com/news/old-intel")]
+        self_test = self
+        with patch("yfinance.Ticker", Ticker):
+            rows = collect.fetch_yahoo_rss("INTC", SINCE, AS_OF, ["Intel"])
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["source"], "Yahoo RSS")
         self.assertEqual(rows[0]["url_kind"], "direct")

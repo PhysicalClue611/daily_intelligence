@@ -176,9 +176,12 @@ def write_report(today_et: str, slot_label: str, markdown: str, budget: dict) ->
     path = _monthly_path(today_et)
     ym_display = today_et[:7]  # "2026-04"
 
+    tavily_line = (f"_Tavily 手动本次: {budget.get('used', 0)}/{budget.get('_run_cap', 0)}_"
+                   if budget.get("_manual") else
+                   f"_Tavily: {budget.get('used', 0)}/{TAVILY_DAILY_LIMIT}_")
     section = (
         f"\n## {today_et} {slot_label}\n"
-        f"_Tavily: {budget.get('used', 0)}/{TAVILY_DAILY_LIMIT}_\n\n"
+        f"{tavily_line}\n\n"
         f"{markdown}\n\n---\n"
     )
 
