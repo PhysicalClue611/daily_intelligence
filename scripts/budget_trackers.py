@@ -27,6 +27,7 @@ from quota_store import load_quota, save_quota, remaining
 _PROJ_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
 
 BUDGET_PATH           = _PROJ_DIR / "finance_tavily_budget.json"
+MANUAL_BUDGET_PATH    = _PROJ_DIR / "finance_tavily_manual_budget.json"
 TAVILY_DAILY_LIMIT     = 25
 SERPAPI_BUDGET_PATH    = _PROJ_DIR / "finance_serpapi_budget.json"
 SERPAPI_MONTHLY_LIMIT  = 250
@@ -52,7 +53,28 @@ def save_budget(budget: dict) -> None:
 
 
 def budget_remaining(budget: dict) -> int:
-    return remaining(budget, TAVILY_DAILY_LIMIT)
+    return remaining(budget, budget.get("_limit", TAVILY_DAILY_LIMIT))
+
+
+def load_manual_budget() -> dict:
+    return load_quota(MANUAL_BUDGET_PATH, "daily")
+
+
+def save_manual_budget(budget: dict) -> None:
+    save_quota(MANUAL_BUDGET_PATH, budget)
+
+
+def save_run_budget(budget: dict) -> None:
+    """Manual calls use a separate cumulative ledger; each run has its own cap."""
+    if not budget.get("_manual"):
+        save_budget({key: value for key, value in budget.items() if not key.startswith("_")})
+        return
+    ledger = load_manual_budget()
+    delta = budget["used"] - budget.get("_persisted_used", 0)
+    if delta > 0:
+        ledger["used"] += delta
+        save_manual_budget(ledger)
+        budget["_persisted_used"] = budget["used"]
 
 
 # ── SerpApi monthly budget ────────────────────────────────────────────────────

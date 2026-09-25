@@ -67,13 +67,19 @@ def coverage_line(entity: dict) -> str:
             + (f"；错误：{'; '.join(errors)}" if errors else ""))
 
 
+def matching_topics(row: dict, geo_keywords: dict[str, list[str]]) -> list[str]:
+    text = row.get("title", "") + " " + row.get("summary", "")
+    return [topic for topic, aliases in geo_keywords.items()
+            if any(_word_match(text, alias) for alias in aliases)]
+
+
 def render_intel_snapshot_context(intel_snapshot: dict, geo_keywords: dict[str, list[str]]) -> str:
     """All movers, quiet holdings with up to 8 titles, macro latest 8/topic, 40 total."""
     lines = ["## 标的事实与来源（供分析）"]
     quiet_observers = []
     for e in intel_snapshot.get("entities", []):
         move = e.get("move") or {}
-        active = _has_move(e)
+        active = _has_move(e) or bool(e.get("fulltext"))
         rows = e.get("items") or []
         if not active and not e.get("held"):
             quiet_observers.append(e["ticker"])
@@ -87,8 +93,9 @@ def render_intel_snapshot_context(intel_snapshot: dict, geo_keywords: dict[str, 
         role = "持有" if e.get("held") else "观察"
         lines.append(f"### {e['ticker']}（{role}）{'、'.join(price_bits)}")
         lines.append(f"检索范围（仅供核查）：{coverage_line(e)}")
-        limit = 25 if active else 8
-        for row in rows[:limit]:
+        limit = 25 if active else 12
+        shown_rows = rows if active else sorted(rows, key=lambda row: bool(row.get("seen_before")))
+        for row in shown_rows[:limit]:
             shown = filing_headline(row) or row.get("title", "")
             if active:
                 summary = str(row.get("summary") or "")[:200]
@@ -96,21 +103,24 @@ def render_intel_snapshot_context(intel_snapshot: dict, geo_keywords: dict[str, 
                              f"{shown}" + (f"；{summary}" if summary else "")
                              + ("（此前已报道）" if row.get("seen_before") else ""))
             else:
-                lines.append(f"- [{row.get('publisher_domain', '')}] {shown}")
+                summary = str(row.get("summary") or "")[:120]
+                lines.append(f"- [{row.get('publisher_domain', '')}] {shown}"
+                             + (f"；{summary}" if summary else ""))
         for chunk in e.get("fulltext", []):
             lines.append(f"  正文[{chunk.get('url', '')}] {chunk.get('confidence_tags', '')}: {chunk.get('text', '')}")
     if quiet_observers:
         lines.append("无异动观察标的：" + "、".join(quiet_observers))
     macro = (intel_snapshot.get("macro_digest") or {}).get("items", [])
     chosen, seen = [], set()
-    for topic, aliases in geo_keywords.items():
+    fulltext_topics = {chunk.get("topic") for chunk in
+                       (intel_snapshot.get("macro_digest") or {}).get("fulltext", [])}
+    ordered_topics = sorted(geo_keywords, key=lambda topic: topic not in fulltext_topics)
+    for topic in ordered_topics:
         count = 0
         for row in sorted(macro, key=lambda r: r.get("published_at", ""), reverse=True):
             if count >= 8 or len(chosen) >= 40:
                 break
-            if (row.get("id") not in seen and
-                    any(_word_match(row.get("title", "") + " " + row.get("summary", ""), alias)
-                        for alias in aliases)):
+            if row.get("id") not in seen and topic in matching_topics(row, geo_keywords):
                 chosen.append((topic, row))
                 seen.add(row.get("id"))
                 count += 1
@@ -118,6 +128,9 @@ def render_intel_snapshot_context(intel_snapshot: dict, geo_keywords: dict[str, 
         lines.append("## 宏观与地缘线索")
         for topic, row in chosen:
             lines.append(f"- {topic} [{row.get('publisher_domain', '')}] {row.get('title', '')}")
+            for chunk in (intel_snapshot.get("macro_digest") or {}).get("fulltext", []):
+                if chunk.get("topic") == topic and chunk.get("item_id") == row.get("id"):
+                    lines.append(f"  正文[{chunk.get('url', '')}]: {chunk.get('text', '')}")
     return "\n".join(lines) + "\n"
 
 

@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from intel_pass0 import replay
+from quota_store import save_quota
 
 CASES = Path(__file__).with_name("attribution_eval_2026-08_09.json")
 
@@ -44,7 +45,7 @@ def main():
                 result = {"date": case["date"], "slot": case["slot"], "ticker": case["ticker"],
                           "collection_hit": False, "error": f"{type(exc).__name__}: {exc}"}
         results.append(result)
-        Path(args.output).write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n")
+        save_quota(Path(args.output), results)
         print(f"  collection={result['collection_hit']}", flush=True)
     collection = sum(r["collection_hit"] for r in results)
     print(f"R7.2 collection {collection}/24 (need >=21)")

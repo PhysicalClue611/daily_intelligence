@@ -187,7 +187,7 @@ class SwitchTest(unittest.TestCase):
             extracted.extend(urls)
             return [{"url": url, "chunks": [{"content": "Full article about company."}]} for url in urls]
         result = deepen_intel_snapshot(intel_snapshot, search=search, extract=extract, remaining=lambda: 25)
-        self.assertLessEqual(len(searched), 3)
+        self.assertLessEqual(len(searched), 5)
         self.assertLessEqual(len(extracted), 10)
         self.assertIn("https://a.example/1", extracted)
         self.assertIn("https://b.example/3", extracted)

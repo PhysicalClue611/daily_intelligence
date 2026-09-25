@@ -264,15 +264,10 @@ def _load_candidate_entries(ticker: str, max_entries: int = 10) -> str:
         return ""
 
 
-def _fetch_tavily_context(ticker: str) -> str:
-    """One basic Tavily search for broader quarterly context. Shares the same
-    daily budget pool as the AM/PM pipeline (load_budget/save_budget).
-
-    Note: rf.tavily_search() already calls rf.save_budget() internally on
-    success (see run_finance.py), so this function must not call
-    rf.save_budget() again — issue #41 flagged that as a redundant
-    (harmless but pointless) double-save."""
-    budget = rf.load_budget()
+def _fetch_tavily_context(ticker: str, manual: bool = False) -> str:
+    """One basic search, with a separate one-credit manual-run ledger."""
+    budget = ({"used": 0, "_manual": True, "_limit": 1,
+               "_run_cap": 1, "_persisted_used": 0} if manual else rf.load_budget())
     if rf.budget_remaining(budget) < 1:
         return ""
     try:
@@ -536,7 +531,7 @@ def run_ticker_review(ticker: str, trigger_reason: str) -> bool:
     )
     candidate_text = _load_candidate_entries(ticker) or "（候选证据日志无该标的记录）"
     news_text = rf.fetch_finnhub_news([ticker], hours=FINNHUB_NEWS_LOOKBACK_HOURS) or "（无 Finnhub 新闻）"
-    tavily_text = _fetch_tavily_context(ticker) or "（无 Tavily 搜索结果）"
+    tavily_text = _fetch_tavily_context(ticker, manual=trigger_reason == "手工指定") or "（无 Tavily 搜索结果）"
     personal_context = rf._load_personal_context()
     rubric = _load_sas_rubric() or "（无法读取 Manual 第7节，检查文件路径）"
 
