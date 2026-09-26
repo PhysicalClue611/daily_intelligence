@@ -195,5 +195,5 @@ OBSIDIAN_PATH="~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview
 25. **issue #105**（PR #108，`5b8efc8`）：下次 AM/PM 看日志 `Pass 0 sec_8k` / `Pass 0 yahoo_rss` 的耗时；8-K 是否出现在报告里并带 Item 编号；Yahoo 失败是否只留在覆盖错误里。回放召回已是 22/24。供给事件日历和 8-K 附件正文仍未做。（Yahoo 已在 #111 改用 yfinance；回放基线降为 21/24）
 26. **issue #111 观察**（PR #112，`a92ff0d`，2026-09-25 起）：`grep -E "run cap|Tavily used today|manual run" /tmp/daily_intelligence.log` 看每次的额度上限和日用量（09-25 PM 用了 6/25）。快照里看 `quiet_selected`、`macro_url_count`、`extract_success_count`。看各股 `yahoo_rss` 的条数和错误，连续 3 个交易日有过半标的失败就下线这一路。看 Pass 2 的 `prompt_tokens`（09-25 PM 为 24.8k）。
 27. **issue #113（下次一并实现）**：
-    - R1（扩大每只标的的链接数）待 owner 观察几天后决定。**写 handoff 或开始实现前，必须先问 owner 要结论。**
-    - R2–R11 已确定：跨运行 URL 去重、新闻量基线的最少份数、manual 记账文件 gitignore、小修；Extract 按标的写 query，3 个 chunk、每条 2000 字；付费墙名单和 Yahoo 导航剔除；安静个股的搜索词改写，并按日期过滤；正文质量门槛；放宽「新东西」，近 3 个交易日至 7 天内正在发酵、推动当日走势的事件可以纳入；已抓到正文的公司级实质事件必须写入报告。
+    - 原 R1（扩大每只标的的链接数）已拆到 #114，暂缓。**写 #114 的 handoff 或动手实现前，必须先问 owner 要结论。**
+    - R2–R11 已确定，2026-09-25 已交给 Codex 实现：跨运行 URL 去重、新闻量基线的最少份数、manual 记账文件 gitignore、小修；Extract 按标的写 query，3 个 chunk、每条 2000 字；付费墙名单和 Yahoo 导航剔除；安静个股的搜索词改写，并按日期过滤；正文质量门槛；放宽「新东西」，近 3 个交易日至 7 天内正在发酵、推动当日走势的事件可以纳入；已抓到正文的公司级实质事件必须写入报告。
