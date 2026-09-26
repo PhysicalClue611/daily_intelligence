@@ -1,5 +1,111 @@
 # 踩坑记录详情
 
+<!-- index moved from CLAUDE.md 2026-09-25 -->
+## 踩过的坑（索引，详情见 `docs/PITFALLS.md`）
+
+**2026-06-30 重构**：本节原为完整叙事（现象/根因/修复），每条 80-250 tokens，73 条累计占每次 session 启动上下文相当大比例。现改为一行索引 + 详情文件指针——完整叙述搬到 `docs/PITFALLS.md`（git-tracked，随需 grep/Read，不自动加载）。新增踩坑请照此规范写：这里加一行索引，详情写进 `docs/PITFALLS.md` 对应分类小节。
+
+1. Yahoo Finance 429 → 详见 `docs/PITFALLS.md#1`
+2. yfinance MultiIndex → 详见 `docs/PITFALLS.md#2`
+3. Gmail invalid_scope → 详见 `docs/PITFALLS.md#3`
+4. feedparser + Python 3.14 TLS → 详见 `docs/PITFALLS.md#4`
+5. RSS DNS 限制 → 详见 `docs/PITFALLS.md#5`
+6. BUDGET_PATH 位置 → 详见 `docs/PITFALLS.md#6`
+7. 重复邮件 → 详见 `docs/PITFALLS.md#7`
+8. 00:00 ET 调度陷阱 → 详见 `docs/PITFALLS.md#8`
+9. Telegram 重复标题 → 详见 `docs/PITFALLS.md#9`
+10. PM slot LLM 标题 → 详见 `docs/PITFALLS.md#10`
+11. Telegram bot token 冲突 → 详见 `docs/PITFALLS.md#11`
+12. Perplexity 隐藏搜索费 → 详见 `docs/PITFALLS.md#12`
+13. DeepSeek R1 拒绝 2026 日期 → 详见 `docs/PITFALLS.md#13`
+14. GPT-4o search 隐藏费用 → 详见 `docs/PITFALLS.md#14`
+15. Python 字符串内中文引号 → 详见 `docs/PITFALLS.md#15`
+16. RSVP 延迟 → 详见 `docs/PITFALLS.md#16`
+17. ET 硬编码 UTC-4 → 详见 `docs/PITFALLS.md#17`
+18. 持仓快照截断 → 详见 `docs/PITFALLS.md#18`
+19. Sonar/Claude 输出截断 → 详见 `docs/PITFALLS.md#19`
+20. 超长会话 token 用量 → 详见 `docs/PITFALLS.md#20`
+21. SerpApi 月度预算独立跟踪 → 详见 `docs/PITFALLS.md#21`
+22. OpenRouter 连接不稳定 → 详见 `docs/PITFALLS.md#22`
+23. Telegram HTML 注入 → 详见 `docs/PITFALLS.md#23`
+24. 搜索触发优先级倒置 → 详见 `docs/PITFALLS.md#24`
+25. KG CLI section 被内部小节截断（已下线子系统 KG，历史参考）→ 详见 `docs/PITFALLS.md#25`
+26. MemPalace Hermes mine 进 general room → 详见 `docs/PITFALLS.md#26`
+27. crontab 并发 mine 触发 ChromaDB SIGSEGV → 详见 `docs/PITFALLS.md#27`
+28. 手动验证用当日日期 + FORCE_RUN 会触发防重拦截定时任务 → 详见 `docs/PITFALLS.md#28`
+29. Gmail OAuth 重授权：ShadowRocket 拦截 localhost 回调 → 详见 `docs/PITFALLS.md#29`
+30. Gmail send 在 token 失效时仍可能实际发出邮件 → 详见 `docs/PITFALLS.md#30`
+31. google-auth SCOPES 陷阱补充 → 详见 `docs/PITFALLS.md#31`
+32. TG bot 代码改动后需重启才生效 → 详见 `docs/PITFALLS.md#32`
+33. KG 三元组泄漏给用户（已下线子系统 KG，历史参考）→ 详见 `docs/PITFALLS.md#33`
+34. Sonar 无法获取盘前即时价格 → 详见 `docs/PITFALLS.md#34`
+35. Finnhub webhook secret ≠ REST API key → 详见 `docs/PITFALLS.md#35`
+36. Finnhub 免费 tier 不含盘前/盘后数据 → 详见 `docs/PITFALLS.md#36`
+37. DeepSeek V4 Flash 默认开 thinking 模式 → 详见 `docs/PITFALLS.md#37`
+38. KG 三元组谓词碎片化（已下线子系统 KG，历史参考）→ 详见 `docs/PITFALLS.md#38`
+39. Haiku via Bedrock/OR 成本严重低估（已下线子系统 KG，历史参考）→ 详见 `docs/PITFALLS.md#39`
+40. 月度文件重复节和乱序 → 详见 `docs/PITFALLS.md#40`
+41. DeepSeek API 早间 SSL 全程不可达 → 详见 `docs/PITFALLS.md#41`
+42. OR flex fallback max_tokens 必须足够大 → 详见 `docs/PITFALLS.md#42`
+43. OR 波浪号前缀 `~model` = always-latest alias → 详见 `docs/PITFALLS.md#43`
+44. Azure provider 已放弃 Sonnet 路由 → 详见 `docs/PITFALLS.md#44`
+45. Exa `/search` 与 `/chat/completions` 分属不同计费桶 → 详见 `docs/PITFALLS.md#45`
+46. Exa 追问 Step 3 不加 RSS 增强 → 详见 `docs/PITFALLS.md#46`
+47. 数据质量 > LLM 档次 → 详见 `docs/PITFALLS.md#47`
+48. Parallel.ai SDK 版本差异 → 详见 `docs/PITFALLS.md#48`
+49. 格式硬约束压制 LLM 分析深度 → 详见 `docs/PITFALLS.md#49`
+50. Step 4 不应使用 `_deepseek_post()` 的 OR flex fallback → 详见 `docs/PITFALLS.md#50`
+51. `_get_portfolio_snapshot()` 提取 `现价` 而非 `均价` → 详见 `docs/PITFALLS.md#51`
+52. DeepSeek 直连暴露个人金融数据 → 详见 `docs/PITFALLS.md#52`
+53. `_preprocess_question` 漏传 `search_queries` 字段 → 详见 `docs/PITFALLS.md#53`
+54. `kg_extractor_finance.py` 中 `_HOME` 未定义（已下线子系统 KG，历史参考）→ 详见 `docs/PITFALLS.md#54`
+55. `_unified_preprocess` max_tokens 截断 → 详见 `docs/PITFALLS.md#55`
+56. LLM 把 `---KG---` 解读为 markdown 水平线（已下线子系统 KG，历史参考）→ 详见 `docs/PITFALLS.md#56`
+57. yfinance 盘后价格字段 → 详见 `docs/PITFALLS.md#57`
+58. Polygon.io 免费 tier 无实时数据 → 详见 `docs/PITFALLS.md#58`
+59. 周末/隔夜 OTC 价格不可达（yfinance/Polygon 免费 tier） → 详见 `docs/PITFALLS.md#59`
+60. IBKR gateway `--conf` 只接受 classpath 资源名 → 详见 `docs/PITFALLS.md#60`
+61. macOS port 5000 被 AirPlay Receiver 占用 → 详见 `docs/PITFALLS.md#61`
+62. IBKR gateway Java 版本用 11，不用 21 → 详见 `docs/PITFALLS.md#62`
+63. IBKR gateway conf 文件必须 JSON，不能 YAML → 详见 `docs/PITFALLS.md#63`
+65. macOS launchd `StartCalendarInterval` 数组只注册第一个时间 → 详见 `docs/PITFALLS.md#65`
+64. IBKR 强制单一 brokerage session，iOS App 登录踢掉 gateway → 详见 `docs/PITFALLS.md#64`
+66. KG object 死端节点：长度合规但不可检索（已下线子系统 KG，历史参考）→ 详见 `docs/PITFALLS.md#66`
+67. `_mempalace_context` 只查 finance room，漏掉日报历史 → 详见 `docs/PITFALLS.md#67`
+68. `_filter_framework_triples` fallback 集合漏 driven_by/correl...（已下线子系统 KG，历史参考）→ 详见 `docs/PITFALLS.md#68`
+69. `resp.json()` 与 `json.loads(content)` 混用同一 handler 导致 Unb... → 详见 `docs/PITFALLS.md#69`
+70. `json.loads(json_str)` 失败直接 `return {}`，未走重试/fallback，导致 ... → 详见 `docs/PITFALLS.md#70`
+71. yfinance 早间瞬时故障导致 ticker 静默丢失 → LLM 幻觉价格 → 详见 `docs/PITFALLS.md#71`
+72. 三个 launchd plist 并存导致 AM/PM 报告各发两次 → 详见 `docs/PITFALLS.md#72`
+73. Tavily extract 对视频聚合页返回无时间戳 caption 堆叠 → LLM 误判为当前时效新闻 → 详见 `docs/PITFALLS.md#73`
+74. getUpdates 长轮询超时配置错位（客户端10s<服务端30s），引发超时刷屏+409冲突 → 详见 `docs/PITFALLS.md#74`
+75. Telegram/Finnhub/Guardian 凭据经 httpx INFO 日志明文写入世界可读 /tmp 文件（安全）→ 详见 `docs/PITFALLS.md#75`
+76. Shadowrocket TUN 隧道对新建TLS连接~25-30%瞬时失败率，#74修复后噪音归零被误判为回归 → 详见 `docs/PITFALLS.md#76`
+77. sendMessage 与 getUpdates 分属两套独立实现，重试补丁只覆盖了轮询未覆盖发送 → 详见 `docs/PITFALLS.md#77`
+78. Sonar 宏观快照过时/幻觉信息（曾报WTI>$100，实际$68.58），未限定检索时间窗+未锚定实时价格 → 详见 `docs/PITFALLS.md#78`
+79. getUpdates 同步重试是多余复杂度，轮询循环本身节奏已是现成的重试机制 → 详见 `docs/PITFALLS.md#79`
+80. `call_llm()` 把 429 限流当不可重试的 4xx，Pass 1 直接放弃生成空报告 → 详见 `docs/PITFALLS.md#80`
+81. 跨源印证指纹复用"打分用宽松关键词表"导致假阳性（同ticker/同拆分词但不同事件误判为已印证）→ 详见 `docs/PITFALLS.md#81`
+82. `parse_llm_json()` 可能返回非dict（外层对象损坏但内部数组能独立解析），消费方未判空导致静默丢弃/daemon崩溃 → 详见 `docs/PITFALLS.md#82`
+83. 回复别人未submit的PENDING GitHub review会422（同账号只能有一个pending review）→ 详见 `docs/PITFALLS.md#83`
+84. 消毒函数"先str()再判断类型"，导致None/bool绕过自己刚建的白名单（str(None).upper()=="NONE"合法匹配ticker正则）→ 详见 `docs/PITFALLS.md#84`
+85. `obsidian_read_note`大文件降级为文本转储时是JSON转义字符串（\n/\"未还原），直接当原文用于search_replace会静默不匹配 → 详见 `docs/PITFALLS.md#85`
+86. 手动跑`run_finance.py`被Bash工具默认2分钟超时杀掉，残留stale lock文件但fcntl.flock跟进程走不阻塞下次运行 → 详见 `docs/PITFALLS.md#86`
+87. `telegram_utils.py::call_telegram()`重试只捕获`httpx.ConnectError`，SSL握手超时是并列兄弟类`httpx.ConnectTimeout`，零重试直接放弃 → 详见 `docs/PITFALLS.md#87`
+88. Bash工具同步命令超时"exit 143"不代表网络请求被取消——本地进程死了，OpenRouter服务端仍会处理并计费，造成未察觉的真实调用 → 详见 `docs/PITFALLS.md#88`
+89. `call_llm()`新增免JSON文本路径时沿用了`content or reasoning_content or reasoning`取值顺序，`finish_reason=length`+空content时会把部分思维链错误当正文返回 → 详见 `docs/PITFALLS.md#89`
+90. `fetch_52week_stats` bulk 1y 瞬时失败无重试 + yfinance ERROR 触发 healthcheck 误报 → 详见 `docs/PITFALLS.md#90`
+91. KeepAlive 长轮询每轮裸 `httpx.post` 泄漏数百 MB（不是忘关 Client；macOS libmalloc 不还页）→ 详见 `docs/PITFALLS.md#91`
+92. 主路径 `yf.download` 8d/2d 假 delisted ERROR 刷屏（#63 只盖了 52 周）；重试不可整表覆盖、不可把坍缩单列认成别的 ticker → 详见 `docs/PITFALLS.md#92`
+93. 7 天围栏若打在 pooled `score_and_filter` 上会把 issue #33 rotation 的 30 天窗砍成 7 天；年龄必须用 `now_et` 不能用墙钟 → 详见 `docs/PITFALLS.md#93`
+94. 「必须解释的 ticker」若在围栏、keyword bonus、Extract query 各拼一次，新增一类 ticker 会漏改 → 详见 `docs/PITFALLS.md#94`
+95. `call_llm()` 免 JSON 路径只拒绝空正文、接受 length 截断的非空正文；推理提档（xhigh）而 `max_tokens` 不跟着加，残缺报告被当成功发出；`max_tokens` 翻倍时 HTTP 超时也要放宽 → 详见 `docs/PITFALLS.md#95`
+96. 新来源只用回放验收，而回放会跳过该来源：Yahoo 按个股 RSS 上线后一条没取到（404/429），也没人发现 → 详见 `docs/PITFALLS.md#96`
+
+---
+
+---
+
 本文件是 `CLAUDE.md` 踩坑记录索引的详情存储。CLAUDE.md 只保留一行摘要，
 完整的现象/根因/修复叙述在这里，按子系统分类，编号与 CLAUDE.md 索引一一对应。
 
