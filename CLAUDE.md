@@ -51,6 +51,34 @@ owner 已要求把原规划 PR3 并入 #89。主流程在价格与多日涨跌�
 
 ---
 
+## 当前系统状态（2026-09-25，issue #111 / PR #112，已合并 `a92ff0d`）
+
+安静日也深挖（`intel_deepen.py`），分三层，额度不够时从后往前砍：
+1. 异动股：最多 5 只，每只 2 条直链；没有直链才搜索。
+2. 宏观：命中条数最多的前 3 个话题，每个话题 3 条直链；排除 `news.google.com`、`ft.com`/`wsj.com`/`barrons.com`。正文写入 `macro_digest.fulltext`。
+3. 安静个股：最多 5 只。入选信号依次为：接近多日阈值（3 日 ≥8%，或 5 日 ≥9%，为覆盖 PLTR，owner 确认）；有新 8-K；新闻量异常（未报道条数 ≥8，且不低于同档最近 10 份快照中位数的 2 倍）。每只 3 条未报道过的直链。
+
+额度与 Extract：
+- 定时 AM 上限 13cr，定时 PM 用当天剩余的全部额度，不为补跑预留。每次运行最多 5 次搜索。
+- Extract 每批 ≤20 个 URL（Tavily 单次上限），超过就分批。
+- 手动运行（`FINANCE_FORCE_RUN`/`FINANCE_FORCE_DATE`，含 TG 强制运行）不看当天日账：AM 13、PM 12。用量记在 `finance_tavily_manual_budget.json`，不占定时额度。`sas_review.py --ticker` 手动模式同样单独记账，每次 1cr。按月计的 SerpApi/Adanos/Apify/Brave 不变。
+
+Pass 2 渲染：抓过正文的安静标的按异动规格（25 条加摘要）；其他持仓每只 12 个标题，附 ≤120 字摘要；宏观标题附正文。
+
+Yahoo 按个股来源改用 `yfinance.Ticker(t).get_news(count=20)`，覆盖字段仍叫 `yahoo_rss`。原来的 `feeds.finance.yahoo.com` RSS 自 #105 上线起在本机返回 404/429，一条都没取到过；当时只用回放验收，而回放会跳过 Yahoo，所以没发现（PITFALLS #96）。
+
+实现由 Codex 完成，经 owner 审批。免费回放 21/24（owner 接受；AAOI 在 main 上同样失败）。没有改 `telegram_commands.py`，无需重启 bot。
+
+首次运行 09-25 PM 实测：
+- Tavily 用 6/25cr：1 次搜索，Extract 分 20+5 两批，成功 20 篇。
+- 20 篇正文里约三分之一有实际内容。其余是 Yahoo 导航栏、边栏/页脚、Foreign Policy 付费墙、搜索返回的旧文。原因是 Extract 查询词是通用的 `financial company event evidence`，正文只取前两个 chunk、截到 1200 字。
+- Pass 2 prompt 24.8k token（此前 9.7k–15.7k），报告约 1650 字（此前 1250–1430 字）。
+
+后续见 issue #113：
+- R1 待 owner 决定：要不要增加每只标的的链接数，把额度用满。写 handoff 前必须先问 owner。
+- R2–R5 已确定：跨运行 URL 去重；新闻量异常基线的最少快照数；manual 记账文件加进 gitignore；几处小修。
+- Extract 质量相关的候选改动已作为 comment 追加到 #113，待 owner 确认。
+
 ## 当前系统状态（2026-09-24，issue #105，已合并 `5b8efc8`）
 
 Pass 0 增加两路免费来源。SEC 8-K：每只个股按该标的窗口查提交的 8-K，`source=SEC 8-K`，`publisher_domain=sec.gov`，`url_kind=sec_filing`，标题含 Item 编号和 accession，渲染成「公司公告（8-K Item x.xx）」；不进 Extract。CIK 来自 SEC `company_tickers.json`，缓存在 gitignore 的 `cik_cache.json`。联系人身份用 `sec_edgar_utils.sec_user_agent()`（读 `FINANCE_FROM_ADDRESS`，未设置时沿用 SAS 客户端已有的回退）。请求间隔 0.12 秒。找不到 CIK 或请求失败只记该标的覆盖错误。Yahoo 按个股 RSS：`url_kind=direct`，域名取文章真实主机，与现有标题去重并保留多个 `publisher_domains`；回放跳过，覆盖里写 `yahoo_rss: skipped in replay`。日志行 `Pass 0 sec_8k` / `Pass 0 yahoo_rss`。免费回放 22/24，两处未命中与合并前相同（09-14 PM AMKR、09-21 AM INTC）。未跑付费报告。未改 `telegram_commands.py`，无需重启机器人。blacktomb42 批准后 squash 为 `5b8efc8`（PR #108）。
@@ -533,9 +561,9 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
 ```
 0.  FINANCE_FORCE_DATE / FINANCE_FORCE_SLOT / FINANCE_FORCE_RUN 覆盖，NYSE 交易日与月度报告同档防重检查
 1.  读取 watchlist、预算和价格；AM 使用盘前价，PM 使用今日收盘和盘后价，并计算单日及 3/5 交易日涨跌
-2.  免费 Pass 0：intel_pass0.build_intel_snapshot(archive=False) 按标的收集 Finnhub、Google News、RSS、Guardian、SEC 8-K、Yahoo 按个股 RSS；多日异动扩大各来源发表窗口；回放跳过 Yahoo（与 RSS 相同）并按提交日期重建 8-K；收集整体失败时保留价格与窗口，生成带错误记录的应急情报快照
+2.  免费 Pass 0：intel_pass0.build_intel_snapshot(archive=False) 按标的收集 Finnhub、Google News、RSS、Guardian、SEC 8-K、Yahoo 按个股新闻（issue #111 起改用 yfinance `get_news`）；多日异动扩大各来源发表窗口；回放跳过 Yahoo（与 RSS 相同）并按提交日期重建 8-K；收集整体失败时保留价格与窗口，生成带错误记录的应急情报快照
 3.  无标的异动、标的新闻或命中地缘话题则退出；否则读取 KB，收集 Sonar 宏观、社交舆情和 FRED 流动性背景
-4.  代码 Pass 1：intel_deepen.py 按触发的绝对涨跌选最多 5 个标的，优先每标的 2 个不同落地域名的直接文章/Finnhub 302 链接；无链接才按同一发表窗口搜索（`max_results=3`，前 2 条进首轮 Extract，第 3 条留作补齐）。首轮后按涨跌强弱把 Extract URL 补到下一个 5 的倍数（最多 10）：先补同标的下一条不同域名直链，再补搜索第 3 条；补齐 URL 排末尾，预算不足先截（PR #96）。最多 3 次 basic 搜索 + 1 次 Extract（≤10 URL，2cr），单次运行合计 ≤5cr，SerpApi 可作回退
+4.  代码 Pass 1（issue #111 起：在下述异动股规则之外，宏观取 3 个话题各 3 条直链，另选最多 5 只安静个股各 3 条直链；定时 AM 13cr / PM 用当天剩余全部 / 手动运行单独限额；最多 5 次搜索；Extract 每批 ≤20 个 URL。以下为异动股原规则）：intel_deepen.py 按触发的绝对涨跌选最多 5 个标的，优先每标的 2 个不同落地域名的直接文章/Finnhub 302 链接；无链接才按同一发表窗口搜索（`max_results=3`，前 2 条进首轮 Extract，第 3 条留作补齐）。首轮后按涨跌强弱把 Extract URL 补到下一个 5 的倍数（最多 10）：先补同标的下一条不同域名直链，再补搜索第 3 条；补齐 URL 排末尾，预算不足先截（PR #96）。最多 3 次 basic 搜索 + 1 次 Extract（≤10 URL，2cr），单次运行合计 ≤5cr，SerpApi 可作回退
 5.  将深挖正文、来源覆盖、此前已报道标记写回情报快照并存档；按异动/安静持仓/地缘话题的数量上限渲染 Pass 2 输入，加入最近 5 个既往交易日报告与发生变化的背景信号
 6.  Pass 2 直接按情报快照归因，输出 Markdown；空响应走同请求重试，`finish_reason=length` 降一档 effort 一次后再 fallback，仍失败则改用代码渲染的情报快照摘要并发 TG 告警。SAS 候选提取仍为独立 JSON 调用，PM 校准仍运行
 7.  写入月度 Obsidian 报告、情报快照上下文和 MemPalace；发送邮件、Telegram 报告及独立运行状态消息
@@ -586,8 +614,9 @@ OBSIDIAN_PATH="~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview
 ## Tavily 预算
 
 - 上限：25 credits/日，`finance_tavily_budget.json` 按 ET 日期自动重置（从 10→15→20→25 逐步调整）
-- Search：basic=1cr，advanced=2cr（已弃用，全部改 basic）；Extract：**5 URLs = 1 credit**（`math.ceil(n/5)`），单次最多 10 URLs = 2cr
-- 主报告：每次运行最多 3 次 basic 搜索（只对没有直链的异动标的，`max_results=3`）+ 一次 Extract（≤10 个 URL，2cr，按 `ceil(n/5)` 补齐到同一 credit 档），合计 ≤5cr。日上限 25。Extract 前按剩余额度截断 URL 列表，补齐的 URL 最先被截掉
+- Search：basic=1cr，advanced=2cr（已弃用，全部改 basic）；Extract：**5 URLs = 1 credit**（`math.ceil(n/5)`），单次最多 20 URLs（Tavily 上限），超过就分批
+- 主报告（issue #111 起）：定时 AM 上限 13cr，定时 PM 用当天剩余的全部额度，不为补跑预留。每次运行最多 5 次 basic 搜索（先给异动股，再给安静个股）。Extract 分层（异动 > 宏观 > 安静个股），额度不够时从最后一层截；补齐到 5 的倍数的 URL 最先被截
+- 手动运行（`FINANCE_FORCE_RUN`/`FINANCE_FORCE_DATE`/TG 强制运行）：AM 13、PM 12，不看当天日账，单独记账于 `finance_tavily_manual_budget.json`；`sas_review.py --ticker` 手动模式每次 1cr，同样单独记账
 - TG 追问不消耗 Tavily（Sonar 内建搜索）
 - Tavily 断连自动 fallback SerpApi（250次/月）；两者均耗尽则跳过搜索继续生成基础报告
 
@@ -794,6 +823,7 @@ _Tavily: N/10_
 93. 7 天围栏若打在 pooled `score_and_filter` 上会把 issue #33 rotation 的 30 天窗砍成 7 天；年龄必须用 `now_et` 不能用墙钟 → 详见 `docs/PITFALLS.md#93`
 94. 「必须解释的 ticker」若在围栏、keyword bonus、Extract query 各拼一次，新增一类 ticker 会漏改 → 详见 `docs/PITFALLS.md#94`
 95. `call_llm()` 免 JSON 路径只拒绝空正文、接受 length 截断的非空正文；推理提档（xhigh）而 `max_tokens` 不跟着加，残缺报告被当成功发出；`max_tokens` 翻倍时 HTTP 超时也要放宽 → 详见 `docs/PITFALLS.md#95`
+96. 新来源只用回放验收，而回放会跳过该来源：Yahoo 按个股 RSS 上线后一条没取到（404/429），也没人发现 → 详见 `docs/PITFALLS.md#96`
 
 ---
 
@@ -823,7 +853,9 @@ _Tavily: N/10_
 22. **SAS 候选命中频率**（#89 之后）：`SAS候选证据日志.md` 的新增频率；#89 后 SAS 抽取输入只剩情报快照（不含 Sonar），据此决定是否把 Sonar 加回 SAS 输入
 23. **issue #99 合并后由验证方看**（实现方不跑报告）：连续 3 个交易日防御性否定句比例是否低于 10%；没有事件的标的是否还单独成段；快照 `pass2` 里的 token 与 `finish_reason`；QQQM 是否还出现在仓位段
 24. **issue #101**（已于 06:21 ET 重启 bot）：下次用 TG 加删个股、关键词、收件人后，确认下一节标题仍在，收件人按行分开。
-25. **issue #105**（PR #108，`5b8efc8`）：下次 AM/PM 看日志 `Pass 0 sec_8k` / `Pass 0 yahoo_rss` 的耗时；8-K 是否出现在报告里并带 Item 编号；Yahoo 失败是否只留在覆盖错误里。回放召回已是 22/24。供给事件日历和 8-K 附件正文仍未做。
+25. **issue #105**（PR #108，`5b8efc8`）：下次 AM/PM 看日志 `Pass 0 sec_8k` / `Pass 0 yahoo_rss` 的耗时；8-K 是否出现在报告里并带 Item 编号；Yahoo 失败是否只留在覆盖错误里。回放召回已是 22/24。供给事件日历和 8-K 附件正文仍未做。（Yahoo 已在 #111 改用 yfinance；回放基线降为 21/24）
+26. **issue #111 观察**（PR #112，`a92ff0d`，2026-09-25 起）：`grep -E "run cap|Tavily used today|manual run" /tmp/daily_intelligence.log` 看每次上限与日用量（09-25 PM 用 6/25）；快照 `quiet_selected`、`macro_url_count`、`extract_success_count`；各股 `yahoo_rss` 条数与错误，连续 3 个交易日超过一半失败就下线；Pass 2 `prompt_tokens`（09-25 PM 24.8k）。
+27. **issue #113**：R1 待 owner 观察几天后决定，写 handoff 或实现前必须先问 owner 要结论；R2–R5 可直接做。Extract 正文质量（通用查询词、1200 字截断、Yahoo 导航栏、付费墙域名、安静个股搜索词与日期）是更主要的瓶颈，候选项已追加到 #113 comment，待 owner 确认。
 
 ---
 

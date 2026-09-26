@@ -434,6 +434,15 @@ httpx 0.28 顶层 `httpx.post()` 内部已是 `with Client(...)`，**不是忘�
 
 ---
 
+### 96. 新来源只用回放验收，而回放会跳过这个来源：Yahoo 按个股 RSS 从上线起就没取到任何数据（issue #105 → #111）
+（2026-09-25 发现）#105/PR #108 接入 `feeds.finance.yahoo.com/rss/2.0/headline`，验收用的是免费回放 22/24 和单元测试（mock）。回放会跳过 Yahoo（`yahoo_rss: skipped in replay`），所以这一路从没在真实网络下验证过。结果 09-24 AM、09-24 PM、09-25 AM 三份快照里，所有标的都是 `yahoo_rss: HTTPStatusError`，0 条数据；运行状态消息里一直有这条错误，但没人追查。本机直接请求：不带 UA 返回 404，带浏览器 UA 返回 429，隔 40 秒再试仍是 429。`finance.yahoo.com/rss/quote/{T}` 虽然返回 200，但内容不区分个股（通用列表）。
+
+**修复**：#111 改用 `yfinance.Ticker(t).get_news()`，用真实请求验证过 INTC/NVDA/AMKR。
+
+**教训**：回放、mock 或任何「跳过该来源」的验收路径，都不能证明新来源可用。接入新数据源时，至少要在宿主机上用真实请求跑一次，并把条数写进 PR。合并后的第一次生产运行，要看运行状态消息里的「来源错误」行，不能只看报告有没有发出去。
+
+---
+
 ## 十、凭据与日志卫生
 
 ### 75. Telegram bot token / Finnhub / Guardian API key 以明文形式写入世界可读的 /tmp 日志文件

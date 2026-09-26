@@ -2,7 +2,17 @@
 
 > 面向独立实现者的完整设计参考。本文档描述一套个人财经情报系统的设计思路、体系结构和实现细节，适合在自有 Claude Code 环境中按需裁剪复用。
 >
-> **最后更新**：2026-09-24（issue #105 / PR #108 `5b8efc8`：Pass 0 增加 SEC 8-K 与 Yahoo 按个股 RSS。8-K 写入 Item 编号和 accession，`url_kind=sec_filing`，不进 Extract；Yahoo `url_kind=direct`。CIK 缓存在 gitignore 的 `cik_cache.json`。回放跳过 Yahoo。此前同日 issue #99 与 #101：TG 编辑 watchlist 不再吃掉下一节标题，收件人一行一条，写回改为原子替换。issue #99：15% 跨越只比较个股且必须已有上一次权重，52 周新高/低同样要求上次已有该标的；Pass 2 不否定材料里没人提出的推论，持仓段只写有新事件、异动或已排期供给事件的标的；`finish_reason=length` 时 reasoning.effort 降一档一次，再截断则 fallback；情报快照写入 `pass2`。此前同日：同步 2026-09-23/24 云端 session 合并的 PR #94–#97：Pass 2 截断正文判为失败 + `max_tokens` 32000 + HTTP 超时 640s（#94）；社交舆情只查非 ETF 个股（#95）；Extract 补齐到同一 credit 档、搜索 `max_results=3`、直链解析日志（#96）；Pass 2 供给事件例外（#97）。同时把第二节流程图、§5.1/§5.1b/§5.2/§5.4、第八节选型表、第十节目录结构改写为 issue #87 PR #89（已合并）之后的情报快照架构；#89 之前的 Search+Extract 三层设计降为 §5.1c 历史记录。另回补仓库版独有的 2026-08-04（#59/PR #61）变更记录，更正 Parallel SDK 版本，标注 §8.3 追问成本表过时。仓库 `docs/design.md` 同日按本版整体同步。详见文末变更记录）
+> **最后更新**：2026-09-25（issue #111 / PR #112 `a92ff0d`）：
+> - 安静日也深挖，宏观也抓正文；
+> - Tavily 用满每日 25cr：定时 AM 13，定时 PM 用当天剩余全部；
+> - 手动运行单独限额（AM 13 / PM 12 / SAS 1）并单独记账；
+> - Extract 每批 ≤20 URL，超过就分批；
+> - Pass 2 材料上限调高；
+> - Yahoo 改用 yfinance `get_news`。
+>
+> 详见 §5.1b 开头。
+>
+> 此前：2026-09-24（issue #105 / PR #108 `5b8efc8`：Pass 0 增加 SEC 8-K 与 Yahoo 按个股 RSS。8-K 写入 Item 编号和 accession，`url_kind=sec_filing`，不进 Extract；Yahoo `url_kind=direct`。CIK 缓存在 gitignore 的 `cik_cache.json`。回放跳过 Yahoo。此前同日 issue #99 与 #101：TG 编辑 watchlist 不再吃掉下一节标题，收件人一行一条，写回改为原子替换。issue #99：15% 跨越只比较个股且必须已有上一次权重，52 周新高/低同样要求上次已有该标的；Pass 2 不否定材料里没人提出的推论，持仓段只写有新事件、异动或已排期供给事件的标的；`finish_reason=length` 时 reasoning.effort 降一档一次，再截断则 fallback；情报快照写入 `pass2`。此前同日：同步 2026-09-23/24 云端 session 合并的 PR #94–#97：Pass 2 截断正文判为失败 + `max_tokens` 32000 + HTTP 超时 640s（#94）；社交舆情只查非 ETF 个股（#95）；Extract 补齐到同一 credit 档、搜索 `max_results=3`、直链解析日志（#96）；Pass 2 供给事件例外（#97）。同时把第二节流程图、§5.1/§5.1b/§5.2/§5.4、第八节选型表、第十节目录结构改写为 issue #87 PR #89（已合并）之后的情报快照架构；#89 之前的 Search+Extract 三层设计降为 §5.1c 历史记录。另回补仓库版独有的 2026-08-04（#59/PR #61）变更记录，更正 Parallel SDK 版本，标注 §8.3 追问成本表过时。仓库 `docs/design.md` 同日按本版整体同步。详见文末变更记录）
 
 > **本文件与 Obsidian 权威版本的关系**：作者本人的实时权威版本维护在私有 Obsidian vault（`Hermes/Daily Intelligence/Daily_Intel设计文档.md`），Session 初始化规则要求每次开发都先读那份。本仓库这份是手动同步的快照，供不使用 Obsidian 的其他实现者参考——内容一致，但更新可能滞后于 Obsidian 版本一次提交的时间差。
 
@@ -46,7 +56,7 @@ fetch_prices —— 价格 + 当日异动 + 3/5 日累计涨跌（issue #80 阈�
       │
       ▼
 Pass 0（intel_pass0.build_intel_snapshot，免费，零 LLM / 零 Tavily）
-      按标的收集 Finnhub company-news、公司名 Google News RSS、7 RSS + Guardian、SEC 8-K、Yahoo 按个股 RSS
+      按标的收集 Finnhub company-news、公司名 Google News RSS、7 RSS + Guardian、SEC 8-K、Yahoo 按个股新闻（yfinance）
       → 别名边界匹配、标的内去重、seen_before 标记；收集整体失败则生成带错误覆盖的应急快照
       │
       ▼
@@ -282,7 +292,27 @@ system prompt 注入 portfolio 快照实现个人化。~$0.005/次，fail-open�
 
 **FRED 流动性水位快照（step 6e，AM+PM，issue #26，2026-07-02）**：`fetch_liquidity_snapshot()` 拉取银行准备金（`WRESBAL`）、SOFR（`SOFR`）、ON RRP 授予利率（`RRPONTSYAWARD`，注意不是 `RRPONTSYD`——后者是隔多逆回购**交易量**不是利率，实测数值差异巨大才发现搭错）、TGA余额（`WTREGEN`），按 `Hermes/Daily Intelligence/市场见顶预警指标.md` 的阈值分类【正常/观察/警戒】，整体取最高档。最初折进 `social_sentiment_section` 注入槽；PR #89 起改为独立的 `liquidity_section`，且只在档位与上次成功报告情报快照的 `context_state` 不同时才注入 Pass 2（`pass2_context.changed_background()`）。SRF用量 FRED 无对应序列，不自动化，留作文档里的人工检查项。选型理由：FRED 是比 Sonar 搜索更可靠的精确数据源（呼应 issue #24 的教训——LLM 搜索对精确数值不可靠，能用结构化权威数据源就不该靠 LLM 猜）。当前 Pass 2 prompt 规定：注入了 FRED 档位变化时允许写仓位小节，但只陈述本次背景变化，不把它当成单独的交易指令（旧版“第⑥条分析要求”随 PR #89 的新 prompt 替换）。
 
-### 5.1b 情报快照与代码深挖（issue #87：PR #88/#89 已合并；PR #96 补齐）
+### 5.1b 情报快照与代码深挖（issue #87：PR #88/#89 已合并；PR #96 补齐；issue #111：PR #112 扩展）
+
+**issue #111（PR #112，`a92ff0d`，2026-09-25）之后的现行规则**。本节后文中与此冲突的旧描述，以这里为准：
+
+- **三层深挖**：
+  1. 异动股：沿用下文规则。
+  2. 宏观：按命中条数取前 3 个话题，每个话题 3 条不同域名、未报道过（非 `seen_before`）的直链；排除 `news.google.com` 和 `ft.com`/`wsj.com`/`barrons.com`。正文写入 `macro_digest.fulltext`。
+  3. 安静个股：最多 5 只（`quiet_candidates()`）。信号按顺序：接近多日阈值（`NEAR_D3=8%`/`NEAR_D5=9%`）> 新 8-K > 新闻量异常（未报道条数 ≥8，且 ≥ 同档最近 10 份快照中位数 ×2）；同一档里持有的在前。每只 3 条未报道过的直链；没有直链、且还有搜索名额时才搜索。
+  URL 按层顺序排列，额度不够时从最后一层截掉。
+- **额度**（`run_finance.run_credit_cap()`）：
+  - 定时 AM `min(13, 当日剩余)`；定时 PM 为当日剩余的全部额度；每次运行最多 5 次搜索。
+  - 手动运行（`FINANCE_FORCE_RUN`/`FINANCE_FORCE_DATE`）固定 AM 13 / PM 12，不读定时日账，用量记在 `finance_tavily_manual_budget.json`（`budget_trackers.save_run_budget()`）。
+  - `sas_review.py --ticker` 手动模式每次 1cr，同样单独记账。
+- **Extract**：每批 ≤20 URL（Tavily 官方单次上限），每批调用前检查剩余额度。快照新增 `quiet_selected`、`quiet_url_count`、`macro_url_count`、`run_credit_cap`、`run_credit_used`、`manual_run`。
+- **Pass 2 渲染**：有正文的安静标的按异动标的规格渲染；其他持仓每只 12 个标题，附 ≤120 字摘要，未报道过的排在前面；宏观标题下附正文。
+- **Yahoo**：改用 `yfinance.Ticker(t).get_news(count=20)`，取 canonical URL 和 provider，要求标题或摘要命中别名，调用时包在 `_quiet_yfinance_logs()` 里。原 RSS 端点从上线起在本机就返回 404/429。
+- **首次运行（09-25 PM）**：
+  - 用 6/25cr，Extract 成功 20 篇，其中约三分之一有实质内容。其余是 Yahoo 导航栏、边栏/页脚、付费墙和旧文。主因是 Extract 用的是通用 query，且正文只取 2 个 chunk、截到 1200 字。
+  - Pass 2 prompt 24.8k token，报告约 1650 字。
+  - 后续改动见 issue #113。
+
 
 **Pass 0 收集（`intel_pass0.py` / `intel_collect.py`，免费、零 LLM、零 Tavily）**：对 watchlist 个股（排除 QQQM/VOO/EWJ/SGOL）按标的收集 Finnhub company-news（AM 36h、PM 24h，多日阈值标的扩到涨跌起点）、公司名 Google News RSS（每次 HTTP 尝试含重试至少间隔 1s，与 Finnhub 使用独立线程池；链接只作线索，不解码原文）、现有 7 个 RSS 源、Guardian、SEC 8-K 和 Yahoo 按个股 RSS（issue #105 / PR #108）。8-K 用 SEC `company_tickers.json` 把 ticker 解成 10 位 CIK（缓存在 gitignore 的 `cik_cache.json`；找不到或请求失败只记该标的覆盖错误），条目 `source=SEC 8-K`、`url_kind=sec_filing`，标题含 Item 编号和 accession，渲染为「公司公告（8-K Item x.xx）」，不进 Extract。联系人身份走 `sec_edgar_utils.sec_user_agent()`，SEC 请求间隔 0.12 秒。Yahoo RSS 的 `url_kind=direct`，域名取文章真实主机，与已有标题去重后保留多个 `publisher_domains`；回放跳过 Yahoo（覆盖注明 `yahoo_rss: skipped in replay`），8-K 按 `dateb=报告时刻+1 天` 再由窗口过滤。日志 `Pass 0 sec_8k` / `Pass 0 yahoo_rss`。标题按别名边界匹配归入实体（中文别名用 ASCII 边界，拉丁别名用词边界）并做标的内去重。别名写在 watchlist `## 实体别名`（如 `INTC: Intel, 英特尔`），缺失时用 Finnhub profile2 补全并缓存到 gitignore 的 `entity_alias_cache.json`。与上一次运行快照归一化标题相同的条目标 `seen_before`（8-K 同样参加；accession 写在标题里，避免同 Item 的两份公告并成一条）。多日异动时 RSS/Guardian 共享抓取窗口扩到最早标的起点，再按各标的窗口分拣；报告与回放共用 `publication_window.py`。每个实体保存移动、覆盖（各来源原始条数与错误）、条目和 `fulltext`。收集整体异常时生成带错误覆盖记录的应急快照，不阻断报告。
 
@@ -297,7 +327,7 @@ system prompt 注入 portfolio 快照实现个人化。~$0.005/次，fail-open�
 
 **Pass 2 输入渲染（`intel_render.py`）**：异动标的最多 25 条（标题、来源、时间、摘要、此前已报道标记、正文与覆盖）；无异动持仓最多 8 个标题；无异动观察标的一行；地缘话题每话题最多 8 条、总数最多 40 条。
 
-**已知结构性取舍**：#89 收窄了输入（没有开放池，地缘话题只有标题没有全文），加上 Pass 2 要求“无进展就省略”，报告信息量可能偏少。这一点待观察几天正常报告后单独评估，PR #94–#97 均未处理。
+**已知结构性取舍**：#89 收窄了输入（没有开放池，地缘话题只有标题没有全文），加上 Pass 2 要求“无进展就省略”，报告信息量可能偏少。这一点待观察几天正常报告后单独评估，PR #94–#97 均未处理。（2026-09-25 更新：#111 已补上安静日和宏观正文。首次运行材料增加约 60%，报告篇幅只增加约 20%；现在的瓶颈转为正文质量，以及 Pass 2 的写作规则。）
 
 ### 5.1c 历史设计：Search+Extract 三层架构（PR #89 之前的主流程，已移除）
 
