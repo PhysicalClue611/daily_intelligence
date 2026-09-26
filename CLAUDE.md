@@ -39,7 +39,7 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 
 ---
 
-## 当前架构速览（2026-09-25，`99120f9`）
+## 当前架构速览（2026-09-25，`66e1ff4`）
 
 *各次改动的细节见 playbook `status_history.md`；权威描述是 Obsidian 设计文档。*
 
@@ -50,9 +50,9 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
   2. 宏观：3 个话题，每个话题 3 条直链，排除 news.google.com 和付费墙站点。
   3. 安静个股：最多 5 只，按「接近多日阈值 3 日 8% / 5 日 9%」「新 8-K」「新闻量异常」入选，每只 3 条。
 
-  每次运行最多搜索 5 次；Extract 每批 ≤20 URL，按 `ceil(n/5)` 计费。
+  每次运行最多搜索 5 次；新闻量异常至少要有 5 份同档历史快照。最近 6 次已抓正文的 URL（去 fragment、`utm_*`）不再抓。Extract 按标的或话题生成 query，同层小组可合批；每批 ≤20 URL，按 `ceil(n/5)` 计费，每篇最多 3 个 chunk、2000 字。清洗后不足 300 字或样板噪声过高的正文不进入报告。
 - **Tavily 额度**：每日 25cr。定时 AM 最多 13，定时 PM 用当天剩下的全部。手动运行（`FINANCE_FORCE_RUN`/`FINANCE_FORCE_DATE`/TG 强制运行）不看日账，AM 13 / PM 12，用量单独记在 `finance_tavily_manual_budget.json`。`sas_review.py --ticker` 手动运行每次 1cr，也单独记账。SerpApi 只在 Tavily 用不了时兜底。
-- **Pass 2**：`report_pass2` = `openai/gpt-6-luna`，推理 xhigh，`max_tokens` 32000。截断时先降一档推理强度，再换 fallback，最后退回代码摘要并发 TG 告警。另有 SAS 候选抽取（gemma）和 PM 核对 AM 预判（gemma）。
+- **Pass 2**：`report_pass2` = `openai/gpt-6-luna`，推理 xhigh，`max_tokens` 32000。近 3 个交易日至 7 个自然日内、与当日走势相关的已报道事件可完整分析；本次抓到正文的公司级实质事件必须覆盖，除非近五日报告已经写过且无新进展。截断时先降一档推理强度，再换 fallback，最后退回代码摘要并发 TG 告警。另有 SAS 候选抽取（gemma）和 PM 核对 AM 预判（gemma）。
 - **输出**：Obsidian 月度报告、情报快照 `archives/YYYYMM/*-intel-snapshot.json`、Context Log、MemPalace、邮件、TG，以及一条单独的 TG 运行状态消息。
 - **LLM 选型**：集中在 `scripts/llm_config.py`，可用 `llm_config.json` 覆盖（纳入 git），改完无需重启。
 - **TG bot**：`com.daily-intel.finance.telegram`。改了 `telegram_commands.py` 必须 `launchctl kickstart -k gui/$(id -u)/com.daily-intel.finance.telegram`，并用启动时间核实已生效。
@@ -127,7 +127,7 @@ OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paper
 1.  读取 watchlist、预算和价格；AM 使用盘前价，PM 使用今日收盘和盘后价，并计算单日及 3/5 交易日涨跌
 2.  免费 Pass 0：intel_pass0.build_intel_snapshot(archive=False) 按标的收集 Finnhub、Google News、RSS、Guardian、SEC 8-K、Yahoo 按个股新闻（issue #111 起改用 yfinance `get_news`）；多日异动扩大各来源发表窗口；回放跳过 Yahoo（与 RSS 相同）并按提交日期重建 8-K；收集整体失败时保留价格与窗口，生成带错误记录的应急情报快照
 3.  无标的异动、标的新闻或命中地缘话题则退出；否则读取 KB，收集 Sonar 宏观、社交舆情和 FRED 流动性背景
-4.  代码 Pass 1（issue #111 起：在下述异动股规则之外，宏观取 3 个话题各 3 条直链，另选最多 5 只安静个股各 3 条直链；定时 AM 13cr / PM 用当天剩余全部 / 手动运行单独限额；最多 5 次搜索；Extract 每批 ≤20 个 URL。以下为异动股原规则）：intel_deepen.py 按触发的绝对涨跌选最多 5 个标的，优先每标的 2 个不同落地域名的直接文章/Finnhub 302 链接；无链接才按同一发表窗口搜索（`max_results=3`，前 2 条进首轮 Extract，第 3 条留作补齐）。首轮后按涨跌强弱把 Extract URL 补到下一个 5 的倍数（最多 10）：先补同标的下一条不同域名直链，再补搜索第 3 条；补齐 URL 排末尾，预算不足先截（PR #96）。最多 3 次 basic 搜索 + 1 次 Extract（≤10 URL，2cr），单次运行合计 ≤5cr，SerpApi 可作回退
+4.  代码 Pass 1：异动股最多 5 只、宏观最多 3 个话题各 3 条直链、安静个股最多 5 只各 3 条直链；直链优先，无直链才搜索。安静个股新闻量异常需至少 5 份同档历史快照；接近阈值时可选此前已报道的条目，但跨运行已抓正文的 URL 会去重。每次最多 5 次搜索；搜索结果按发表窗口过滤，安静个股使用公司名加 ticker 的新闻查询。Extract 分层、按对象生成 query，同层小组可合批，每批 ≤20 URL、3 个 chunk，清洗与正文质量门槛后回填；定时 AM 13cr、PM 用当天剩余，手动运行单独限额。
 5.  将深挖正文、来源覆盖、此前已报道标记写回情报快照并存档；按异动/安静持仓/地缘话题的数量上限渲染 Pass 2 输入，加入最近 5 个既往交易日报告与发生变化的背景信号
 6.  Pass 2 直接按情报快照归因，输出 Markdown；空响应走同请求重试，`finish_reason=length` 降一档 effort 一次后再 fallback，仍失败则改用代码渲染的情报快照摘要并发 TG 告警。SAS 候选提取仍为独立 JSON 调用，PM 校准仍运行
 7.  写入月度 Obsidian 报告、情报快照上下文和 MemPalace；发送邮件、Telegram 报告及独立运行状态消息
@@ -194,6 +194,6 @@ OBSIDIAN_PATH="~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview
 24. **issue #101**（已于 06:21 ET 重启 bot）：下次用 TG 加删个股、关键词、收件人后，确认下一节标题仍在，收件人按行分开。
 25. **issue #105**（PR #108，`5b8efc8`）：下次 AM/PM 看日志 `Pass 0 sec_8k` / `Pass 0 yahoo_rss` 的耗时；8-K 是否出现在报告里并带 Item 编号；Yahoo 失败是否只留在覆盖错误里。回放召回已是 22/24。供给事件日历和 8-K 附件正文仍未做。（Yahoo 已在 #111 改用 yfinance；回放基线降为 21/24）
 26. **issue #111 观察**（PR #112，`a92ff0d`，2026-09-25 起）：`grep -E "run cap|Tavily used today|manual run" /tmp/daily_intelligence.log` 看每次的额度上限和日用量（09-25 PM 用了 6/25）。快照里看 `quiet_selected`、`macro_url_count`、`extract_success_count`。看各股 `yahoo_rss` 的条数和错误，连续 3 个交易日有过半标的失败就下线这一路。看 Pass 2 的 `prompt_tokens`（09-25 PM 为 24.8k）。
-27. **issue #113（下次一并实现）**：
+27. **issue #113（PR #115，`66e1ff4`，已合并；观察中）**：
     - 原 R1（扩大每只标的的链接数）已拆到 #114，暂缓。**写 #114 的 handoff 或动手实现前，必须先问 owner 要结论。**
-    - R2–R11 已确定，2026-09-25 已交给 Codex 实现：跨运行 URL 去重、新闻量基线的最少份数、manual 记账文件 gitignore、小修；Extract 按标的写 query，3 个 chunk、每条 2000 字；付费墙名单和 Yahoo 导航剔除；安静个股的搜索词改写，并按日期过滤；正文质量门槛；放宽「新东西」，近 3 个交易日至 7 天内正在发酵、推动当日走势的事件可以纳入；已抓到正文的公司级实质事件必须写入报告。
+    - R2–R11 已合并：跨运行 URL 去重、新闻量基线至少 5 份、manual 记账文件 gitignore、状态与宏观正文修复；Extract 按标的或话题写 query，3 个 chunk、每条最多 2000 字；付费墙名单和 Yahoo 导航清洗；安静个股搜索与日期过滤；正文质量门槛；近一周与当日走势相关的旧事件可分析；已抓到正文的公司级实质事件必须写入。测试脚本全过，免费回放 22/24；未跑新的生产报告。观察 `extract_dedup_skipped`、`extract_rejected_count`、Pass 2 token 与 SPCX NASA 合同是否实际写入。
