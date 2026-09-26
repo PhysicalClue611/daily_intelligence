@@ -152,7 +152,7 @@ class SwitchTest(unittest.TestCase):
         intel_snapshot = {"date": "2026-09-21", "slot": "pm", "entities": [entity("INTC", d1=8, items=rows)]}
         with patch("intel_deepen.resolve_article_url", side_effect=lambda url: landing[url]):
             deepen_intel_snapshot(intel_snapshot, search=lambda *_: self.fail("searched despite direct leads"),
-                          extract=lambda urls, _: extracted.extend(urls) or [], remaining=lambda: 25)
+                          extract=lambda urls, _, chunks: extracted.extend(urls) or [], remaining=lambda: 25)
         self.assertEqual(extracted, ["https://a.example/one", "https://b.example/two"])
 
     def test_paid_request_retries_transient_failure_before_accounting(self):
@@ -183,9 +183,9 @@ class SwitchTest(unittest.TestCase):
         def search(query, start, end):
             searched.append((query, start, end))
             return [{"title": query, "url": f"https://search{len(searched)}.example/a", "content": "lead"}]
-        def extract(urls, query):
+        def extract(urls, query, chunks):
             extracted.extend(urls)
-            return [{"url": url, "chunks": [{"content": "Full article about company."}]} for url in urls]
+            return [{"url": url, "chunks": [{"content": "Full article about company. " * 20}]} for url in urls]
         result = deepen_intel_snapshot(intel_snapshot, search=search, extract=extract, remaining=lambda: 25)
         self.assertLessEqual(len(searched), 5)
         self.assertLessEqual(len(extracted), 10)
@@ -209,7 +209,7 @@ class SwitchTest(unittest.TestCase):
         extracted = []
         def search(query, start, end):
             return [{"title": query, "url": f"https://s{i}.example/x", "content": "lead"} for i in range(3)]
-        def extract(urls, query):
+        def extract(urls, query, chunks):
             extracted.extend(urls)
             return [{"url": url, "chunks": [{"content": "Body."}]} for url in urls]
         with self.assertLogs("intel_deepen", "INFO") as logs:
@@ -218,13 +218,13 @@ class SwitchTest(unittest.TestCase):
         # First pass: INTC 2 + AAOI 1 + SPCX 2 (search) + PLTR 2 = 7; top-up fills to 10
         # with the next-newest INTC link, SPCX's spare search result, then PLTR's next link;
         # AAOI has only one link, so it contributes nothing.
-        self.assertEqual(len(extracted), 10)
-        self.assertEqual(extracted[7:], ["https://intc1.example/a", "https://s2.example/x",
-                                         "https://pltr0.example/a"])
-        self.assertEqual(result["extract_topup_count"], 3)
-        self.assertEqual(len(set(extracted)), 10)
+        self.assertEqual(len(extracted), 9)
+        self.assertIn("https://intc1.example/a", extracted)
+        self.assertNotIn("https://s2.example/x", extracted)
+        self.assertEqual(result["extract_topup_count"], 2)
+        self.assertEqual(len(set(extracted)), 9)
         self.assertTrue(any("Deepen direct leads INTC" in line and "s" in line for line in logs.output))
-        self.assertTrue(any("top-up: +3 URLs to 10" in line for line in logs.output))
+        self.assertTrue(any("top-up: +2 URLs to 9" in line for line in logs.output))
 
     def test_extract_top_up_skips_exact_multiple_and_reuses_redirect_cache(self):
         redirects = [item(f"INTC news {i}", "finnhub.io", f"https://finnhub.io/r{i}",
@@ -237,7 +237,7 @@ class SwitchTest(unittest.TestCase):
         with patch("intel_deepen.httpx.stream", side_effect=fake_stream(
                 lambda url: (302, f"https://site{url[-1]}.example/a"), calls)):
             deepen_intel_snapshot(intel_snapshot, search=lambda *_: [],
-                                  extract=lambda urls, q: extracted.extend(urls) or [],
+                                  extract=lambda urls, q, chunks: extracted.extend(urls) or [],
                                   remaining=lambda: 25)
         self.assertEqual(len(extracted), 3)  # 2 first pass + 1 top-up toward 5
         self.assertEqual(sorted(url for _, url, _ in calls),

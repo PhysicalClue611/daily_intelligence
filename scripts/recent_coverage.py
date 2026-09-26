@@ -4,12 +4,39 @@ import re
 import json
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fetch_prices import DISPLAY_NAMES
 from intel_collect import _word_match
 
 _HEADER = re.compile(r"^## (\d{4}-\d{2}-\d{2}) (开盘前简报|夜盘收市速报)\s*$", re.M)
 _FOLLOWUP = re.compile(r"^## 追问\b", re.M)
+
+
+def normalize_url(url: str) -> str:
+    """Ignore tracking parameters and fragments when comparing extracted articles."""
+    parts = urlsplit(url)
+    query = urlencode([(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+                       if not key.lower().startswith("utm_")])
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, query, ""))
+
+
+def recent_extracted_urls(root: Path, before: str, slot: str, limit: int = 6) -> set[str]:
+    """Fulltext URLs in the previous six runs; fail open if a selected archive is unreadable."""
+    paths = sorted(root.glob("*/????-??-??-??-intel-snapshot.json"), reverse=True)
+    # Same-day AM is history for PM, but today's PM is not.
+    key = f"{before}-{slot}"
+    selected = [path for path in paths if path.name[:13] < key][:limit]
+    urls = set()
+    try:
+        for path in selected:
+            snap = json.loads(path.read_text(encoding="utf-8"))
+            chunks = [chunk for entity in snap.get("entities", []) for chunk in entity.get("fulltext", [])]
+            chunks += (snap.get("macro_digest") or {}).get("fulltext", [])
+            urls.update(normalize_url(chunk["url"]) for chunk in chunks if chunk.get("url"))
+    except (OSError, ValueError, TypeError, KeyError):
+        return set()
+    return urls
 
 
 def _trading_dates(today: date) -> set[str]:

@@ -5,7 +5,8 @@ import logging
 import math
 import statistics
 import time
-from datetime import date, timedelta
+import re
+from datetime import date, datetime, timedelta
 from urllib.parse import urlparse
 
 import httpx
@@ -13,6 +14,7 @@ import httpx
 from intel_collect import _word_match
 from intel_render import matching_topics
 from scoring_utils import _source_confidence_tags
+from recent_coverage import normalize_url
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +27,59 @@ NEAR_D3 = 8.0
 NEAR_D5 = 9.0
 NEWS_SPIKE_RATIO = 2.0
 NEWS_SPIKE_MIN = 8
+NEWS_SPIKE_MIN_HISTORY = 5
 MACRO_TOPICS = 3
 MACRO_PER_TOPIC = 3
 EXTRACT_BATCH_URLS = 20
-PAYWALL_DOMAINS = {"ft.com", "wsj.com", "barrons.com"}
+PAYWALL_DOMAINS = {"ft.com", "wsj.com", "barrons.com", "foreignpolicy.com", "marketwatch.com"}
 NON_ARTICLE_DOMAINS = {"news.google.com"}
+EXTRACT_CHUNKS = 3
+BODY_MAX_CHARS = 2000
+MIN_BODY_CHARS = 300
+MAX_BOILERPLATE_RATIO = 0.35
+YAHOO_NAV = ("Most active", "Day gainers", "Day losers", "Stock splits",
+             "Oops, something went wrong", "Private companies", "Trending tickers")
+YAHOO_EVENT_WORDS = ("awarded", "agreement", "contract", "delivery", "delivered",
+                     "order", "guidance", "lawsuit", "regulator", "financing")
+BOILERPLATE = (*YAHOO_NAV, "This article is an Insider exclusive", "All rights reserved",
+               "Companies Mentioned", "Image ", "Copyright")
+
+
+def clean_body(url: str, text: str) -> str:
+    """Remove Yahoo navigation lines before measuring article quality."""
+    if "finance.yahoo.com" not in (urlparse(url).hostname or ""):
+        return text.strip()
+    nav_page = "[...]" in text and any(term.lower() in text.lower() for term in YAHOO_NAV)
+    if "[...]" in text:
+        text = text.split("[...]", 1)[1]
+    cleaned = "\n".join(line for line in text.splitlines()
+                        if not any(term.lower() in line.lower() for term in YAHOO_NAV)).strip()
+    # A short tail after a navigation page is often an ad or site disclaimer.
+    if nav_page and len(cleaned) < 600 and not any(
+            re.search(r"\b" + word + r"\b", cleaned, re.I) for word in YAHOO_EVENT_WORDS):
+        return ""
+    return cleaned
+
+
+def body_acceptable(text: str) -> bool:
+    if len(text) < MIN_BODY_CHARS:
+        return False
+    lowered = text.lower()
+    if ("insider exclusive" in lowered and "upgrade options" in lowered or
+            lowered.count("copyright") >= 2 and "marketwatch" in lowered):
+        return False
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    noisy = sum(len(line) for line in lines if any(term.lower() in line.lower() for term in BOILERPLATE))
+    return noisy / max(1, sum(len(line) for line in lines)) <= MAX_BOILERPLATE_RATIO
+
+
+def _published_day(value: str) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+    except (TypeError, ValueError):
+        return None
 
 
 def _move_strength(entity: dict) -> float:
@@ -81,7 +131,8 @@ def resolve_article_url(url: str) -> str | None:
 
 
 def _direct_leads(entity: dict, limit: int = 2, cache: dict | None = None,
-                  skip_seen: bool = False) -> list[tuple[str, dict]]:
+                  skip_seen: bool = False, skip_urls: set[str] | None = None,
+                  skipped: set[str] | None = None) -> list[tuple[str, dict]]:
     """Up to `limit` title-matching article links with distinct landing domains.
 
     Finnhub 302 links are resolved one request at a time (headers-only GET); `cache` keeps results
@@ -94,7 +145,9 @@ def _direct_leads(entity: dict, limit: int = 2, cache: dict | None = None,
     domains = set()
     resolved = attempted = 0
     started = time.monotonic()
-    for row in sorted(entity.get("items", []), key=lambda x: x.get("published_at", ""), reverse=True):
+    for row in sorted(entity.get("items", []),
+                      key=lambda x: ("finance.yahoo.com" in (urlparse(x.get("url", "")).hostname or ""),
+                                     -( _published_day(x.get("published_at", "")) or date.min).toordinal())):
         if row.get("url_kind") not in {"direct", "finnhub_redirect"}:
             continue
         if skip_seen and row.get("seen_before"):
@@ -108,6 +161,11 @@ def _direct_leads(entity: dict, limit: int = 2, cache: dict | None = None,
                 cache[url] = resolve_article_url(url) or ""
                 resolved += bool(cache[url])
             url = cache[url]
+        normalized = normalize_url(url)
+        if skip_urls and normalized in skip_urls:
+            if skipped is not None:
+                skipped.add(normalized)
+            continue
         domain = (urlparse(url).hostname or "").removeprefix("www.").lower()
         if not domain or domain in domains:
             continue
@@ -144,7 +202,7 @@ def quiet_candidates(entities: list[dict], movers: list[dict],
         elif any(row.get("url_kind") == "sec_filing" and not row.get("seen_before")
                  for row in entity.get("items", [])):
             tier, strength, reason = 1, 1, "new_8k"
-        elif (baseline is not None and fresh >= NEWS_SPIKE_MIN and
+        elif (len(prior) >= NEWS_SPIKE_MIN_HISTORY and baseline is not None and fresh >= NEWS_SPIKE_MIN and
               fresh >= NEWS_SPIKE_RATIO * baseline):
             tier = 2
             strength = fresh / baseline if baseline else float("inf")
@@ -156,7 +214,8 @@ def quiet_candidates(entities: list[dict], movers: list[dict],
     return [(entity, reason) for _, _, _, _, entity, reason in ranked[:QUIET_MAX]]
 
 
-def macro_leads(macro_digest: dict, geo_keywords: dict[str, list[str]]) -> list[tuple[str, dict, str]]:
+def macro_leads(macro_digest: dict, geo_keywords: dict[str, list[str]],
+                skip_urls: set[str] | None = None, skipped: set[str] | None = None) -> list[tuple[str, dict, str]]:
     """Select recent direct articles from the three most populated topics."""
     rows = macro_digest.get("items") or []
     topics = sorted(geo_keywords, key=lambda topic: (-sum(topic in matching_topics(row, geo_keywords)
@@ -172,6 +231,11 @@ def macro_leads(macro_digest: dict, geo_keywords: dict[str, list[str]]) -> list[
             if topic not in matching_topics(row, geo_keywords):
                 continue
             url = row.get("url", "")
+            normalized = normalize_url(url)
+            if skip_urls and normalized in skip_urls:
+                if skipped is not None:
+                    skipped.add(normalized)
+                continue
             domain = (urlparse(url).hostname or "").removeprefix("www.").lower()
             if (not url.startswith("https://") or not domain or domain in domains or
                     any(domain == bad or domain.endswith("." + bad)
@@ -192,7 +256,8 @@ def _search_bounds(intel_snapshot: dict, entity: dict) -> tuple[str, str]:
 def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining,
                           slot: str | None = None, geo_keywords: dict | None = None,
                           history_counts: dict | None = None,
-                          run_credit_cap: int | None = None) -> dict:
+                          run_credit_cap: int | None = None,
+                          skip_urls: set[str] | None = None) -> dict:
     """Select and extract mover, macro, then quiet evidence within this run's credits."""
     slot = slot or intel_snapshot.get("slot", "am")
     geo_keywords = geo_keywords or {}
@@ -202,24 +267,30 @@ def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining,
                                          for e, reason in quiet]
     intel_snapshot["run_credit_cap"] = run_credit_cap
     jobs, status, spare_search = [], {}, {}
+    skipped, rejected = set(), set()
+    skip_urls = skip_urls or set()
     owners: dict[str, list[tuple[dict | None, dict, str | None]]] = {}
     layers: list[list[str]] = [[], [], []]
     cache: dict[str, str] = {}
     search_count = 0
 
     def add(layer: int, url: str, entity: dict | None, row: dict, topic: str | None = None):
+        if normalize_url(url) in skip_urls:
+            skipped.add(normalize_url(url))
+            return
         if url not in owners:
             owners[url] = []
             layers[layer].append(url)
         owners[url].append((entity, row, topic))
 
-    def search_for(entity: dict, reserve_urls: int) -> list[tuple[str, dict]]:
+    def search_for(entity: dict, reserve_urls: int, quiet_search: bool = False) -> list[tuple[str, dict]]:
         nonlocal search_count
         ticker = entity["ticker"]
         if search_count >= SEARCH_CAP or remaining() <= math.ceil(reserve_urls / 5):
-            status[ticker] = status.get(ticker, "") + "; search cap or budget exhausted"
+            status.setdefault(ticker, []).append("search cap or budget exhausted")
             return []
-        query = f"Why is {entity.get('name') or ticker} stock {_move_direction(entity)}"
+        query = (f"{entity.get('name') or ticker} {ticker} news" if quiet_search else
+                 f"Why is {entity.get('name') or ticker} stock {_move_direction(entity)}")
         start, end = _search_bounds(intel_snapshot, entity)
         jobs.append({"ticker": ticker, "query": query, "start_date": start, "end_date": end})
         search_count += 1
@@ -227,34 +298,48 @@ def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining,
             results = search(query, start, end) or []
         except Exception:
             results = []
+        cutoff = date.fromisoformat(start) - timedelta(days=7)
+        fresh_results = []
+        for row in results:
+            url = str(row.get("url", ""))
+            if not url.startswith("https://"):
+                continue
+            if _published_day(row.get("published_date")) is not None and _published_day(row.get("published_date")) < cutoff:
+                continue
+            if normalize_url(url) in skip_urls:
+                skipped.add(normalize_url(url))
+                continue
+            fresh_results.append(row)
+        fresh_results.sort(key=lambda row: _published_day(row.get("published_date")) is None)
         found = [(row["url"], {"id": None, "title": row.get("title", ""),
                               "publisher_domain": urlparse(row["url"]).hostname or "",
-                              "published_at": "", "summary": row.get("content", "")})
-                 for row in results if str(row.get("url", "")).startswith("https://")]
-        spare_search[ticker] = found[2:]
-        status[ticker] = status.get(ticker, "") + ("; search: found leads" if found else "; search: no leads")
+                              "published_at": row.get("published_date") or "", "summary": row.get("content", "")})
+                 for row in fresh_results]
+        spare_search[ticker] = [lead for lead in found[2:] if lead[1]["published_at"]]
+        status.setdefault(ticker, []).append("search: found leads" if found else "search: no leads")
         return found[:2]
 
     for entity in movers:
         ticker = entity["ticker"]
-        leads = _direct_leads(entity, cache=cache)
-        status[ticker] = "direct leads" if leads else ""
+        leads = _direct_leads(entity, cache=cache, skip_urls=skip_urls, skipped=skipped)
+        status[ticker] = ["direct leads"] if leads else []
         if not leads:
             leads = search_for(entity, len(layers[0]))
         for url, row in leads:
             add(0, url, entity, row)
 
-    macro = intel_snapshot.get("macro_digest") or {}
+    macro = intel_snapshot.setdefault("macro_digest", {})
     macro.setdefault("fulltext", [])
-    for url, row, topic in macro_leads(macro, geo_keywords):
+    for url, row, topic in macro_leads(macro, geo_keywords, skip_urls, skipped):
         add(1, url, None, row, topic)
 
     for entity, reason in quiet:
         ticker = entity["ticker"]
-        status[ticker] = "quiet: " + reason
-        leads = _direct_leads(entity, limit=QUIET_URLS, cache=cache, skip_seen=True)
+        status[ticker] = ["quiet: " + reason]
+        leads = _direct_leads(entity, limit=QUIET_URLS, cache=cache,
+                              skip_seen=not reason.startswith("near_"), skip_urls=skip_urls, skipped=skipped)
         if not leads:
-            leads = search_for(entity, len(layers[0]) + len(layers[1]))
+            leads = search_for(entity, len(layers[0]) + len(layers[1]), quiet_search=True)
         for url, row in leads:
             add(2, url, entity, row)
 
@@ -267,13 +352,16 @@ def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining,
         if len(urls) >= target:
             break
         known = {url for url in urls if any(owner is entity for owner, _, _ in owners[url])}
-        extra = [lead for lead in _direct_leads(entity, limit=len(known) + 1, cache=cache)
+        extra = [lead for lead in _direct_leads(entity, limit=len(known) + 1, cache=cache,
+                                                skip_urls=skip_urls, skipped=skipped)
                  if lead[0] not in known]
         extra += spare_search.get(entity["ticker"], [])
         for url, row in extra:
             if len(urls) >= target:
                 break
-            if url in urls:
+            if url in urls or normalize_url(url) in skip_urls:
+                if normalize_url(url) in skip_urls:
+                    skipped.add(normalize_url(url))
                 continue
             urls.append(url)
             owners[url] = [(entity, row, None)]
@@ -282,7 +370,9 @@ def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining,
         if len(urls) >= target:
             break
         for url, row in spare_search.get(entity["ticker"], [])[:1]:
-            if len(urls) >= target or url in urls:
+            if len(urls) >= target or url in urls or normalize_url(url) in skip_urls:
+                if normalize_url(url) in skip_urls:
+                    skipped.add(normalize_url(url))
                 continue
             urls.append(url)
             owners[url] = [(entity, row, None)]
@@ -290,13 +380,47 @@ def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining,
     if topped_up:
         logger.info("Deepen Extract top-up: +%d URLs to %d (same credit tier)", topped_up, len(urls))
 
+    groups: dict[tuple[int, str], list[str]] = {}
+    for url in urls:
+        entity, row, topic = owners[url][0]
+        layer = 1 if entity is None else (0 if entity in movers else 2)
+        key = (layer, topic or entity["ticker"])
+        groups.setdefault(key, []).append(url)
+    batches: list[list[str]] = []
+    for layer in range(3):
+        pending: list[str] = []
+        for (group_layer, _), group_urls in groups.items():
+            if group_layer != layer:
+                continue
+            if len(group_urls) >= 5:
+                if pending:
+                    batches.append(pending)
+                    pending = []
+                batches.extend(group_urls[start:start + EXTRACT_BATCH_URLS]
+                               for start in range(0, len(group_urls), EXTRACT_BATCH_URLS))
+            elif len(pending) + len(group_urls) <= 5:
+                pending.extend(group_urls)
+            else:
+                batches.append(pending)
+                pending = list(group_urls)
+        if pending:
+            batches.append(pending)
     results = []
-    for start in range(0, len(urls), EXTRACT_BATCH_URLS):
-        batch = urls[start:start + EXTRACT_BATCH_URLS]
+    attempted_urls = []
+    for batch in batches:
         if remaining() < math.ceil(len(batch) / 5):
-            break
+            continue
+        labels = []
+        for url in batch:
+            entity, _, topic = owners[url][0]
+            label = topic if entity is None else f"{entity.get('name') or entity['ticker']} {entity['ticker']}"
+            if label not in labels:
+                labels.append(label)
+        words = re.findall(r"[\w-]+", " ".join(owners[url][0][1].get("title", "") for url in batch))
+        query = " ".join(labels + list(dict.fromkeys(words[:10])))
+        attempted_urls.extend(batch)
         try:
-            results.extend(extract(batch, "financial company event evidence") or [])
+            results.extend(extract(batch, query, EXTRACT_CHUNKS) or [])
         except Exception as exc:
             logger.warning("Deepen Extract batch failed: %s", type(exc).__name__)
 
@@ -309,12 +433,19 @@ def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining,
     successful_urls = set()
     for result in results:
         url = result.get("url", "")
-        if url not in owners or url not in urls:
+        if url not in owners or url not in attempted_urls:
             continue
         chunks = result.get("chunks") or []
-        body = " ".join(str(chunk.get("content") or "") for chunk in chunks[:2]).strip()
-        body = (body or str(result.get("raw_content") or ""))[:1200]
-        if not body:
+        body = " ".join(str(chunk.get("content") or "") for chunk in chunks[:EXTRACT_CHUNKS]).strip()
+        original_body = (body or str(result.get("raw_content") or ""))[:BODY_MAX_CHARS]
+        try:
+            body = clean_body(url, original_body)
+            acceptable = body_acceptable(body)
+        except Exception as exc:
+            logger.warning("Deepen body quality check failed, using original text: %s", type(exc).__name__)
+            body, acceptable = original_body, bool(original_body)
+        if not acceptable:
+            rejected.add(url)
             continue
         successful_urls.add(url)
         for entity, lead, topic in owners[url]:
@@ -324,13 +455,15 @@ def deepen_intel_snapshot(intel_snapshot: dict, *, search, extract, remaining,
                 macro["fulltext"].append({**chunk, "topic": topic})
             else:
                 entity.setdefault("fulltext", []).append(chunk)
-                status[entity["ticker"]] += "; extracted"
-    intel_snapshot["deepen_status"] = status
+                status[entity["ticker"]].append("extracted")
+    intel_snapshot["deepen_status"] = {ticker: "; ".join(dict.fromkeys(parts)) for ticker, parts in status.items()}
     intel_snapshot["search_jobs"] = jobs
     intel_snapshot["search_count"] = search_count
     intel_snapshot["extract_url_count"] = len(urls)
     intel_snapshot["extract_topup_count"] = topped_up
     intel_snapshot["extract_success_count"] = len(successful_urls)
+    intel_snapshot["extract_dedup_skipped"] = len(skipped)
+    intel_snapshot["extract_rejected_count"] = len(rejected)
     intel_snapshot["quiet_url_count"] = sum(url in urls for url in layers[2])
     intel_snapshot["macro_url_count"] = sum(url in urls for url in layers[1])
     return intel_snapshot

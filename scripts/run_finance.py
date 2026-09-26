@@ -88,7 +88,7 @@ from report_writers import (
     _fmt_llm_meta, finance_footer,
     REPORTS_DIR,
 )
-from recent_coverage import build_recent_coverage_section, recent_fresh_counts
+from recent_coverage import build_recent_coverage_section, recent_fresh_counts, recent_extracted_urls
 from pass2_context import (
     CORE_HOLDING_EXCLUDE as _CORE_HOLDING_EXCLUDE,
     current_state, changed_background, read_previous_intel_snapshot_state,
@@ -344,7 +344,7 @@ def tavily_search(query: str, budget: dict, days: int = 1,
 
 
 def tavily_extract(urls: list[str], query: str, budget: dict,
-                   chunks_per_source: int = 2) -> list[dict]:
+                   chunks_per_source: int = 3) -> list[dict]:
     """Batch-extract full content chunks from known URLs.
     Cost: 1 credit per 5 URLs (ceiling), so 5=1cr, 10=2cr.
     Always send multiples of 5 for best credit efficiency.
@@ -604,14 +604,14 @@ USER_PROMPT_TEMPLATE_P2 = """今日日期（ET）：{date}
 ## 实际持仓与框架
 {personal_context}
 
-根据所给事实直接分析事件、传导路径和持仓含义，不复述情报收集过程。对需要解释的价格异动，直接证据可写“已知原因”并附来源；仅有线索时写“线索待核实”，单一来源的强断言在相关句内标一次“未证实”；没有可靠线索时写“未找到原因”，只在这种情形下简短写明该标的来源覆盖。检索失败且无条目时写“未能完成检索”，不能声称已查遍。价格变化本身不是原因；不凭空归因于情绪、资金流或风格轮动，也不因没找到线索就断言没有公司级催化。陈述事实及其传导即可；材料里没人提出的推论（如“已兑现”“已获客户”）不要去逐条否定；只有当某篇报道或市场叙事确实作出了这个推论，才用一句话指出证据不足，同一标的只说一次。只写新闻相对“此前已报道”及近五个交易日报告新增的事实；无进展时省略，或一句“延续 MM-DD 已报道的<事件>，今日无新进展”。例外：已排期的供给事件（限售股解禁、增发或 ATM 发行、配售、指数纳入或剔除调整）在生效日之前和之后的报告里都要保留，即使此前已报道也不算“无进展”；写明生效日期、规模，以及它与当日价格或成交的关系。不复述信源独立域名数量。
+根据所给事实直接分析事件、传导路径和持仓含义，不复述情报收集过程。对需要解释的价格异动，直接证据可写“已知原因”并附来源；仅有线索时写“线索待核实”，单一来源的强断言在相关句内标一次“未证实”；没有可靠线索时写“未找到原因”，只在这种情形下简短写明该标的来源覆盖。检索失败且无条目时写“未能完成检索”，不能声称已查遍。价格变化本身不是原因；不凭空归因于情绪、资金流或风格轮动，也不因没找到线索就断言没有公司级催化。陈述事实及其传导即可；材料里没人提出的推论（如“已兑现”“已获客户”）不要去逐条否定；只有当某篇报道或市场叙事确实作出了这个推论，才用一句话指出证据不足，同一标的只说一次。只写新闻相对“此前已报道”及近五个交易日报告新增的事实；无进展时省略，或一句“延续 MM-DD 已报道的<事件>，今日无新进展”。近三个交易日至七个自然日内已报道的事件，如与当日该标的异动、接近或达到多日阈值、或当日后续报道及价格变动有关，可以完整分析它如何发酵、兑现或被市场重新定价，并写明原始日期及与当日价格的关系。超过七天或与当日走势无关的旧事仍省略或一句带过，不复述同一事实。已排期的供给事件（限售股解禁、增发或 ATM 发行、配售、指数纳入或剔除调整）在生效日之前和之后的报告里都要保留，即使此前已报道也不算“无进展”；写明生效日期、规模，以及它与当日价格或成交的关系。本次抓到正文的标的，如正文含合同、订单、监管、融资、管理层、产品交付、诉讼或指引等公司级实质事件，必须写到报告里；只有近五日报告确实写过且没有新进展时才可省略。不复述信源独立域名数量。
 
 仓位建议仅在下列事实命中时提出，并指出具体新证据：认知提升（战略节点首次商业化、竞争格局结构变化、此前被怀疑的管理层承诺获证实）；Alpha 大幅兑现（预期差评分下降超过3分、未来 Alpha 潜力低于5分且无新催化）；更高赔率机会（候选潜力高2分以上且战略空间同量级）；价格被动上涨致单一仓位跨过15%。若注入了 FRED 档位变化或52周新高/新低，也允许写仓位小节，但只陈述本次背景变化，不把它当成单独的交易指令。上述事实或背景变化均未出现时省略仓位小节，不逐股声明“无加减仓依据”，不复述标准原文。
 
 输出骨架（空节省略）：
 # [Daily_Intel] {date} 开盘前简报
 ## 要点（可选，最多3条）
-## 持仓与观察标的（只写当天有新事件、有异动或有已排期供给事件的标的；其余标的不单独成段，不复述价格表数字）
+## 持仓与观察标的（写当天有新事件、有异动、有已排期供给事件，或近一周事件正在发酵并伴随价格变动的标的；其余标的不单独成段，不复述价格表数字）
 ## 宏观与地缘（只写对持仓有传导的新事实）
 ## 仓位（仅出现上述例外时）
 {verifiable_signals_rule}
@@ -725,7 +725,7 @@ def build_status_message(today_et: str, slot_label: str, budget: dict,
     lines += ["", "情报来源:",
               f"- Pass 0: {len(entities)} 标的；Finnhub {totals['finnhub']}、Google News {totals['google_news']}、RSS {totals['rss']}、Guardian {totals['guardian']}、SEC 8-K {totals['sec_8k']}、Yahoo RSS {totals['yahoo_rss']}",
               f"- 来源错误: {'；'.join(errors[:5]) if errors else '无'}",
-              f"- Pass 1（代码）: 搜索 {intel_snapshot.get('search_count', 0)}，Extract {intel_snapshot.get('extract_success_count', 0)}/{intel_snapshot.get('extract_url_count', 0)} URL；安静标的 {len(intel_snapshot.get('quiet_selected', []))} 只/{intel_snapshot.get('quiet_url_count', 0)} URL；宏观 {intel_snapshot.get('macro_url_count', 0)} URL；本次限额 {intel_snapshot.get('run_credit_cap', 0)}cr"]
+              f"- Pass 1（代码）: 搜索 {intel_snapshot.get('search_count', 0)}，Extract {intel_snapshot.get('extract_success_count', 0)}/{intel_snapshot.get('extract_url_count', 0)} URL；跨运行去重跳过 {intel_snapshot.get('extract_dedup_skipped', 0)}，正文拒绝 {intel_snapshot.get('extract_rejected_count', 0)}；安静标的 {len(intel_snapshot.get('quiet_selected', []))} 只/{intel_snapshot.get('quiet_url_count', 0)} URL；宏观 {intel_snapshot.get('macro_url_count', 0)} URL；本次限额 {intel_snapshot.get('run_credit_cap', 0)}cr"]
     for ticker, status in (intel_snapshot.get("deepen_status") or {}).items():
         lines.append(f"  {ticker}: {status}")
     lines.append(f"- Sonar宏观快照: {'成功' if sonar_macro_section else '失败/跳过'}")
@@ -1020,10 +1020,11 @@ def _main_body():
                 query, budget, serpapi_budget, search_depth="basic", max_results=3,
                 start_date=start, end_date=end,
             ),
-            extract=lambda urls, query: tavily_extract(urls, query, budget),
+            extract=lambda urls, query, chunks: tavily_extract(urls, query, budget, chunks_per_source=chunks),
             remaining=lambda: budget_remaining(budget),
             slot=run_slot, geo_keywords=wl["geo_keywords"],
             history_counts=recent_fresh_counts(_PROJ_DIR / "archives", today_et, run_slot),
+            skip_urls=recent_extracted_urls(_PROJ_DIR / "archives", today_et, run_slot),
             run_credit_cap=cap,
         )
     except Exception as exc:
