@@ -62,7 +62,7 @@ class PromptWordingTest(unittest.TestCase):
         template = rf.USER_PROMPT_TEMPLATE_P2
         self.assertIn("材料里没人提出的推论", template)
         self.assertIn("同一标的只说一次", template)
-        self.assertIn("只写当天有新事件、有异动或有已排期供给事件的标的", template)
+        self.assertIn("或近一周事件正在发酵并伴随价格变动的标的", template)
         self.assertIn("不复述价格表数字", template)
         self.assertIn("已排期的供给事件", template)
         self.assertNotIn("分别说明日内表现与盘后", template)

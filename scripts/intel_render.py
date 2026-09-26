@@ -92,6 +92,8 @@ def render_intel_snapshot_context(intel_snapshot: dict, geo_keywords: dict[str, 
                 price_bits.append(f"{label} {move[key]:+.1f}%")
         role = "持有" if e.get("held") else "观察"
         lines.append(f"### {e['ticker']}（{role}）{'、'.join(price_bits)}")
+        if e.get("fulltext"):
+            lines.append("本次抓到正文：请核查其中的公司级实质事件及其报告覆盖。")
         lines.append(f"检索范围（仅供核查）：{coverage_line(e)}")
         limit = 25 if active else 12
         shown_rows = rows if active else sorted(rows, key=lambda row: bool(row.get("seen_before")))

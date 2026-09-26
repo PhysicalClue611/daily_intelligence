@@ -33,7 +33,7 @@ def test_quiet_selection():
         {"url_kind": "sec_filing", "seen_before": False}]}
     assert quiet_candidates([e], [], {})[0][1] == "new_8k"
     e["items"] = [{"seen_before": False}] * 12
-    assert quiet_candidates([e], [], {"X": [4, 5, 6]})[0][1].startswith("news_spike")
+    assert quiet_candidates([e], [], {"X": [4, 5, 6, 4, 5]})[0][1].startswith("news_spike")
     assert quiet_candidates([e], [], {}) == []
 
 
@@ -44,7 +44,7 @@ def test_macro_and_priority():
          "seen_before": False}
         for i, host in enumerate(["news.google.com", "ft.com", "cnbc.com", "theguardian.com", "marketwatch.com"])]}
     leads = macro_leads(macro, {"Taiwan": ["Taiwan"]})
-    assert [x[0].split("/")[2] for x in leads] == ["cnbc.com", "theguardian.com", "marketwatch.com"]
+    assert [x[0].split("/")[2] for x in leads] == ["cnbc.com", "theguardian.com"]
     snap = {"date": "2026-09-25", "slot": "am", "entities": [
         {"ticker": "A", "name": "A", "held": True, "aliases": ["Alpha"],
          "move": {"d1": 5, "flags": ["anomaly"]}, "items": [
@@ -58,14 +58,14 @@ def test_macro_and_priority():
               "published_at": "2026-09-25", "seen_before": False}], "fulltext": []}],
         "macro_digest": macro}
     calls = []
-    def extract(urls, query):
+    def extract(urls, query, chunks):
         calls.append(urls)
-        return [{"url": u, "raw_content": "body"} for u in urls]
+        return [{"url": u, "raw_content": "Article analysis of company performance and financial outlook. " * 10} for u in urls]
     out = deepen_intel_snapshot(snap, search=lambda *args: [], extract=extract,
                                 remaining=lambda: 1, slot="am", geo_keywords={"Taiwan": ["Taiwan"]})
     assert out["entities"][0]["fulltext"]
-    assert len(out["macro_digest"]["fulltext"]) == 3
-    assert out["entities"][1]["fulltext"] == []
+    assert len(out["macro_digest"]["fulltext"]) == 2
+    assert out["entities"][1]["fulltext"]
 
 
 def test_budget_and_batch():
@@ -90,7 +90,7 @@ def test_budget_and_batch():
                        "url_kind": "direct", "published_at": "2026-09-25", "seen_before": False}
                       for j in range(3)]})
     batches = []
-    def extract(urls, query):
+    def extract(urls, query, chunks):
         batches.append(urls)
         return []
     deepen_intel_snapshot(snap, search=lambda *args: [], extract=extract,
@@ -107,7 +107,7 @@ def test_manual_accounting_and_search_order():
         extraction_batches = []
         def request(method, url, **kwargs):
             if url.endswith("/extract"):
-                extraction_batches.append(kwargs["json"]["urls"])
+                extraction_batches.append((kwargs["json"]["urls"], kwargs["json"]["chunks_per_source"]))
             return Response()
         with patch.object(bt, "BUDGET_PATH", daily_path), \
              patch.object(bt, "MANUAL_BUDGET_PATH", manual_path), \
@@ -122,7 +122,8 @@ def test_manual_accounting_and_search_order():
             urls = [f"https://site{i}.example/story" for i in range(25)]
             rf.tavily_extract(urls[:20], "fixture", manual)
             rf.tavily_extract(urls[20:], "fixture", manual)
-            assert [len(batch) for batch in extraction_batches] == [20, 5]
+            assert [len(batch) for batch, _ in extraction_batches] == [20, 5]
+            assert all(chunks == 3 for _, chunks in extraction_batches)
             assert manual["used"] == 6 and bt.load_manual_budget()["used"] == 6
             assert daily_path.read_bytes() == original
             monthly = bt.load_serpapi_budget()
@@ -140,7 +141,7 @@ def test_manual_accounting_and_search_order():
                           search=lambda query, *args: searched.append(query) or [],
                           extract=lambda *args: [], remaining=lambda: 13)
     assert ["Alpha" in searched[0], "Quiet" in searched[1]] == [True, True]
-    assert searched[1].endswith("stock down")
+    assert searched[1] == "Quiet Q news"
 
 
 def test_render_and_yahoo():
