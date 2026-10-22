@@ -9,20 +9,18 @@
 - `docs/playbooks/reference_legacy.md` — 旧目录结构、旧 TG 追问流水线、月度报告格式、与 Hermes MI 的隔离边界、RSS 源表、已结束的观察项、待实现功能（A 股行情 / Parallel 降级 / Serper）、设计决策备忘
 - `docs/PITFALLS.md` — 踩坑索引（1–96）加详情
 - `docs/playbooks/github_issue_format.md` — issue 五段式格式规范
-- `docs/design.md` — 设计文档的仓库快照（权威版本在 Obsidian）
+- `docs/design.md` — 设计文档，Obsidian `Daily_Intel设计文档.md` 去掉 frontmatter 的逐字副本（agent 读这份）
+- `docs/playbooks/design_legacy_20260925.md` — 2026-09-25 之前的长篇设计文档（含逐次变更记录），只供溯源
 
 ---
 
-## [强制] Session 初始化
+## [强制] 上下文按需读取（2026-10-21 起，取代原"Session 初始化必读两文档"）
 
-**每个新 session 开始时，无论用户第一句话是什么，必须先读以下两个文档，再做任何其他操作：**
-
-1. `Hermes/Daily Intelligence/Daily_Intel设计文档.md` — 权威架构参考，API key 路径、LLM 选型、流水线细节均以此为准
-2. `Hermes/Daily Intelligence/Daily Intelligence 开发部署日志.md` — 近期变更与踩坑记录
-
-**若用户第一条消息已明确指定"阅读文档"，该指令必须立即执行，不得跳过或延后。**
-
-CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为准。
+启动时只靠本文件。纯问答、杂项任务不读设计文档和开发日志。
+**Why**：两份 Obsidian 文档每个 session 先吃掉 120K+ token；开发日志是历史叙事，有用部分已提炼进本文件"下一步优先事项"和 `docs/PITFALLS.md`。
+- **改代码、改配置、改流水线之前，必须先完整读 `docs/design.md`**（2026-05-23 曾因没读设计文档，把 Tavily key 改到错误的 `~/.hermes/.env`）。
+- 开发部署日志只按需检索：查某 issue 用 `obsidian_global_search` 搜编号，要近况只读最后 1–2 个条目，不通读。
+- 用户明确说"阅读文档"时，第一个工具调用就去读，不得跳过。本文件与 `docs/design.md` 不一致时以后者为准。
 
 ---
 
@@ -33,15 +31,16 @@ CLAUDE.md 仅作快速索引，两文档不一致时以 Obsidian 设计文档为
 **规则：本项目每次"打扫战场"，第 4 项（Obsidian 文档更新）必须显式拆成两个独立动作，都要做，不能只做一个就视为完成：**
 
 1. 更新 `Daily Intelligence 开发部署日志.md`（叙事型，append 到文件尾部，记录"这次做了什么、踩了什么坑"）
-2. 检查并更新 `Daily_Intel设计文档.md`（架构权威参考）——本次会话若新增/修改了数据源、LLM 选型、流水线步骤、目录结构、prompt 注入槽，必须同步反映到对应章节（第五节数据采集、第八节 LLM 选型表、第十节目录结构等），而不是只在开发日志里提一笔。判断标准：**如果这次改动会让 session 初始化时读到的架构描述、模型选型表、文件清单出现任何一处"与代码不符"，就必须更新设计文档**，哪怕只是一行表格或一个函数名。
-3. 大改动（新数据源、新子系统、模型切换等）额外在文档末尾追加"变更记录追加：YYYY-MM-DD"小节；小改动（如单个函数改名、单个常量调整）直接原地修正对应章节的过时表述，不必单独开变更记录小节。
+2. 检查并更新 `Daily_Intel设计文档.md`（架构权威参考）——本次会话若新增/修改了数据源、LLM 选型、流水线步骤、目录结构、prompt 注入槽，必须同步反映到对应章节（第五节数据采集、第八节 LLM 选型表、第十节目录结构等），而不是只在开发日志里提一笔。判断标准：**如果这次改动会让设计文档的架构描述、模型选型表、文件清单出现任何一处"与代码不符"，就必须更新设计文档**，哪怕只是一行表格或一个函数名。
+3. 大改动（新数据源、新子系统、模型切换等）额外在文末"演进简表"加一行；小改动（如单个函数改名、单个常量调整）直接原地修正对应章节的过时表述。
 4. 更新"最后更新"元信息行（文档顶部），反映本次改动的日期和摘要。
+5. 设计文档改过就同步 `docs/design.md`：经 Obsidian Local REST API（`https://127.0.0.1:27124/vault/...`，key 在 `~/.claude.json` 的 obsidian MCP env，不打印）取原文，去 frontmatter、保留文件头的关系说明，原子写入后逐行比对，随本次改动一起 commit。不要用 shell 直接读 iCloud 路径，会挂起。
 
 ---
 
 ## 当前架构速览（2026-09-25，`66e1ff4`）
 
-*各次改动的细节见 playbook `status_history.md`；权威描述是 Obsidian 设计文档。*
+*各次改动的细节见 playbook `status_history.md`；完整描述是 `docs/design.md`。*
 
 - **价格**：由 yfinance 在宿主机上拉取；PM 的今日收盘价取 intraday 数据（#69）。两次运行分别是 AM 08:30 ET 和 PM 20:10 ET（PM 结束后接着跑 `sas_review.py`，当前为 NOTIFY_ONLY）。
 - **Pass 0（免费，不调用 LLM）**：`intel_pass0.py`/`intel_collect.py` 按个股收集以下来源：Finnhub、Google News（公司名）、7 个 RSS 源、Guardian、SEC 8-K、Yahoo 个股新闻（yfinance `get_news`，覆盖字段仍叫 `yahoo_rss`）。标题按别名匹配、去重；与上一份快照重复的标 `seen_before`。

@@ -307,8 +307,9 @@ Daily_Intelligence/
 │   ├── backfill_drawers.py     one-shot: backfill past reports into MemPalace
 │   └── migrate_reports.py      one-shot: migrate old single-file reports to monthly
 ├── docs/
-│   └── design.md                full architecture reference (manually synced snapshot of the
-│                                 author's private Obsidian design doc — see note at top of the file)
+│   ├── design.md                full architecture reference (verbatim copy of the author's
+│   │                             private Obsidian design doc — see note at top of the file)
+│   └── playbooks/               on-demand history (incl. the pre-2026-09-25 long design doc)
 ├── templates/
 │   ├── investment_operating_manual.example.md   starting point for Finance/Investment Operating Manual v1.0.md
 │   └── layer_a_prompt.example.md                starting point for Hermes/Daily Intelligence/Layer_A_Prompt.md
