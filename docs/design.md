@@ -4,7 +4,7 @@
 
 > 这份文档描述系统**现在**怎么工作，写给想看懂或自己复刻这套系统的人。每一次改了什么、踩了什么坑，按时间记在《Daily Intelligence 开发部署日志》里；本文末尾只留一张演进简表。
 >
-> **最后更新**：2026-09-25。issue #113（PR #115，合并提交 `66e1ff4`）起：近 6 次已抓正文 URL 去重；新闻量异常至少 5 份同档历史；Extract 按标的或话题查询、3 个 chunk、每篇最多 2000 字并做正文质量过滤；安静个股搜索加日期围栏；Pass 2 允许分析近一周仍推动当日走势的事件，并要求写到新抓正文中的公司级实质事件。R1 的链接数调整仍在 #114。
+> **最后更新**：2026-11-01。负责人批准停用 Telegram 监听，指令与问答不可用；AM/PM 报告和 SAS 摘要的 Telegram 主动推送保留。此前 2026-09-25 的变更：issue #113（PR #115，合并提交 `66e1ff4`）起：近 6 次已抓正文 URL 去重；新闻量异常至少 5 份同档历史；Extract 按标的或话题查询、3 个 chunk、每篇最多 2000 字并做正文质量过滤；安静个股搜索加日期围栏；Pass 2 允许分析近一周仍推动当日走势的事件，并要求写到新抓正文中的公司级实质事件。R1 的链接数调整仍在 #114。
 
 ---
 
@@ -16,7 +16,7 @@ Daily Intelligence 是给一个长期持仓的个人投资者用的每日财经�
 
 - 报告回答的不是"市场发生了什么"，而是"这件事对我的持仓意味着什么"。
 - 系统记得用户过去的判断和关注点，不是每次从零开始。
-- 用户可以通过 Telegram 用自然语言改监控范围、追问细节。
+- Telegram 指令和追问的代码保留，但监听已于 2026-11-01 经负责人批准停用；当前通过文档手工维护监控范围。
 
 几条一直坚持的原则：
 
@@ -69,7 +69,7 @@ Daily Intelligence 是给一个长期持仓的个人投资者用的每日财经�
 输出：写进 Obsidian 月度报告，发邮件，发 Telegram，另发一条运行状态消息
 ```
 
-### 2.2 Telegram 追问
+### 2.2 Telegram 追问（监听已停用，以下为保留代码流程）
 
 ```
 用户在 Telegram 发消息 → 机器人先回"收到，处理中..."
@@ -96,7 +96,7 @@ Daily Intelligence 是给一个长期持仓的个人投资者用的每日财经�
 
 | 文件 | 内容 | 谁来写 |
 |---|---|---|
-| `Hermes/Daily Intelligence/watchlist.md` | 监控清单：股票、商品、汇率、地缘关键词、异动阈值、收件人、公司别名 | 用户手改，或 Telegram 指令改 |
+| `Hermes/Daily Intelligence/watchlist.md` | 监控清单：股票、商品、汇率、地缘关键词、异动阈值、收件人、公司别名 | 用户手改（Telegram 监听已停用） |
 | `Hermes/Daily Intelligence/Daily Reports/Daily_Intel_report_YYYYMM.md` | 每月的报告和追问记录 | 系统追加 |
 | `Hermes/Daily Intelligence/Daily Reports/Daily_Intel_context_YYYYMM.md` | 每次报告用到的原始材料摘要（Context Log） | 系统追加 |
 | `Hermes/Daily Intelligence/Layer_A_Prompt.md` | 写报告时的系统提示词：投资风格、资产结构逻辑、分析原则 | 用户维护 |
@@ -152,7 +152,7 @@ someone@example.com
 
 - **实体别名**（可选）：写公司的常用名，一行一个股票，比如 `INTC: Intel, 英特尔`。系统用它来判断一条新闻是不是在说这家公司，也用它拼搜索词。没写的，系统会用 Finnhub 查到的公司正式名称，并缓存在 `entity_alias_cache.json`。正式名称有时不自然（SpaceX 会变成 "Space Exploration Technologies"），这种情况手写一个别名就好。这一节放在最前面。
 - **收件人**一行一个邮箱。
-- **Telegram 指令**可以改清单：`加 MSFT` / `删 INTC`（个股）、`加关键词 US-Iran blockade`（地缘关键词）、`加收件人 x@x.com`。改的时候只动对应那一节，其他各节原样保留；写回文件是先写临时文件再整体替换，不会写出半个文件。
+- **Telegram 指令代码保留，监听停用期间不可用。** 原指令可改清单：`加 MSFT` / `删 INTC`（个股）、`加关键词 US-Iran blockade`（地缘关键词）、`加收件人 x@x.com`。改的时候只动对应那一节，其他各节原样保留；写回文件是先写临时文件再整体替换，不会写出半个文件。
 
 ---
 
@@ -308,13 +308,15 @@ AM 报告末尾写 2–4 条当晚能核对的具体判断（比如"WTI 收盘�
 
 ## 六、Telegram 机器人
 
+**当前状态（2026-11-01 00:44 ET）：** 负责人批准停用监听。`com.daily-intel.finance.telegram` 已从 launchd 卸载，plist 移至 `~/Library/LaunchAgents/.disabled/`；指令、校准统计查询和问答不可用。AM/PM 报告、运行状态与 SAS 摘要通过独立的 `sendMessage` 调用主动推送，不依赖监听。以下保留代码能力说明不代表服务正在运行，恢复须负责人另行批准。
+
 ### 6.1 运行方式
 
 - 用独立的 bot（@PhyCluFintel_bot），和 Hermes 的 bot 分开，避免两边抢消息。
-- 由 launchd 常驻运行，用长轮询收消息，服务端每次最多等 30 秒。收到消息先回"收到，处理中..."。
+- 停用前由 launchd 常驻运行，用长轮询收消息，服务端每次最多等 30 秒。收到消息先回"收到，处理中..."。
 - **网络不稳时怎么办：** 本机代理对 Telegram 的新连接大约有 25–30% 会瞬间失败。收消息的循环本身每半分钟就会再来一次，所以失败了就等下一轮，连续失败 30 分钟以上才记警告；发消息没有"下一轮"，所以失败会立刻重试。
 - **进程管理：** 整个进程共用一个网络连接对象，连续失败 3 次或满 6 小时重建一次；运行满 24 小时自动退出，由 launchd 重新拉起（防止长时间运行后内存越涨越大）。
-- **改了 `telegram_commands.py` 必须重启机器人才生效：**`launchctl kickstart -k gui/$(id -u)/com.daily-intel.finance.telegram`。
+- **监听已停用，修改 `telegram_commands.py` 不得自动启动机器人；恢复须负责人另行批准。**
 
 ### 6.2 指令
 
@@ -400,7 +402,7 @@ gemma 这几步都固定走 OpenInference 这家服务商。追问第 3 步的 P
 ```
 com.daily-intel.finance.am.plist        美东 08:30   开盘前简报
 com.daily-intel.finance.pm.plist        美东 20:10   夜盘收市速报，然后运行 sas_review.py
-com.daily-intel.finance.telegram.plist  常驻          Telegram 机器人
+com.daily-intel.finance.telegram.plist  已停用        plist 在 ~/Library/LaunchAgents/.disabled/
 ```
 
 - AM 和 PM 必须是两个独立的 plist。macOS 的 launchd 在一个 plist 里写多个时间时只认第一个，这个坑踩过。
@@ -411,7 +413,7 @@ com.daily-intel.finance.telegram.plist  常驻          Telegram 机器人
 
 ```
 /tmp/daily_intelligence.log    报告
-/tmp/finance_telegram.log      Telegram 机器人
+/tmp/finance_telegram.log      Telegram 监听历史日志（监听已停用）
 ```
 
 httpx 库默认会把完整请求地址写进日志，而 Telegram、Finnhub、Guardian 的密钥就在地址里。所以两个脚本都把 httpx 的日志级别调到 WARNING。以后新接入把密钥放在地址里的接口，要记得同样处理。
@@ -430,8 +432,7 @@ HERMES_DATA=~/.hermes OBSIDIAN_PATH="$HOME/Library/Mobile Documents/iCloud~md~ob
 # 只重建某天的免费情报快照，不发任何东西
 .venv/bin/python scripts/intel_pass0.py --replay 2026-09-21 --slot am
 
-# 重启 Telegram 机器人
-launchctl kickstart -k gui/$(id -u)/com.daily-intel.finance.telegram
+# Telegram 监听已停用；恢复须负责人另行批准，不在此列出启动命令。
 ```
 
 手动跑一次完整报告约需 2–5 分钟，用脚本调用时要把超时设长一些。被中途杀掉的进程会留下锁文件，但锁跟着进程走，不会挡住下一次运行。
@@ -461,7 +462,7 @@ launchctl kickstart -k gui/$(id -u)/com.daily-intel.finance.telegram
 │   ├── report_writers.py         写 Obsidian、Context Log、MemPalace、状态消息
 │   ├── memory_context_finance.py 查知识库
 │   ├── budget_trackers.py / quota_store.py   付费额度记账
-│   ├── telegram_commands.py      Telegram 机器人和追问
+│   ├── telegram_commands.py      Telegram 机器人和追问（代码保留，监听已停用）
 │   ├── telegram_utils.py         Telegram 发送与重试
 │   ├── finance_email.py          邮件（Resend）
 │   ├── sas_review.py / sec_edgar_utils.py    季度 SAS 复盘
