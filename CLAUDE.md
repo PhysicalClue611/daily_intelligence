@@ -54,13 +54,13 @@
 - **Pass 2**：`report_pass2` = `openai/gpt-6-luna`，推理 xhigh，`max_tokens` 32000。近 3 个交易日至 7 个自然日内、与当日走势相关的已报道事件可完整分析；本次抓到正文的公司级实质事件必须覆盖，除非近五日报告已经写过且无新进展。截断时先降一档推理强度，再换 fallback，最后退回代码摘要并发 TG 告警。另有 SAS 候选抽取（gemma）和 PM 核对 AM 预判（gemma）。
 - **输出**：Obsidian 月度报告、情报快照 `archives/YYYYMM/*-intel-snapshot.json`、Context Log、MemPalace、邮件、TG，以及一条单独的 TG 运行状态消息。
 - **LLM 选型**：集中在 `scripts/llm_config.py`，可用 `llm_config.json` 覆盖（纳入 git），改完无需重启。
-- **TG bot**：`com.daily-intel.finance.telegram`。改了 `telegram_commands.py` 必须 `launchctl kickstart -k gui/$(id -u)/com.daily-intel.finance.telegram`，并用启动时间核实已生效。
+- **TG 监听已停用**（2026-11-01 00:44 ET，负责人批准）：`com.daily-intel.finance.telegram` 已 bootout，plist 在 `~/Library/LaunchAgents/.disabled/`。Telegram 指令和问答不可用；AM/PM 报告、运行状态和 SAS 摘要仍独立主动推送。不要因修改 `telegram_commands.py` 而启动监听，恢复须负责人另行批准。
 
 ### 依赖外部资源
 
 | 资源 | 路径 | 说明 |
 |---|---|---|
-| 监控配置 | Obsidian: `Hermes/Daily Intelligence/watchlist.md` | 手工编辑或 TG 指令修改 |
+| 监控配置 | Obsidian: `Hermes/Daily Intelligence/watchlist.md` | 手工编辑（TG 监听已停用） |
 | 月度报告 | Obsidian: `Hermes/Daily Intelligence/Daily Reports/Daily_Intel_report_YYYYMM.md` | 脚本 append 写入 |
 | 持仓快照 | Obsidian: `Finance/portfolio_report_latest.md` | portfolio-agent 覆盖更新 |
 | Gmail token | `~/.hermes/token.json` | 借用 Hermes 的 OAuth token |
@@ -101,8 +101,9 @@
       sas_review.py 当前 NOTIFY_ONLY=True，触发时只发邮件提醒不自动跑分析。
   非交易日: exchange_calendars 检查后静默退出
 
-Telegram bot: com.daily-intel.finance.telegram.plist
-  - KeepAlive 常驻，long polling timeout=30，响应延迟 < 1s
+Telegram 监听（已停用，2026-11-01 00:44 ET）: com.daily-intel.finance.telegram.plist
+  - plist 已移至 ~/Library/LaunchAgents/.disabled/，launchd 已卸载；不要自动恢复
+  - AM/PM 报告和 SAS 摘要的 Telegram 主动推送不依赖此监听
   - Bot: @PhyCluFintel_bot（独立 token，与 Hermes bot 隔离）
 
 日志:
@@ -148,6 +149,8 @@ OBSIDIAN_PATH="~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview
 
 ## Telegram 指令（telegram_commands.py）
 
+**当前不可用：** 负责人已于 2026-11-01 批准停用监听。下表仅记录保留代码的能力，不代表服务在运行。
+
 | 指令示例 | 动作 |
 |---|---|
 | `加 MSFT` / `删 INTC` | 增删个股，直接改 watchlist.md |
@@ -190,7 +193,7 @@ OBSIDIAN_PATH="~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview
 21. **供给事件例外效果**（PR #97）：解禁、增发/ATM、配售、指数调整是否在生效日前后都出现在报告里；生效日当天无新闻时是否漏掉，据此评估要不要做代码按日期注入的“供给事件日历”
 22. **SAS 候选命中频率**（#89 之后）：`SAS候选证据日志.md` 的新增频率；#89 后 SAS 抽取输入只剩情报快照（不含 Sonar），据此决定是否把 Sonar 加回 SAS 输入
 23. **issue #99 合并后由验证方看**（实现方不跑报告）：连续 3 个交易日防御性否定句比例是否低于 10%；没有事件的标的是否还单独成段；快照 `pass2` 里的 token 与 `finish_reason`；QQQM 是否还出现在仓位段
-24. **issue #101**（已于 06:21 ET 重启 bot）：下次用 TG 加删个股、关键词、收件人后，确认下一节标题仍在，收件人按行分开。
+24. **issue #101**：历史上已重启 bot。2026-11-01 起监听已停用，TG 修改清单的观察暂停；不要为此恢复监听。
 25. **issue #105**（PR #108，`5b8efc8`）：下次 AM/PM 看日志 `Pass 0 sec_8k` / `Pass 0 yahoo_rss` 的耗时；8-K 是否出现在报告里并带 Item 编号；Yahoo 失败是否只留在覆盖错误里。回放召回已是 22/24。供给事件日历和 8-K 附件正文仍未做。（Yahoo 已在 #111 改用 yfinance；回放基线降为 21/24）
 26. **issue #111 观察**（PR #112，`a92ff0d`，2026-09-25 起）：`grep -E "run cap|Tavily used today|manual run" /tmp/daily_intelligence.log` 看每次的额度上限和日用量（09-25 PM 用了 6/25）。快照里看 `quiet_selected`、`macro_url_count`、`extract_success_count`。看各股 `yahoo_rss` 的条数和错误，连续 3 个交易日有过半标的失败就下线这一路。看 Pass 2 的 `prompt_tokens`（09-25 PM 为 24.8k）。
 27. **issue #113（PR #115，`66e1ff4`，已合并；观察中）**：
