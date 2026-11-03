@@ -221,7 +221,7 @@ def _sonar_macro_brief(
                 OR_BASE_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
                          "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
-                json=or_payload,
+                json=llm_config.enforce_policy(or_payload),
                 timeout=30,
             )
             resp.raise_for_status()

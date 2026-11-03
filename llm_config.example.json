@@ -30,7 +30,7 @@
       "_note": "Split from report_pass1 (issue #59) so tuning the main report stage can't silently change this unrelated PM calibration judgement call's budget/model. Defaults mirror report_pass1 for now — same real-data validation.",
       "gateway": "openrouter",
       "model": "google/gemma-4-31b-it",
-      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
+      "providers": {"order": ["Crusoe", "Novita"], "allow_fallbacks": true, "quantizations": ["bf16", "fp8"], "max_price": {"prompt": 0.3, "completion": 0.6}},
       "max_tokens": 4000,
       "temperature": 0.2,
       "fallback_model": "google/gemini-3.1-flash-lite"
@@ -50,7 +50,7 @@
       "_note": "Split out of report_pass2 (issue #60) so report_pass2's report_md — the largest payload in this project — no longer has to be escaped into a JSON string that a truncation mid-string would destroy wholesale. google/gemma-4-31b-it verified 9/9 across 3 real adversarial test batches (exact reproduction of the real 2026-08-03 PM SAS候选证据日志.md ground truth, correct holdings-only gating, correct rejection of generic-beat/scheduled-sale traps).",
       "gateway": "openrouter",
       "model": "google/gemma-4-31b-it",
-      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
+      "providers": {"order": ["Crusoe", "Novita"], "allow_fallbacks": true, "quantizations": ["bf16", "fp8"], "max_price": {"prompt": 0.3, "completion": 0.6}},
       "max_tokens": 800,
       "temperature": 0.0,
       "fallback_model": "google/gemini-3.1-flash-lite"
@@ -66,7 +66,7 @@
       "_note": "Not deepseek-v4-flash: at temperature=0, 3 real reps of the identical simple command produced 3 different broken outcomes (hallucinated action, full truncation, mid-JSON truncation) — see llm_config.py DEFAULTS comment for the full writeup. gemma-4-31b-it reproduced clean on every rep across 5 command types.",
       "gateway": "openrouter",
       "model": "google/gemma-4-31b-it",
-      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
+      "providers": {"order": ["Crusoe", "Novita"], "allow_fallbacks": true, "quantizations": ["bf16", "fp8"], "max_price": {"prompt": 0.3, "completion": 0.6}},
       "max_tokens": 600,
       "temperature": 0.0,
       "fallback_model": "google/gemini-3.1-flash-lite"
@@ -75,7 +75,7 @@
       "_note": "Throwaway yes/no judgement on a 60-token budget — not deepseek-v4-flash, it burns the whole budget on hidden reasoning here even with no thinking key sent (verified live, issue #53/#11); gemma-4-31b-it reproduces clean.",
       "gateway": "openrouter",
       "model": "google/gemma-4-31b-it",
-      "providers": {"order": ["OpenInference"], "allow_fallbacks": true},
+      "providers": {"order": ["Crusoe", "Novita"], "allow_fallbacks": true, "quantizations": ["bf16", "fp8"], "max_price": {"prompt": 0.3, "completion": 0.6}},
       "max_tokens": 60,
       "temperature": 0.1,
       "fallback_model": null

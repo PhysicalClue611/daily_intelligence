@@ -78,7 +78,34 @@ KNOWN_GATEWAYS = {"openrouter"}
 # with no explicit pin — OpenInference standardized on as the preferred
 # provider for consistency, allow_fallbacks=true so a real outage still
 # degrades to another provider rather than failing the call outright.
-_GEMMA_PROVIDERS = {"order": ["OpenInference"], "allow_fallbacks": True}
+#
+# 2026-11-03 (owner OpenRouter rule: 8-bit+ precision, no data collection, sane
+# price): OpenInference is no longer listed in
+# GET /api/v1/models/google/gemma-4-31b-it/endpoints, and production calls had
+# been landing on DeepInfra/Friendli/Crusoe, which can include fp4 or
+# "unknown"-precision endpoints. Prefer the listed bf16 endpoints, allow
+# fallback only within bf16/fp8 under a price cap (USD per M tokens) that
+# excludes the 0.75/1.00 tier. data_collection=deny is added to every request
+# by enforce_policy() below, not stored here.
+_GEMMA_MAX_PRICE = {"prompt": 0.3, "completion": 0.6}
+_GEMMA_PROVIDERS = {
+    "order": ["Crusoe", "Novita"],
+    "allow_fallbacks": True,
+    "quantizations": ["bf16", "fp8"],
+    "max_price": _GEMMA_MAX_PRICE,
+}
+
+# Owner rule 2026-11-03: every OpenRouter request must carry this, including
+# fallback requests that otherwise send no provider block.
+DATA_POLICY = {"data_collection": "deny"}
+
+
+def enforce_policy(payload: dict) -> dict:
+    """Return a copy of an OpenRouter request body with data_collection=deny
+    merged into its provider block (created if absent). Every httpx.post to
+    OpenRouter in scripts/ must send json=llm_config.enforce_policy(...);
+    test_or_policy.py checks that statically."""
+    return {**payload, "provider": {**(payload.get("provider") or {}), **DATA_POLICY}}
 
 DEFAULTS: dict[str, dict] = {
     # ── Report pipeline (run_finance.py / calibration.py via llm_client.py) ──
