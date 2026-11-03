@@ -211,7 +211,7 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                 "Content-Type": "application/json",
                 **OR_ATTRIBUTION_HEADERS,
             },
-            json={
+            json=llm_config.enforce_policy({
                 "model": model,
                 **({"provider": providers} if providers else {}),
                 "messages": [
@@ -226,7 +226,7 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                    else {"temperature": cfg["temperature"]}),
                 **({"thinking": thinking_cfg} if thinking_cfg else {}),
                 **({"reasoning": reasoning} if reasoning else {}),
-            },
+            }),
             timeout=_http_timeout(max_tokens),
         )
         resp.raise_for_status()
@@ -390,7 +390,7 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
             OR_BASE_URL,
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
                      "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
-            json={
+            json=llm_config.enforce_policy({
                 "model": fallback_model,
                 "service_tier": "flex",
                 "messages": [
@@ -399,7 +399,7 @@ def call_llm(prompt: str, system_prompt: str, max_retries: int = 2,
                 ],
                 "max_tokens": max_tokens,
                 "temperature": cfg["temperature"],
-            },
+            }),
             timeout=_http_timeout(max_tokens),
         )
         resp.raise_for_status()

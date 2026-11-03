@@ -52,6 +52,7 @@ from pathlib import Path
 import httpx
 from llm_json_utils import parse_llm_json
 
+import llm_config
 import run_finance as rf
 import fetch_prices as fp
 import sec_edgar_utils as seu
@@ -374,7 +375,7 @@ def _call_sas_review_llm(system_prompt: str, user_prompt: str, max_retries: int 
                     "Content-Type": "application/json",
                     **rf.OR_ATTRIBUTION_HEADERS,
                 },
-                json={
+                json=llm_config.enforce_policy({
                     "model": SAS_REVIEW_MODEL,
                     "messages": [
                         {"role": "system", "content": system_prompt},
@@ -382,7 +383,7 @@ def _call_sas_review_llm(system_prompt: str, user_prompt: str, max_retries: int 
                     ],
                     "max_tokens": 4000,
                     "temperature": 0.2,
-                },
+                }),
                 timeout=180,
             )
             resp.raise_for_status()

@@ -90,7 +90,8 @@ def test_primary_payload_has_reasoning_enabled():
     assert "thinking" not in captured           # DeepSeek-only param, not sent for this model
     assert captured["reasoning"] == {"effort": "high"}
     assert captured["max_tokens"] == 16000, captured["max_tokens"]
-    assert captured["provider"] == {"order": ["OpenAI"], "allow_fallbacks": False}
+    assert captured["provider"] == {"order": ["OpenAI"], "allow_fallbacks": False,
+                                    "data_collection": "deny"}
     # Reasoning latency: a 120s timeout would push most calls to the fallback.
     assert captured["_timeout"] == 180
 
@@ -199,7 +200,8 @@ def test_fallback_uses_configured_model_with_reasoning_effort():
     assert fb["reasoning"] == {"effort": "medium"}
     assert fb["max_tokens"] == 8000          # fallback_max_tokens, not the primary's 16000
     assert "thinking" not in fb              # thinking is a DeepSeek-side param
-    assert "provider" not in fb              # no provider pin on the fallback
+    # no provider pin on the fallback, but the 2026-11-03 data policy still applies
+    assert fb["provider"] == {"data_collection": "deny"}
     assert len(calls) == 4                   # 3 primary attempts, then fallback
 
 

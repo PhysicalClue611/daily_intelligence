@@ -567,7 +567,8 @@ def test_call_llm_sends_reasoning_param_for_report_pass2_parse_json_false():
     assert captured["model"] == "openai/gpt-6-luna"
     assert captured["reasoning"] == {"effort": "xhigh"}
     assert "thinking" not in captured
-    assert captured["provider"] == {"order": ["OpenAI"], "allow_fallbacks": False}
+    assert captured["provider"] == {"order": ["OpenAI"], "allow_fallbacks": False,
+                                    "data_collection": "deny"}
     assert "temperature" not in captured
 
 

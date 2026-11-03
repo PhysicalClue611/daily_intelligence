@@ -528,7 +528,7 @@ def _openrouter_post(payload: dict, timeout: int = 30, max_retries: int = 2):
             resp = httpx.post(
                 OR_BASE_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", **OR_ATTRIBUTION_HEADERS},
-                json=payload,
+                json=llm_config.enforce_policy(payload),
                 timeout=timeout,
             )
             resp.raise_for_status()
@@ -566,7 +566,7 @@ def _deepseek_post(payload: dict, timeout: int = 30, max_retries: int = 2,
                 OR_BASE_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
                          "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
-                json=payload,
+                json=llm_config.enforce_policy(payload),
                 timeout=timeout,
             )
             resp.raise_for_status()
@@ -595,7 +595,7 @@ def _deepseek_post(payload: dict, timeout: int = 30, max_retries: int = 2,
             OR_BASE_URL,
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
                      "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
-            json=or_payload,
+            json=llm_config.enforce_policy(or_payload),
             timeout=120,
         )
         resp.raise_for_status()
@@ -951,13 +951,13 @@ def _detect_research_gap(question_intent: str, queries: list[str], brief: str) -
         resp = httpx.post(
             OR_BASE_URL,
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
-            json={
+            json=llm_config.enforce_policy({
                 "model": gap_cfg["model"],
                 **({"provider": gap_cfg["providers"]} if gap_cfg["providers"] else {}),
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": gap_cfg["max_tokens"],
                 "temperature": gap_cfg["temperature"],
-            },
+            }),
             timeout=15,
         )
         resp.raise_for_status()
@@ -1555,13 +1555,13 @@ def _followup_reason(messages: list[dict]) -> tuple[str, str]:
                 OR_BASE_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
                          "Content-Type": "application/json", **OR_ATTRIBUTION_HEADERS},
-                json={"model": fu_cfg["model"],
+                json=llm_config.enforce_policy({"model": fu_cfg["model"],
                       **({"provider": fu_cfg["providers"]} if fu_cfg["providers"] else {}),
                       "messages": messages,
                       "max_tokens": fu_cfg["max_tokens"],
                       "temperature": fu_cfg["temperature"],
                       **({"thinking": fu_cfg["thinking"]} if fu_cfg.get("thinking") else {}),
-                      **({"reasoning": fu_cfg["reasoning"]} if fu_cfg.get("reasoning") else {})},
+                      **({"reasoning": fu_cfg["reasoning"]} if fu_cfg.get("reasoning") else {})}),
                 # 180s, not the pre-thinking 120s: reasoning tokens are generated
                 # before the first visible token, so a timeout tuned for
                 # no-thinking latency would push every call to the fallback.
