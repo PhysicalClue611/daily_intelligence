@@ -72,13 +72,7 @@ CONFIG_PATH = Path(os.getenv("DAILY_INTEL_LLM_CONFIG", str(_PROJ_DIR / "llm_conf
 # confusing HTTP error at call time.
 KNOWN_GATEWAYS = {"openrouter"}
 
-# google/gemma-4-31b-it routing on OpenRouter (issue #60). Real calls across
-# this project's gemma stages have been observed landing on several different
-# providers (Friendli, Crusoe, Novita, OpenInference, OpenInference-bf16...)
-# with no explicit pin — OpenInference standardized on as the preferred
-# provider for consistency, allow_fallbacks=true so a real outage still
-# degrades to another provider rather than failing the call outright.
-#
+# google/gemma-4-31b-it previously preferred OpenInference (issue #60).
 # 2026-11-03 (owner OpenRouter rule: 8-bit+ precision, no data collection, sane
 # price): OpenInference is no longer listed in
 # GET /api/v1/models/google/gemma-4-31b-it/endpoints, and production calls had
