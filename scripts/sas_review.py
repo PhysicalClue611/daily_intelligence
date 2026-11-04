@@ -54,6 +54,7 @@ from llm_json_utils import parse_llm_json
 
 import llm_config
 import run_finance as rf
+import intel_sources
 import fetch_prices as fp
 import sec_edgar_utils as seu
 from finance_email import send_report
@@ -531,7 +532,7 @@ def run_ticker_review(ticker: str, trigger_reason: str) -> bool:
         if risk_diff else "（无法获取两期可对比的10-K risk factors）"
     )
     candidate_text = _load_candidate_entries(ticker) or "（候选证据日志无该标的记录）"
-    news_text = rf.fetch_finnhub_news([ticker], hours=FINNHUB_NEWS_LOOKBACK_HOURS) or "（无 Finnhub 新闻）"
+    news_text = intel_sources.fetch_finnhub_news([ticker], hours=FINNHUB_NEWS_LOOKBACK_HOURS) or "（无 Finnhub 新闻）"
     tavily_text = _fetch_tavily_context(ticker, manual=trigger_reason == "手工指定") or "（无 Tavily 搜索结果）"
     personal_context = rf._load_personal_context()
     rubric = _load_sas_rubric() or "（无法读取 Manual 第7节，检查文件路径）"
