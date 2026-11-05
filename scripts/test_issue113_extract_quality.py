@@ -11,7 +11,8 @@ from intel_deepen import clean_body, body_acceptable, quiet_candidates, deepen_i
 from intel_render import render_intel_snapshot_context
 from run_finance import USER_PROMPT_TEMPLATE_P2
 
-ROOT = next(p for p in Path(__file__).resolve().parents if (p / "archives/202609/2026-09-25-pm-intel-snapshot.json").exists())
+# Frozen copies of runtime snapshots (issue #127); the root archives/ is gitignored.
+FIXTURE_ARCHIVES = Path(__file__).resolve().parent / "fixtures" / "archives"
 
 
 def test_history_and_selection():
@@ -88,7 +89,7 @@ def test_dedup_search_and_order():
 
 
 def test_quality_calibration():
-    snap = json.loads((ROOT / "archives/202609/2026-09-25-pm-intel-snapshot.json").read_text())
+    snap = json.loads((FIXTURE_ARCHIVES / "202609/2026-09-25-pm-intel-snapshot.json").read_text())
     rows = [(x["url"], x["text"]) for e in snap["entities"] for x in e.get("fulltext", [])]
     rows += [(x["url"], x["text"]) for x in snap["macro_digest"].get("fulltext", [])]
     assert len(rows) == 20
