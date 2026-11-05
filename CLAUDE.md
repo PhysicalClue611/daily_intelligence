@@ -7,7 +7,7 @@
 **按需查阅的详细文件**（2026-09-25 做 context trim 时从本文件迁出，内容一字未删）：
 - `docs/playbooks/status_history.md` — 2026-05 至 09 各次「当前系统状态」段（每个 issue/PR 的实现细节、review 记录、生产验证），以及 #87 两个 PR 的完整说明
 - `docs/playbooks/reference_legacy.md` — 旧目录结构、旧 TG 追问流水线、月度报告格式、与 Hermes MI 的隔离边界、RSS 源表、已结束的观察项、待实现功能（A 股行情 / Parallel 降级 / Serper）、设计决策备忘
-- `docs/PITFALLS.md` — 踩坑索引（1–96）加详情
+- `docs/PITFALLS.md` — 踩坑索引（1–98）加详情
 - `docs/playbooks/github_issue_format.md` — issue 五段式格式规范
 - `docs/design.md` — 设计文档，Obsidian `Daily_Intel设计文档.md` 去掉 frontmatter 的逐字副本（agent 读这份）
 - `docs/playbooks/design_legacy_20260925.md` — 2026-09-25 之前的长篇设计文档（含逐次变更记录），只供溯源
@@ -179,7 +179,7 @@ OBSIDIAN_PATH="~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview
 
 ## 踩过的坑
 
-*索引（1–96）和详情都在 `docs/PITFALLS.md`。新增踩坑时，一行索引和详情都写进该文件，不要再加进本文件。*
+*索引（1–98）和详情都在 `docs/PITFALLS.md`。新增踩坑时，一行索引和详情都写进该文件，不要再加进本文件。*
 
 ---
 
@@ -199,3 +199,5 @@ OBSIDIAN_PATH="~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Paperview
 27. **issue #113（PR #115，`66e1ff4`，已合并；观察中）**：
     - 原 R1（扩大每只标的的链接数）已拆到 #114，暂缓。**写 #114 的 handoff 或动手实现前，必须先问 owner 要结论。**
     - R2–R11 已合并：跨运行 URL 去重、新闻量基线至少 5 份、manual 记账文件 gitignore、状态与宏观正文修复；Extract 按标的或话题写 query，3 个 chunk、每条最多 2000 字；付费墙名单和 Yahoo 导航清洗；安静个股搜索与日期过滤；正文质量门槛；近一周与当日走势相关的旧事件可分析；已抓到正文的公司级实质事件必须写入。测试脚本全过，免费回放 22/24；未跑新的生产报告。观察 `extract_dedup_skipped`、`extract_rejected_count`、Pass 2 token 与 SPCX NASA 合同是否实际写入。
+28. **2026-11-04 已合并**：#125 / PR #126（`27e7ab5`）按 AM 点名标的挑选校准证据，总上限 40000 字符；缺报道的 miss 使用 null 类型。#127 / PR #128（`7ad42ca`）冻结五份测试快照到 `scripts/fixtures/archives/`，真实校准为 10 个正例、5 个负例；运行时代码不读写 fixture。
+    - 两个函数式脚本必须单独执行，discover 不运行其普通函数；快照覆盖与 discover 漏测见 `docs/PITFALLS.md` #97/#98。没有扩大链接数、修改生产质量阈值或改变 discover。

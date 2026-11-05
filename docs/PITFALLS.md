@@ -101,6 +101,8 @@
 94. 「必须解释的 ticker」若在围栏、keyword bonus、Extract query 各拼一次，新增一类 ticker 会漏改 → 详见 `docs/PITFALLS.md#94`
 95. `call_llm()` 免 JSON 路径只拒绝空正文、接受 length 截断的非空正文；推理提档（xhigh）而 `max_tokens` 不跟着加，残缺报告被当成功发出；`max_tokens` 翻倍时 HTTP 超时也要放宽 → 详见 `docs/PITFALLS.md#95`
 96. 新来源只用回放验收，而回放会跳过该来源：Yahoo 按个股 RSS 上线后一条没取到（404/429），也没人发现 → 详见 `docs/PITFALLS.md#96`
+97. 同日同档快照被重跑覆盖，测试依赖的原始正文丢失 → 详见 `docs/PITFALLS.md#97`
+98. unittest discover 导入函数式测试脚本但不执行普通测试函数，门禁绿灯掩盖失败 → 详见 `docs/PITFALLS.md#98`
 
 ---
 
@@ -546,6 +548,18 @@ httpx 0.28 顶层 `httpx.post()` 内部已是 `with Client(...)`，**不是忘�
 **修复**：#111 改用 `yfinance.Ticker(t).get_news()`，用真实请求验证过 INTC/NVDA/AMKR。
 
 **教训**：回放、mock 或任何「跳过该来源」的验收路径，都不能证明新来源可用。接入新数据源时，至少要在宿主机上用真实请求跑一次，并把条数写进 PR。合并后的第一次生产运行，要看运行状态消息里的「来源错误」行，不能只看报告有没有发出去。
+
+---
+
+### 97. 同日同档快照被重跑覆盖，测试原始正文丢失
+（2026-11-04 排查 #127 / PR #128）`archives/` 是运行时目录，同日同档重跑会覆盖原快照。09-25 PM 的原 20 条正文在测试提交后被 22:26 ET 重跑替换，只剩 10 条经过质量过滤的正文；`test_quality_calibration` 的 20 条断言因而失败。没有找到仍含全部旧正文的现存快照。
+
+**修复**：将既定五份快照原样冻结到 `scripts/fixtures/archives/`，两个测试脚本及 eval 改为只读 fixture。质量校准保留 10 个现存真实正文正例和 3 个历史 Yahoo 导航负例，再用同 Tavily Extract 接口取得真实 FP 付费墙、MarketWatch 版权页各 1 个负例；逐条断言，新抓响应记录来源并保留原文。没有恢复历史原文，也没有修改生产质量规则。`evaluate_issue113.py` 的 SPCX 缺段 `IndexError` 在基线已存在，本 PR 未修，不应声称完整 eval 通过。
+
+### 98. unittest discover 不执行普通函数式测试
+（2026-11-04 排查 #127 / PR #128）`scripts/test_issue111_quiet_deepen.py`、`scripts/test_issue113_extract_quality.py` 使用普通 `test_*` 函数，由 `__main__` 顺序调用；`unittest discover` 仅导入模块，不会执行这些普通函数。因此先前门禁的 71 项 OK 没有覆盖 #113 的失败。
+
+**本次验证方式**：discover 之外，分别用项目 Python 执行这两个脚本，并将 Obsidian 路径指向临时目录。没有删除或跳过测试，也没有修改 discover 执行机制；不能把 discover 的计数当成函数式探针已经运行的证据。
 
 ---
 
