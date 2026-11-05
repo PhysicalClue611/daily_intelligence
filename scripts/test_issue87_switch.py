@@ -103,7 +103,7 @@ class SwitchTest(unittest.TestCase):
                 stack.enter_context(patch.object(rf, name, return_value=value))
             stack.enter_context(patch.object(rf, "deepen_intel_snapshot", side_effect=lambda intel_snapshot, **_: intel_snapshot))
             stack.enter_context(patch.object(rf, "call_llm", side_effect=fake_llm))
-            stack.enter_context(patch.object(rf, "evaluate_am_calibration", side_effect=lambda *args: args[-1]))
+            stack.enter_context(patch.object(rf, "evaluate_am_calibration", side_effect=lambda *args, **_: args[-1]))
             stack.enter_context(patch.object(rf, "write_report", side_effect=lambda *args: written.append(args[2])))
             stack.enter_context(patch.object(rf, "send_telegram_alert", side_effect=lambda text: alerts.append(text)))
             rf._main_body()

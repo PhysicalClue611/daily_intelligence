@@ -1117,7 +1117,7 @@ def _main_body():
         report_md = re.sub(r"^# \[Daily_Intel\] .+", f"# [Daily_Intel] {today_et} {slot_label}",
                            report_md, flags=re.MULTILINE)
     report_md = evaluate_am_calibration(
-        today_et, run_slot, price_table, intel_snapshot_section, sonar_macro_section, report_md
+        today_et, run_slot, price_table, intel_snapshot_section, sonar_macro_section, report_md, watchlist_tickers=wl["stocks"]
     )
     write_report(today_et, slot_label, report_md, budget)
     if pass2_succeeded:

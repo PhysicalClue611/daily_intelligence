@@ -74,6 +74,10 @@ CALIBRATION_BACKUP_PATH = _PROJ_DIR / "backups" / "预判校准记录_backup.md"
 # CLAUDE.md — 'a' mode only, never 'w').
 CALIBRATION_METRICS_PATH = _PROJ_DIR / "finance_calibration_log.jsonl"
 
+_EVIDENCE_PER_TICKER_CHARS = 8000
+_EVIDENCE_SONAR_CHARS = 3000
+_EVIDENCE_TOTAL_CHARS = 24000
+
 _MISS_TYPES = ("framework_falsified", "threshold_miscalibrated")
 
 _CALIBRATION_SYSTEM_PROMPT = (
@@ -102,6 +106,46 @@ def _extract_verifiable_signals(am_section_text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def _calibration_evidence_selection(signals_text: str, intel_snapshot_section: str,
+                                    watchlist_tickers: list[str]) -> tuple[dict[str, str], list[str], list[str], str]:
+    """Locate rendered sections and tickers in first signal occurrence order."""
+    headers = list(re.compile(r"^### ([A-Z0-9.\-]+)（", re.MULTILINE).finditer(intel_snapshot_section))
+    boundaries = list(re.finditer(r"^## 宏观与地缘线索$|^无异动观察标的：", intel_snapshot_section, re.MULTILINE))
+    sections = {}
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(intel_snapshot_section)
+        end = min([end] + [m.start() for m in boundaries if m.start() > header.start()])
+        sections[header.group(1)] = intel_snapshot_section[header.start():end]
+    positions = {}
+    for ticker in dict.fromkeys([*sections, *watchlist_tickers]):
+        match = re.search(rf"(?<![A-Za-z0-9]){re.escape(ticker)}(?![A-Za-z0-9])", signals_text)
+        if match:
+            positions[ticker] = match.start()
+    named = sorted(positions, key=positions.get)
+    missing = [ticker for ticker in named if ticker not in sections]
+    macro_match = re.search(r"^## 宏观与地缘线索$", intel_snapshot_section, re.MULTILINE)
+    macro = intel_snapshot_section[macro_match.start():] if macro_match else ""
+    return sections, named, missing, macro
+
+
+def _build_calibration_evidence(signals_text: str, intel_snapshot_section: str,
+                                sonar_macro_section: str, watchlist_tickers: list[str]) -> str:
+    """Select named ticker evidence before macro context, within character caps."""
+    sections, named, missing, macro = _calibration_evidence_selection(
+        signals_text, intel_snapshot_section, watchlist_tickers
+    )
+    parts = []
+    if missing:
+        parts.append("以下被点名标的在今日情报快照中无条目：" + "、".join(missing))
+    parts.extend(sections[ticker][:_EVIDENCE_PER_TICKER_CHARS]
+                 for ticker in named if ticker in sections)
+    if sonar_macro_section:
+        parts.append("## Sonar 宏观\n" + sonar_macro_section[:_EVIDENCE_SONAR_CHARS])
+    if macro:
+        parts.append(macro)
+    return "\n".join(parts)[:_EVIDENCE_TOTAL_CHARS]
+
+
 def _evaluate_am_predictions(signals_text: str, price_table: str, news_context: str, date_str: str) -> dict:
     """Single cheap LLM call: judge each AM 'verifiable signal' against today's
     actual outcome data. Returns {} on any failure or empty input (fail-open).
@@ -118,11 +162,14 @@ def _evaluate_am_predictions(signals_text: str, price_table: str, news_context: 
 ## 价格数据
 {price_table}
 
-## 新闻/宏观上下文（节选）
-{news_context[:3000]}
+## 情报证据（按断言点名的标的挑选）
+{news_context}
 
 任务：
 1. 对清单中每一条，判断 hit（命中）/ miss（未命中）/ inconclusive（无法判断），给一句话理由。
+   - 条件型断言：条件成立判 hit，不成立判 miss。
+   - 事件型条件（某公告、披露、业绩是否发生）：该标的证据段落中有相关报道就据此判定；有段落但未见相关报道，视为条件不成立，判 miss，reasoning 以"所给来源内未见"开头。
+   - 只有该标的被列为"无条目"、且无法凭价格表判定时，才判 inconclusive。
 2. 对每一条额外标注 resolvable_from_eod_data（true/false）：该条判断能否仅凭今日收盘价/成交量/汇率/收益率等
    已有数据判定，不需要额外的新闻/事件内容确认。若判断结果依赖"某新闻是否发生/某证词说了什么"这类无法从
    价格表直接读出的信息，则为 false。
@@ -494,7 +541,7 @@ def _load_recent_calibration_notes(max_entries: int = 5, max_chars: int = 1200) 
 
 def evaluate_am_calibration(today_et: str, run_slot: str, price_table: str,
                             finnhub_news_section: str, sonar_macro_section: str,
-                            report_md: str) -> str:
+                            report_md: str, *, watchlist_tickers: list[str] | None = None) -> str:
     """Top-level entry point for the calibration step — PM slot only. Returns
     report_md unchanged, or with a '## 预判校验' section appended if the
     evaluation judged today's result worth surfacing. Fully fail-open: any
@@ -513,7 +560,13 @@ def evaluate_am_calibration(today_et: str, run_slot: str, price_table: str,
             logger.info("No '可验证信号' section found in today's AM report, skipping calibration")
             return report_md
 
-        news_context = "\n".join(filter(None, [finnhub_news_section, sonar_macro_section]))
+        news_context = _build_calibration_evidence(
+            signals_text, finnhub_news_section, sonar_macro_section, watchlist_tickers or []
+        )
+        _, named, missing, _ = _calibration_evidence_selection(
+            signals_text, finnhub_news_section, watchlist_tickers or []
+        )
+        logger.info("Calibration evidence: tickers=%s missing=%s chars=%d", named, missing, len(news_context))
         evaluation = _evaluate_am_predictions(signals_text, price_table, news_context, today_et)
         knowledge_entry = evaluation.get("knowledge_entry", "")
         verdicts = evaluation.get("verdicts", [])
