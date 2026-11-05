@@ -1,0 +1,49 @@
+{
+  "description": "Real replacement quality-calibration samples captured via Tavily Extract on 2026-11-04 ET. Selected results are unmodified; these are not recovered 2026-09-25 bodies. No API key is stored. Tests apply the production 2000-character cap before cleaning.",
+  "samples": [
+    {
+      "id": "foreignpolicy_paywall",
+      "fetched_at": "2026-11-05T03:07:05.398745+00:00",
+      "endpoint": "https://api.tavily.com/extract",
+      "request": {
+        "urls": [
+          "https://foreignpolicy.com/2026/09/25/ethiopia-tigray-tplf-civil-war-abiy-amhara-afar-eritrea/",
+          "https://foreignpolicy.com/2026/09/25/russia-putin-authoritarianism-language-vocabulary/",
+          "https://www.marketwatch.com/story/microsofts-stock-has-roared-back-to-life-and-is-now-headed-for-its-highest-close-of-the-year-89e4d596?mod=mw_rss_topstories",
+          "https://www.marketwatch.com/story/apples-expensive-new-iphones-could-be-a-double-edged-sword-for-the-company-21c4fefb?mod=mw_rss_topstories",
+          "https://finance.yahoo.com/technology/ai/articles/intel-shares-rise-agentic-ai-173452687.html"
+        ],
+        "query": "financial company event evidence",
+        "chunks_per_source": 2
+      },
+      "result": {
+        "url": "https://foreignpolicy.com/2026/09/25/russia-putin-authoritarianism-language-vocabulary/",
+        "title": "Book Excerpt: The Words Russians Use to Describe Life Under Authoritarianism",
+        "raw_content": "## FP Analytics\n\n## Events\n\n### FP @ Davos 2027\n\n### FP @ MSC 2027\n\n### Emerging Threats Forum\n\nFollow FP on X\n\nFollow FP on LinkedIn\n\nFollow FP on Instagram\n\nFollow FP on Facebook\n\n## FP SOLUTIONS\n\n## Subscription Services\n\n## EDUCATION\n\n## ABOUT FP\n\nFollow FP on X\n\nFollow FP on LinkedIn\n\nFollow FP on Instagram\n\nFollow FP on Facebook\n\nForeign Policy Magazine is a division of Graham Holdings Company. All contents (c) 2026, Foreign Policy LLC, a unit of Graham Digital Holding Company. All rights reserved. Foreign Policy, 1099 14th St NW, Suite 500 East, Washington, D.C., 20005.\n\n# 6 Russian Words for a Country Sliding Into Authoritarianism\n\n## How ordinary people describe power, repression, absurdity, and life under Putin. [...] This article is an Insider exclusive.\n\nContact us at (/cdn-cgi/l/email-protection#cdbeb8bdbda2bfb98daba2bfa8a4aaa3bda2a1a4aeb4e3aea2a0f2beb8afa7a8aeb9f08b9ded84a3bea4a9a8bfed98bdaabfaca9a8ed84a3bcb8a4bfb4) to learn about upgrade options, unlocking the ability to gift this article.\n\n## Topics\n\n## Regions\n\n## FP Live\n\n### What the Midterms Mean for U.S. Foreign Policy\n\n## Video\n\n## Podcasts\n\nIllustration with Adam Tooze headshot on a green background with the text Ones & Tooze\n\n### Ones and Tooze\n\nIllustration with a male spy headshot and the text I Spy\n\n### I Spy\n\nFP Live podcast logo\n\n### Foreign Policy Live\n\n## Magazine\n\nFall 2026 print magazine cover image\n\n## Fall 2026 print Issue\n\nPrint Archive\n\nSee All\n\n## Collections\n\n## FP Analytics\n\n## Events\n\n### FP @ Davos 2027",
+        "images": []
+      }
+    },
+    {
+      "id": "marketwatch_copyright",
+      "fetched_at": "2026-11-05T03:07:40.131535+00:00",
+      "endpoint": "https://api.tavily.com/extract",
+      "request": {
+        "urls": [
+          "https://www.marketwatch.com/story/micron-investors-should-get-ready-for-a-seesaw-ride-analyst-says-1c0cc651",
+          "https://www.marketwatch.com/story/a-death-cross-is-coming-for-the-dollar-why-trump-will-be-happy-0766303d",
+          "https://www.marketwatch.com/story/why-spacexs-stock-is-surging-and-lifting-the-broader-ai-universe-along-with-it-0cd62f39",
+          "https://www.marketwatch.com/story/spacex-reportedly-is-looking-to-raise-as-much-money-as-the-company-generates-in-revenue-to-buy-nvidia-chips-01ca6d82",
+          "https://www.marketwatch.com/"
+        ],
+        "query": "financial company event evidence",
+        "chunks_per_source": 3
+      },
+      "result": {
+        "url": "https://www.marketwatch.com/story/a-death-cross-is-coming-for-the-dollar-why-trump-will-be-happy-0766303d",
+        "title": "A ‘death cross’ is coming for the dollar. Why Trump will be happy.",
+        "raw_content": "Columns\n\nNo results found\n\nDJIA 51770.31 -1.09%\n\nS&P 500 7580.07 -1.82%\n\nNasdaq 25437.00 -2.86%\n\nVIX 19.42 12.91%\n\nU.S. 10 Yr 4.934%\n\nCrude Oil 102.95 0.93%\n\nGold 3884.90 -3.63%\n\nBitcoin 77298.69 0.69%\n\n1.   Home\n\n3.   Markets\n\n5.   U.S. & Canada\n\n7.   Market Extra\n\n## Market Extra\n\n# A ‘death cross’ is coming for the dollar. Why Trump will be happy.\n\n## The moving-average crossover to the downside isn’t the only chart signal to suggest the uptrend is reversing — and that government intervention may have actually worked\n\nBy Tomi Kilgore\n\nUpdated Sept. 27, 2026, 3:21 p.m. ET\n\nShare\n\nAdd us on Google\n\nChoose MarketWatch as a preferred source of financial news\n\nResize\n\n13\n\n  \n\n(2 min)\n\nImage 2: A clear skull filled with one-dollar bills, against a black background. [...] Image 1: MarketWatch Logo\n\nA ‘death cross’ is coming for the dollar. Why Trump will be happy.\n\nShare\n\nAdd us on Google\n\nChoose MarketWatch as a preferred source of financial news\n\nResize\n\n13\n\n  \n\n(2 min)\n\nSkip to main content\n\nExplore Our Brands\n\n   WSJ\n   \n  \n\n   Barron's\n   \n  \n\n   MarketWatch\n   \n  \n\n   IBD\n   \n  \n\n   \n\n   Investing\n   Personal Finance\n   RetirementEconomy \n\n   Watchlist\n\n### Account Settings\n\n   Log In\n   Sign Up\n\n### Here’s where the smart money is moving after the market's front runners stumbled\n\nSite Search Clear SEARCH\n\nAdvanced Search➔\n\nSearch Results\n\nSymbols\n\nNo results found\n\n   All News\n   Articles\n   Video\n   Podcasts\n\n0 Results\n\nNo Results Found\n\nAuthors\n\nNo results found\n\nSections\n\nNo results found\n\nColumns\n\nNo results found\n\nDJIA 51770.31 -1.09% [...] About the Author\n\nImage 8: Tomi Kilgore\n\nTomi Kilgore\n\n\n\n\n\nAdvertisement\n\nAdvertisement\n\nBACK TO TOP\n\nA Dow Jones Company\n\nCopyright © 2026 MarketWatch, Inc. All rights reserved.\n\nTerms of UsePrivacy NoticeCookie NoticeArchive\n\n[](\n\n##### Marketwatch\n\n   Live Coverage\n   Customer Center\n   Contact Us\n   Newsletters\n   Newsroom Roster\n   Virtual Stock Exchange\n   MarketWatch Guides\n   Copyright Policy\n   Manage Notifications\n   Cancel My Subscription\n\n##### Company\n\n   Dow Jones\n   Code of Conduct\n   Corrections\n   Reprints & Licensing\n   Digital Self Service\n   Your Ad Choices\n   Corporate Subscriptions\n   Accessibility\n\n##### Dow Jones Network",
+        "images": []
+      }
+    }
+  ]
+}
