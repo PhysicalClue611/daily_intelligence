@@ -13,8 +13,8 @@ from intel_render import render_intel_snapshot_context
 from recent_coverage import recent_fresh_counts, recent_extracted_urls
 from run_finance import load_watchlist, USER_PROMPT_TEMPLATE_P2
 
-ROOT = next(p for p in Path(__file__).resolve().parents if (p / "archives/202609/2026-09-25-pm-intel-snapshot.json").exists())
-ARCHIVES = ROOT / "archives"
+# Frozen copies of runtime snapshots (issue #127); the root archives/ is gitignored.
+ARCHIVES = Path(__file__).resolve().parents[1] / "fixtures" / "archives"
 DATES = [("2026-09-24", "am"), ("2026-09-24", "pm"),
          ("2026-09-25", "am"), ("2026-09-25", "pm")]
 

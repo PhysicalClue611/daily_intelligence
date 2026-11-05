@@ -26,7 +26,7 @@ cik_cache.json
 ibkr/
 
 # Extract archives (large, local-only)
-archives/
+/archives/
 
 # Local backup mirror of personal-data Obsidian files (calibration log etc.)
 backups/

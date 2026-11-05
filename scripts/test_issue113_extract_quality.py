@@ -11,7 +11,8 @@ from intel_deepen import clean_body, body_acceptable, quiet_candidates, deepen_i
 from intel_render import render_intel_snapshot_context
 from run_finance import USER_PROMPT_TEMPLATE_P2
 
-ROOT = next(p for p in Path(__file__).resolve().parents if (p / "archives/202609/2026-09-25-pm-intel-snapshot.json").exists())
+# Frozen copies of runtime snapshots (issue #127); the root archives/ is gitignored.
+FIXTURE_ARCHIVES = Path(__file__).resolve().parent / "fixtures" / "archives"
 
 
 def test_history_and_selection():
@@ -88,19 +89,38 @@ def test_dedup_search_and_order():
 
 
 def test_quality_calibration():
-    snap = json.loads((ROOT / "archives/202609/2026-09-25-pm-intel-snapshot.json").read_text())
+    # The original 20-body snapshot was overwritten by a production rerun.
+    # Keep all ten surviving article bodies as individually checked positives.
+    snap = json.loads((FIXTURE_ARCHIVES / "202609/2026-09-25-pm-intel-snapshot.json").read_text())
     rows = [(x["url"], x["text"]) for e in snap["entities"] for x in e.get("fulltext", [])]
     rows += [(x["url"], x["text"]) for x in snap["macro_digest"].get("fulltext", [])]
-    assert len(rows) == 20
-    assert sum(body_acceptable(clean_body(url, body)) for url, body in rows) >= 9
+    assert len(rows) == 10
     for url, body in rows:
-        accepted = body_acceptable(clean_body(url, body))
-        if (("finance.yahoo.com" in url and "spacex-spcx-wins" not in url) or
-                "foreignpolicy.com" in url or "marketwatch.com" in url):
-            assert not accepted, url
-        if ("spacex-spcx-wins" in url or "qualcomm-rallies" in url or "trump-xi-summit" in url or "saudi-arabia-oil" in url or
-                "stock-market-today-sept-25-tesla" in url):
-            assert accepted, url
+        assert body_acceptable(clean_body(url, body)), url
+
+    # These pre-filter snapshots still contain the original Yahoo navigation.
+    yahoo_rows = []
+    for slot in ("am", "pm"):
+        snap = json.loads((FIXTURE_ARCHIVES / f"202609/2026-09-24-{slot}-intel-snapshot.json").read_text())
+        yahoo_rows += [(x["url"], x["text"]) for e in snap["entities"]
+                       for x in e.get("fulltext", []) if "finance.yahoo.com" in x["url"]]
+    assert {url for url, _ in yahoo_rows} == {
+        "https://finance.yahoo.com/m/daef2f2f-50a0-3aff-9c37-f773d9bf5f56/intel%2C-marvell%2C-super-micro%2C.html",
+        "https://finance.yahoo.com/technology/articles/oracle-named-leader-idc-marketscape-120000993.html",
+        "https://finance.yahoo.com/technology/ai/articles/intel-shares-rise-agentic-ai-173452687.html",
+    }
+    for url, body in yahoo_rows:
+        assert not body_acceptable(clean_body(url, body)), url
+
+    # Real replacement responses, captured via Tavily Extract on 2026-11-04 ET.
+    # Preserve raw_content in the fixture; apply the production 2000-char cap here.
+    captures = json.loads((FIXTURE_ARCHIVES.parent / "extract_quality_captures.json").read_text())
+    assert {sample["id"] for sample in captures["samples"]} == {"foreignpolicy_paywall", "marketwatch_copyright"}
+    assert len(captures["samples"]) == 2
+    for sample in captures["samples"]:
+        result = sample["result"]
+        url, body = result["url"], result["raw_content"][:2000]
+        assert not body_acceptable(clean_body(url, body)), url
 
 
 if __name__ == "__main__":

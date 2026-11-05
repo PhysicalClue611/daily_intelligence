@@ -17,9 +17,8 @@ from run_finance import run_credit_cap
 import budget_trackers as bt
 import run_finance as rf
 
-FIXTURE = next(root / "archives/202609/2026-09-25-am-intel-snapshot.json"
-               for root in Path(__file__).resolve().parents
-               if (root / "archives/202609/2026-09-25-am-intel-snapshot.json").exists())
+# Frozen copy of a runtime snapshot (issue #127); the root archives/ is gitignored.
+FIXTURE = Path(__file__).resolve().parent / "fixtures/archives/202609/2026-09-25-am-intel-snapshot.json"
 
 
 def test_quiet_selection():
