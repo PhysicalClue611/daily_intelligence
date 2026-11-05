@@ -109,6 +109,7 @@ class SwitchTest(unittest.TestCase):
             rf._main_body()
             fail["pass2"] = True
             rf._main_body()
+            self.assertIn("watchlist_tickers", rf.evaluate_am_calibration.call_args.kwargs)
         self.assertEqual(stages, ["report_pass2", "sas_candidate_extract"] * 2)
         self.assertIn("标的事实与来源（供分析）", prompts[0])
         self.assertNotIn("过去24小时新闻（RSS）", prompts[0])

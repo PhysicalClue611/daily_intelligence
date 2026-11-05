@@ -74,9 +74,8 @@ CALIBRATION_BACKUP_PATH = _PROJ_DIR / "backups" / "预判校准记录_backup.md"
 # CLAUDE.md — 'a' mode only, never 'w').
 CALIBRATION_METRICS_PATH = _PROJ_DIR / "finance_calibration_log.jsonl"
 
-_EVIDENCE_PER_TICKER_CHARS = 8000
 _EVIDENCE_SONAR_CHARS = 3000
-_EVIDENCE_TOTAL_CHARS = 24000
+_EVIDENCE_TOTAL_CHARS = 40000
 
 _MISS_TYPES = ("framework_falsified", "threshold_miscalibrated")
 
@@ -137,20 +136,31 @@ def _build_calibration_evidence(signals_text: str, intel_snapshot_section: str,
     parts = []
     if missing:
         parts.append("以下被点名标的在今日情报快照中无条目：" + "、".join(missing))
-    parts.extend(sections[ticker][:_EVIDENCE_PER_TICKER_CHARS]
-                 for ticker in named if ticker in sections)
+    ticker_indices = []
+    for ticker in named:
+        if ticker in sections:
+            ticker_indices.append(len(parts))
+            parts.append(sections[ticker])
     if sonar_macro_section:
         parts.append("## Sonar 宏观\n" + sonar_macro_section[:_EVIDENCE_SONAR_CHARS])
+    trim_order = []
     if macro:
+        trim_order.append(len(parts))
         parts.append(macro)
-    return "\n".join(parts)[:_EVIDENCE_TOTAL_CHARS]
+    trim_order.extend(reversed(ticker_indices))
+    for index in trim_order:
+        excess = len("\n".join(part for part in parts if part)) - _EVIDENCE_TOTAL_CHARS
+        if excess <= 0:
+            break
+        parts[index] = parts[index][:max(0, len(parts[index]) - excess)]
+    return "\n".join(part for part in parts if part)
 
 
 def _evaluate_am_predictions(signals_text: str, price_table: str, news_context: str, date_str: str) -> dict:
     """Single cheap LLM call: judge each AM 'verifiable signal' against today's
     actual outcome data. Returns {} on any failure or empty input (fail-open).
-    Cost: ~$0.0005 (small prompt, google/gemma-4-31b-it via OR, "am_calibration"
-    stage — see llm_config.py, split out from report_pass1 in issue #59)."""
+    The evidence block is capped at 40000 chars. Uses the "am_calibration"
+    stage — see llm_config.py, split out from report_pass1 in issue #59."""
     if not OPENROUTER_API_KEY or not signals_text.strip():
         return {}
     prompt = f"""今日日期：{date_str}
@@ -177,6 +187,7 @@ def _evaluate_am_predictions(signals_text: str, price_table: str, news_context: 
    - "framework_falsified"：预判背后的因果逻辑本身在今天被证明是错的（如"地缘风险应传导至科技股"但实际没传导）
    - "threshold_miscalibrated"：方向/逻辑基本合理，只是具体价位/百分比阈值设得不对（卡在了边界外一点点，
      或波动幅度被低估/高估）
+   - 因所给来源内未见相关报道而判定、reasoning 以"所给来源内未见"开头的 miss，miss_type 设为 null。
    非 miss 的条目该字段留 null。
 4. 写一段"知识条目"（knowledge_entry）——不是简单罗列对错，而是提炼一条对未来分析有参考价值的教训或验证
    （例如某类判断的系统性偏差、某条框架逻辑被验证有效），供未来生成 AM 报告时参考。50-150字。

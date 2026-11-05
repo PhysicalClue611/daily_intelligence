@@ -45,16 +45,39 @@ class CalibrationEvidenceTests(unittest.TestCase):
         evidence = self.build("INTCX XINTC AMDX XAMD **PLTR**：", snapshot)
         self.assertEqual(evidence, "### PLTR（持有）\npltr\n")
 
-    def test_per_section_and_total_caps(self):
-        sections = [f"### {ticker}（持有）\n" + char * 9000
-                    for ticker, char in [("INTC", "i"), ("PLTR", "p"), ("ORCL", "o")]]
-        snapshot = "\n".join(sections) + "\n## 宏观与地缘线索\n" + "m" * 4000
-        self.assertEqual(self.build("INTC", snapshot.split("\n## 宏观")[0]), sections[0][:8000])
-        evidence = self.build("INTC PLTR ORCL", snapshot, "s" * 4000)
-        expected = "\n".join(section[:8000] for section in sections)[:24000]
-        self.assertEqual(evidence, expected)
-        self.assertEqual(len(evidence), 24000)
-        self.assertTrue(evidence.startswith(sections[0][:8000]))
+    def test_total_cap_preserves_sonar_and_trims_macro_then_tickers(self):
+        first = "### INTC（持有）\n" + "i" * 18000 + "\n"
+        last = "### PLTR（持有）\n" + "p" * 25000 + "LAST_TAIL\n"
+        macro = "## 宏观与地缘线索\n" + "m" * 10000
+        sonar = "## Sonar 宏观\n" + "s" * 3000
+        missing = "以下被点名标的在今日情报快照中无条目：AMD"
+        evidence = self.build("AMD INTC PLTR", first + last + macro,
+                              "s" * 4000, ["AMD", "INTC", "PLTR"])
+        self.assertLessEqual(len(evidence), 40000)
+        self.assertIn(sonar, evidence)
+        self.assertTrue(evidence.startswith(missing + "\n" + first))
+        self.assertNotIn("## 宏观与地缘线索", evidence)
+        retained_last = evidence.split("### PLTR（持有）", 1)[1].split("\n" + sonar, 1)[0]
+        self.assertTrue(last.startswith("### PLTR（持有）" + retained_last))
+        self.assertNotIn("LAST_TAIL", evidence)
+        self.assertGreater(len(retained_last), 0)
+
+        # If macro alone can absorb the excess, keep every named section intact.
+        shorter_last = "### PLTR（持有）\n" + "p" * 12000 + "LAST_TAIL\n"
+        evidence = self.build("INTC PLTR", first + shorter_last + macro, "s" * 4000)
+        self.assertLessEqual(len(evidence), 40000)
+        self.assertTrue(evidence.startswith(first + "\n" + shorter_last))
+        self.assertIn(sonar, evidence)
+        retained_macro = evidence[evidence.index("## 宏观与地缘线索"):]
+        self.assertTrue(macro.startswith(retained_macro))
+        self.assertLess(len(retained_macro), len(macro))
+
+    def test_macro_directly_after_ticker_is_a_boundary(self):
+        section = "### PLTR（持有）\ncompany evidence\n"
+        macro = "## 宏观与地缘线索\nmacro evidence\n"
+        evidence = self.build("PLTR", section + macro, "SONAR")
+        self.assertEqual(evidence.count("## 宏观与地缘线索"), 1)
+        self.assertEqual(evidence, section + "\n## Sonar 宏观\nSONAR\n" + macro)
 
     def test_no_named_ticker_only_sonar_and_macro(self):
         snapshot = "### PLTR（持有）\ncompany\n## 宏观与地缘线索\nmacro\n"
@@ -89,7 +112,8 @@ class CalibrationEvidenceTests(unittest.TestCase):
                 self.assertIn(marker, prompt)
                 for rule in ["## 情报证据（按断言点名的标的挑选）", "条件成立判 hit，不成立判 miss",
                              "有段落但未见相关报道", 'reasoning 以"所给来源内未见"开头',
-                             '只有该标的被列为"无条目"、且无法凭价格表判定时，才判 inconclusive']:
+                             '只有该标的被列为"无条目"、且无法凭价格表判定时，才判 inconclusive',
+                             'reasoning 以"所给来源内未见"开头的 miss，miss_type 设为 null']:
                     self.assertIn(rule, prompt)
                 self.assertNotIn("report sentinel", prompt)
                 knowledge.assert_called_once()
